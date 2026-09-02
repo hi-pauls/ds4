@@ -152,6 +152,26 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+
+/* Compact per-expert descriptor used by the convcache to snapshot the current
+ * resident set alongside a KV snapshot and restore it on load. `priority` is
+ * the entry's use_count downcast; higher values indicate hotter experts. */
+typedef struct {
+    uint16_t layer;
+    uint16_t expert;
+    uint32_t priority;
+} ds4_stream_expert_ref;
+
+/* Enumerate currently-resident experts. Fills `out` with up to `max_out`
+ * (layer, expert, priority) triples sorted by priority descending. Returns
+ * the total number of residents (may exceed max_out — in that case only
+ * the top max_out fit in `out`). If `out` is NULL, returns the count only. */
+uint32_t ds4_gpu_stream_expert_cache_enum_residents(
+        ds4_stream_expert_ref *out, uint32_t max_out);
+
+/* Evict a specific (layer, expert) resident so subsequent lookups miss it.
+ * No-op if the entry isn't currently resident. */
+void ds4_gpu_stream_expert_cache_evict_one(uint32_t layer, uint32_t expert);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

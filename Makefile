@@ -22,6 +22,19 @@ DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
+# zstd for the conversation-cache RAM compression (ds4_convcache.c). Homebrew
+# on macOS puts headers/libs under /opt/homebrew; Linux/CUDA hosts typically
+# have libzstd-dev in the default search path.
+ifeq ($(UNAME_S),Darwin)
+ZSTD_CFLAGS ?= -I/opt/homebrew/include
+ZSTD_LDLIBS ?= -L/opt/homebrew/lib -lzstd
+else
+ZSTD_CFLAGS ?=
+ZSTD_LDLIBS ?= -lzstd
+endif
+CFLAGS += $(ZSTD_CFLAGS)
+LDLIBS += $(ZSTD_LDLIBS)
+
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
@@ -79,8 +92,8 @@ help:
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
+ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o ds4_convcache.o ds4_syscache.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ ds4_server.o ds4_help.o ds4_kvstore.o ds4_convcache.o ds4_syscache.o rax.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -163,7 +176,7 @@ rocm: strix-halo
 ds4: ds4_cli.o ds4_help.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
-ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args.o $(CORE_OBJS)
+ds4-server: ds4_server.o ds4_help.o ds4_kvstore.o ds4_convcache.o ds4_syscache.o rax.o ds4_gpu_args.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 ds4-bench: ds4_bench.o ds4_help.o ds4_gpu_args.o $(CORE_OBJS)

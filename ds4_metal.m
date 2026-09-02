@@ -437,6 +437,9 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t down_expert_bytes);
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
+static void ds4_gpu_stream_expert_cache_clear_entry(uint32_t layer,
+                                                    uint32_t expert,
+                                                    int      count_eviction);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
@@ -10519,6 +10522,60 @@ uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 
 uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
+}
+
+/* Compare two refs so higher priority (use_count) sorts first. */
+static int ds4_stream_expert_ref_cmp_desc(const void *a, const void *b) {
+    const ds4_stream_expert_ref *ra = a;
+    const ds4_stream_expert_ref *rb = b;
+    if (ra->priority > rb->priority) return -1;
+    if (ra->priority < rb->priority) return  1;
+    if (ra->layer   != rb->layer)   return ra->layer  < rb->layer  ? -1 : 1;
+    if (ra->expert  != rb->expert)  return ra->expert < rb->expert ? -1 : 1;
+    return 0;
+}
+
+uint32_t ds4_gpu_stream_expert_cache_enum_residents(
+        ds4_stream_expert_ref *out, uint32_t max_out) {
+    /* First pass: count. Second pass (if out): collect, sort, copy up to
+     * max_out. Layered scan keeps the O(L*E) walk cache-friendly, and both
+     * L and E are small (≤ 384). */
+    uint32_t total = 0;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            if (g_stream_expert_cache[layer][expert].valid) total++;
+        }
+    }
+    if (!out || max_out == 0) return total;
+
+    ds4_stream_expert_ref *scratch =
+        (ds4_stream_expert_ref *)malloc((size_t)total * sizeof(*scratch));
+    if (!scratch) return total;
+    uint32_t k = 0;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            const ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid) continue;
+            uint64_t uc = e->use_count;
+            scratch[k].layer    = (uint16_t)layer;
+            scratch[k].expert   = (uint16_t)expert;
+            scratch[k].priority = uc > UINT32_MAX ? UINT32_MAX : (uint32_t)uc;
+            k++;
+        }
+    }
+    qsort(scratch, k, sizeof(*scratch), ds4_stream_expert_ref_cmp_desc);
+    uint32_t n_copy = k < max_out ? k : max_out;
+    memcpy(out, scratch, (size_t)n_copy * sizeof(*out));
+    free(scratch);
+    return total;
+}
+
+void ds4_gpu_stream_expert_cache_evict_one(uint32_t layer, uint32_t expert) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    if (expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return;
+    if (!g_stream_expert_cache[layer][expert].valid) return;
+    ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 1);
 }
 
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(

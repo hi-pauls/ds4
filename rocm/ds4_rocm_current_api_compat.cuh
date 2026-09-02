@@ -160,6 +160,19 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return (uint32_t)g_stream_resident_experts.size();
 }
 
+/* Convcache resident-set snapshot/restore is Metal-only for now; stub on
+ * ROCm so the header stays consistent and callers get a safe no-op. */
+extern "C" uint32_t ds4_gpu_stream_expert_cache_enum_residents(
+        ds4_stream_expert_ref *out, uint32_t max_out) {
+    (void)out; (void)max_out;
+    return 0;
+}
+
+extern "C" void ds4_gpu_stream_expert_cache_evict_one(
+        uint32_t layer, uint32_t expert) {
+    (void)layer; (void)expert;
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 

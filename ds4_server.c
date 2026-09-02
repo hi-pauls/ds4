@@ -3,6 +3,8 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_convcache.h"
+#include "ds4_syscache.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -8441,6 +8443,13 @@ struct server_slot {
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
+/* Cache mode selects which caching subsystem gets used for a request:
+ *   PREFIX       = the historical byte-prefix hashed disk cache (kv, ds4_kvstore).
+ *   CONVERSATION = the RAM-first per-conversation cache (convcache).
+ * They are mutually exclusive; only one is initialised at startup based on the
+ * --kv-cache-mode flag. Default is PREFIX so existing users see no change. */
+typedef enum { DS4_CACHE_PREFIX = 0, DS4_CACHE_CONVERSATION = 1 } ds4_cache_mode;
+
 struct server {
     ds4_engine *engine;
     server_slot *slots;
@@ -8450,7 +8459,10 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    ds4_cache_mode cache_mode;
     kv_disk_cache kv;
+    ds4_convcache convcache;
+    ds4_syscache syscache;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
@@ -8862,6 +8874,84 @@ static void tool_memory_remember(server *s, const tool_calls *calls) {
         tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_tool_text,
                                TOOL_MEMORY_RAM);
     }
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+/* Serialize the current tool_memory to a caller-owned malloc'd byte blob so it
+ * can travel alongside a convcache KV snapshot. Format:
+ *   [n_entries(u32)]
+ *   per entry: [id_len(u16)] [id_bytes] [dsml_len(u32)] [dsml_bytes]
+ * Walk tail-to-head (oldest first) so re-inserting via tool_memory_put_locked
+ * (which always adds to head) restores the original LRU order exactly. */
+static void tool_memory_snapshot(server *s, uint8_t **out, size_t *out_len) {
+    if (out) *out = NULL;
+    if (out_len) *out_len = 0;
+    if (!s || !out || !out_len) return;
+    pthread_mutex_lock(&s->tool_mu);
+    tool_memory *m = &s->tool_mem;
+    size_t total = 4;    /* n_entries */
+    uint32_t n = 0;
+    for (tool_memory_entry *e = m->head; e; e = e->next) {
+        if (!e->id || !e->block || !e->block->dsml || e->block->len == 0) continue;
+        total += 2 + strlen(e->id) + 4 + e->block->len;
+        n++;
+    }
+    if (n == 0) { pthread_mutex_unlock(&s->tool_mu); return; }
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) { pthread_mutex_unlock(&s->tool_mu); return; }
+    uint8_t *p = buf;
+    memcpy(p, &n, 4); p += 4;
+    for (tool_memory_entry *e = m->tail; e; e = e->prev) {
+        if (!e->id || !e->block || !e->block->dsml || e->block->len == 0) continue;
+        uint16_t id_len = (uint16_t)strlen(e->id);
+        uint32_t dsml_len = (uint32_t)e->block->len;
+        memcpy(p, &id_len, 2);    p += 2;
+        memcpy(p, e->id, id_len); p += id_len;
+        memcpy(p, &dsml_len, 4);  p += 4;
+        memcpy(p, e->block->dsml, dsml_len); p += dsml_len;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    *out = buf;
+    *out_len = (size_t)(p - buf);
+}
+
+/* Replace the current tool_memory contents with the deserialized snapshot.
+ * `bytes` may be NULL or `len == 0` — in that case the memory is just reset. */
+static void tool_memory_restore(server *s, const uint8_t *bytes, size_t len) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    tool_memory_free(&s->tool_mem);
+    tool_memory_init_locked(&s->tool_mem);
+    if (!bytes || len < 4) { pthread_mutex_unlock(&s->tool_mu); return; }
+    const uint8_t *p = bytes;
+    const uint8_t *end = bytes + len;
+    uint32_t n = 0; memcpy(&n, p, 4); p += 4;
+    for (uint32_t i = 0; i < n; i++) {
+        if (p + 2 > end) break;
+        uint16_t id_len; memcpy(&id_len, p, 2); p += 2;
+        if (p + id_len > end) break;
+        char *id = (char *)malloc((size_t)id_len + 1);
+        if (!id) break;
+        memcpy(id, p, id_len); id[id_len] = '\0'; p += id_len;
+        if (p + 4 > end) { free(id); break; }
+        uint32_t dsml_len; memcpy(&dsml_len, p, 4); p += 4;
+        if (p + dsml_len > end) { free(id); break; }
+        char *dsml = (char *)malloc((size_t)dsml_len + 1);
+        if (!dsml) { free(id); break; }
+        memcpy(dsml, p, dsml_len); dsml[dsml_len] = '\0'; p += dsml_len;
+        tool_memory_put_locked(&s->tool_mem, id, dsml, TOOL_MEMORY_RAM);
+        free(id); free(dsml);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+/* Fresh-conversation reset: drop every accumulated tool_memory entry so
+ * subsequent renders don't fold in DSML from a prior unrelated session. */
+static void tool_memory_reset(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    tool_memory_free(&s->tool_mem);
+    tool_memory_init_locked(&s->tool_mem);
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -9663,6 +9753,26 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
     if (!byte_prefix_match(req->prompt_text, prompt_text_len,
                            live_text, live_text_len))
     {
+        /* Trace what diverged. Cheap to log — only fires when we couldn't
+         * reuse live state via the text path, which is the exact case we're
+         * trying to diagnose. Emits the first differing byte offset plus a
+         * ±80 char window from each side. */
+        size_t min_len = live_text_len < prompt_text_len ? live_text_len : prompt_text_len;
+        size_t diff = 0;
+        while (diff < min_len && live_text[diff] == req->prompt_text[diff]) diff++;
+        size_t win_lo = diff > 80 ? diff - 80 : 0;
+        size_t live_hi = diff + 80 < live_text_len ? diff + 80 : live_text_len;
+        size_t prompt_hi = diff + 80 < prompt_text_len ? diff + 80 : prompt_text_len;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: live_text_prefix_prompt divergence at byte %zu "
+                   "(live_len=%zu prompt_len=%zu)",
+                   diff, live_text_len, prompt_text_len);
+        server_log(DS4_LOG_KVCACHE,
+                   "  live[..%zu..]=%.*s",
+                   diff, (int)(live_hi - win_lo), live_text + win_lo);
+        server_log(DS4_LOG_KVCACHE,
+                   "  prom[..%zu..]=%.*s",
+                   diff, (int)(prompt_hi - win_lo), req->prompt_text + win_lo);
         free(live_text);
         return 0;
     }
@@ -11096,6 +11206,37 @@ static uint64_t server_next_sequence(server *s) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* One-line dump of the accumulator state that persists across generate_job
+ * calls. Useful for catching leaks / stale carry-over between turns — pair
+ * the "enter" and "exit" lines for a given job. Fires under DS4_LOG_KVCACHE
+ * so it doesn't spam DEFAULT-level output. Per-turn accumulators moved to the
+ * per-slot state; tool_memory stays server-global. */
+static void log_session_state(server *s, server_slot *slot,
+                              const char *tag, const char *req_kind) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    int tool_entries = s->tool_mem.entries;
+    size_t tool_bytes = s->tool_mem.bytes;
+    pthread_mutex_unlock(&s->tool_mu);
+    bool thinking_valid = slot->thinking_live.valid;
+    int thinking_tokens = slot->thinking_live.live_tokens;
+    size_t thinking_visible = slot->thinking_live.visible_len;
+    bool responses_valid = slot->responses_live.valid;
+    int responses_tokens = slot->responses_live.live_tokens;
+    bool anthropic_valid = slot->anthropic_live.valid;
+    int anthropic_tokens = slot->anthropic_live.live_tokens;
+    const int pos = ds4_session_pos(slot->session);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: session-state %s kind=%s pos=%d "
+               "tool_mem=%d/%zuB "
+               "thinking=%c/%d/%zuB responses=%c/%d anthropic=%c/%d",
+               tag, req_kind ? req_kind : "?", pos,
+               tool_entries, tool_bytes,
+               thinking_valid ? 'Y' : 'N', thinking_tokens, thinking_visible,
+               responses_valid ? 'Y' : 'N', responses_tokens,
+               anthropic_valid ? 'Y' : 'N', anthropic_tokens);
+}
+
 static void generate_job(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -11104,6 +11245,21 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
+    log_session_state(s, slot, "enter",
+                      j->req.kind == REQ_CHAT ? "chat" : "compl");
+
+    /* System-prompt boundary in the rendered chat prompt. The chat template
+     * always emits `<｜User｜>` (or the same-shaped marker) as the first
+     * non-system token; everything before it is the system portion, keyed
+     * separately by the syscache. sys_text_len==0 means the request has
+     * no user turn or no system prefix — skip sys handling in that case. */
+    size_t sys_text_len = 0;
+    if (j->req.prompt_text) {
+        const char *first_user = strstr(j->req.prompt_text, "<｜User｜>");
+        if (first_user) {
+            sys_text_len = (size_t)(first_user - j->req.prompt_text);
+        }
+    }
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
@@ -11209,6 +11365,246 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             cached = text_cached;
             cache_source = "memory-text";
             prompt_for_sync = &effective_prompt;
+        }
+    }
+    /* Partial-match extend: live and incoming share a token prefix but diverge
+     * afterward. Typical when the client re-serializes the previous assistant
+     * reply differently from the model's generated tokens (reasoning models
+     * strip the <think>...</think> block; some chat templates canonicalize
+     * whitespace). Rewind live to the shared boundary — the KV cells beyond
+     * `common` are discarded, and the next forward pass rebuilds them from
+     * the incoming prompt starting at position `common`. Requires `common > 0`
+     * (some real overlap) and `common < prompt.len` (real extension to forward).
+     * Skipped when the shared prefix is trivially short: rewinding to lose
+     * near-all live state for near-cold prefill is not worth the KV churn. */
+    if (cached == 0 && common > 0 && common < j->req.prompt.len &&
+        common >= 256)
+    {
+        if (common < old_pos) {
+            ds4_session_rewind(slot->session, common);
+        }
+        cached = common;
+        cache_source = "memory-token-rewind";
+        prompt_for_sync = &j->req.prompt;
+    }
+    /* Conversation-cache mode: if the live-state didn't extend to cover the
+     * incoming request, treat it as a conversation switch — persist the
+     * outgoing state to the RAM cache (spilling oldest to disk if needed)
+     * and load the incoming state from RAM or disk. All the prefix-cache
+     * write paths below are dormant because s->kv.enabled == false in this
+     * mode, so no NAND writes happen from the "cold" or "continued" paths.
+     */
+    if (s->cache_mode == DS4_CACHE_CONVERSATION &&
+        j->req.prompt_text && j->req.prompt_text[0])
+    {
+        const int model_id   = ds4_engine_model_id(s->engine);
+        const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+        const int ctx_size   = ds4_session_ctx(slot->session);
+        const size_t req_text_len = strlen(j->req.prompt_text);
+
+        /* First: if the current live state's rendered text starts with the
+         * incoming request's prompt text (i.e. same conversation, live has
+         * generated extra tokens beyond the request), we can reuse live —
+         * just rewind past the generated suffix so live == the request
+         * prompt. This handles the "identical prompt replay" case which
+         * neither line 10064's token check nor live_text_prefix_prompt
+         * catches (both require incoming to EXTEND live, not the reverse). */
+        if (cached == 0 && old_pos > 0) {
+            const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+            if (live_tokens && live_tokens->len > 0) {
+                size_t live_text_len = 0;
+                char *live_text =
+                    render_tokens_text(s->engine, live_tokens, &live_text_len);
+                if (live_text && live_text_len >= req_text_len &&
+                    memcmp(live_text, j->req.prompt_text, req_text_len) == 0)
+                {
+                    /* Live is a superset — rewind to the request's prompt
+                     * boundary. Rewind one token short so ds4_session_sync's
+                     * forward loop runs at least once and refreshes logits;
+                     * otherwise sync becomes a no-op and the decode step
+                     * samples from stale post-generation logits. */
+                    if (j->req.prompt.len > 1 &&
+                        j->req.prompt.len <= live_tokens->len) {
+                        ds4_session_rewind(slot->session, j->req.prompt.len - 1);
+                        cached = j->req.prompt.len - 1;
+                        cache_source = "conv-live-rewind";
+                        prompt_for_sync = &j->req.prompt;
+                    }
+                }
+                free(live_text);
+            }
+        }
+
+        /* Still uncovered — genuine conversation switch. Snapshot outgoing
+         * live state to the RAM cache, then try to load the incoming from
+         * cache. Pin the incoming prompt text so the store's eviction pass
+         * doesn't kick out an entry that is a prefix of the incoming (the
+         * entry we're about to load). */
+        if (cached == 0) {
+            if (old_pos > 0) {
+                const ds4_tokens *live = ds4_session_tokens(slot->session);
+                if (live && live->len > 0) {
+                    size_t live_text_len = 0;
+                    char *live_text =
+                        render_tokens_text(s->engine, live, &live_text_len);
+                    if (live_text) {
+                        char sto_err[160] = {0};
+                        /* Snapshot tool_memory alongside the KV state so a
+                         * later restore reinstates the DSML-by-id map that
+                         * was in effect at save time. */
+                        uint8_t *tool_blob = NULL;
+                        size_t tool_blob_len = 0;
+                        tool_memory_snapshot(s, &tool_blob, &tool_blob_len);
+                        ds4_convcache_store(&s->convcache, s->engine,
+                                            slot->session,
+                                            live_text, live_text_len,
+                                            model_id, quant_bits, ctx_size,
+                                            (int)live->len,
+                                            j->req.prompt_text, req_text_len,
+                                            tool_blob, (uint32_t)tool_blob_len,
+                                            sto_err, sizeof(sto_err));
+                        free(tool_blob);
+                        free(live_text);
+                    }
+                }
+            }
+
+            /* Find the longest cached entry whose text is a byte-prefix of
+             * the incoming request. If found, load it and rewind to the
+             * request's prompt length so live == the request's prompt. */
+            int ram_idx = ds4_convcache_find_prefix(&s->convcache,
+                                                    j->req.prompt_text,
+                                                    req_text_len);
+            if (ram_idx >= 0) {
+                char err[160] = {0};
+                ds4_stream_expert_ref *residents = NULL;
+                uint32_t residents_len = 0;
+                uint8_t *tool_blob = NULL;
+                uint32_t tool_blob_len = 0;
+                if (ds4_convcache_load(&s->convcache, ram_idx, slot->session,
+                                       &residents, &residents_len,
+                                       &tool_blob, &tool_blob_len,
+                                       err, sizeof(err))) {
+                    const ds4_tokens *loaded_live =
+                        ds4_session_tokens(slot->session);
+                    /* Rewind one short so sync re-evals the last prompt
+                     * token and produces fresh logits for decoding. */
+                    if (loaded_live && j->req.prompt.len > 1 &&
+                        j->req.prompt.len <= loaded_live->len) {
+                        ds4_session_rewind(slot->session, j->req.prompt.len - 1);
+                        cached = j->req.prompt.len - 1;
+                        cache_source = "conv-ram";
+                        prompt_for_sync = &j->req.prompt;
+                    }
+                    /* Restore the outgoing conversation's expert residency
+                     * so the first tokens don't pay SSD misses. */
+                    if (residents && residents_len > 0) {
+                        ds4_engine_swap_experts_from_refs(s->engine,
+                                                          residents,
+                                                          residents_len);
+                    }
+                    /* Restore tool_memory too — otherwise DSML for tool_call
+                     * ids from the swapped-in conversation would come back
+                     * as canonicalized (not the exact sampled bytes). */
+                    tool_memory_restore(s, tool_blob, tool_blob_len);
+                } else {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: convcache RAM load failed: %s",
+                               err);
+                    ds4_session_invalidate(slot->session);
+                }
+                free(residents);
+                free(tool_blob);
+            } else if (ds4_convcache_disk_has_prefix(&s->convcache,
+                                                     j->req.prompt_text,
+                                                     req_text_len))
+            {
+                /* Disk fallback: RAM cache had no matching entry but the
+                 * disk store has a .conv file with a common byte-prefix
+                 * to the incoming request. Load it directly into the live
+                 * session (bypassing the RAM tier), then rewind to the
+                 * incoming's token boundary. */
+                int loaded_tokens = 0;
+                char err[160] = {0};
+                ds4_stream_expert_ref *residents = NULL;
+                uint32_t residents_len = 0;
+                uint8_t *tool_blob = NULL;
+                uint32_t tool_blob_len = 0;
+                if (ds4_convcache_load_from_disk(&s->convcache,
+                                                 j->req.prompt_text,
+                                                 req_text_len,
+                                                 slot->session,
+                                                 &loaded_tokens,
+                                                 &residents, &residents_len,
+                                                 &tool_blob, &tool_blob_len,
+                                                 err, sizeof(err))) {
+                    const ds4_tokens *loaded_live =
+                        ds4_session_tokens(slot->session);
+                    if (loaded_live && j->req.prompt.len > 1 &&
+                        j->req.prompt.len <= loaded_live->len) {
+                        ds4_session_rewind(slot->session, j->req.prompt.len - 1);
+                        cached = j->req.prompt.len - 1;
+                        cache_source = "conv-disk";
+                        prompt_for_sync = &j->req.prompt;
+                    }
+                    if (residents && residents_len > 0) {
+                        ds4_engine_swap_experts_from_refs(s->engine,
+                                                          residents,
+                                                          residents_len);
+                    }
+                    tool_memory_restore(s, tool_blob, tool_blob_len);
+                } else {
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: convcache disk load failed: %s",
+                               err);
+                    ds4_session_invalidate(slot->session);
+                }
+                free(residents);
+                free(tool_blob);
+            } else {
+                /* True new-conversation switch: outgoing snapshot was
+                 * persisted above, but no matching entry to load. Drop the
+                 * server-side tool_memory so a stale DSML-by-id table from
+                 * the outgoing conversation can't fold into the render of
+                 * this fresh request. */
+                tool_memory_reset(s);
+                /* Last-chance warmup: if we've cached the state after a prior
+                 * cold-prefill under this exact system prompt, jump straight
+                 * to it instead of paying the full prefill again. Uses
+                 * ds4_session_common_prefix after load to find the exact
+                 * token boundary — tolerates BPE realignment past the sys
+                 * portion, so it also opportunistically reuses matching
+                 * bytes into the user turn when we saved a full-turn state. */
+                if (sys_text_len > 0 &&
+                    ds4_syscache_has(&s->syscache, j->req.prompt_text,
+                                     sys_text_len))
+                {
+                    int loaded_tokens = 0;
+                    char sys_err[160] = {0};
+                    if (ds4_syscache_load(&s->syscache, j->req.prompt_text,
+                                          sys_text_len, slot->session,
+                                          &loaded_tokens,
+                                          sys_err, sizeof(sys_err)))
+                    {
+                        int sys_common =
+                            ds4_session_common_prefix(slot->session,
+                                                      &j->req.prompt);
+                        if (sys_common > 1 &&
+                            sys_common < j->req.prompt.len)
+                        {
+                            ds4_session_rewind(slot->session, sys_common);
+                            cached = sys_common;
+                            cache_source = "syscache";
+                            prompt_for_sync = &j->req.prompt;
+                        }
+                    } else {
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: syscache load failed: %s",
+                                   sys_err);
+                        ds4_session_invalidate(slot->session);
+                    }
+                }
+            }
         }
     }
     if (cached == 0 && old_pos > 0) {
@@ -11375,8 +11771,83 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (server_session_sync(s, slot, prompt_for_sync,
-                            err, sizeof(err)) != 0) {
+    /* Two-phase sys-cache save: on turn 1 of a fresh conversation with a new
+     * system prompt, split the cold prefill so we can snapshot the state at
+     * exactly the sys-prompt boundary (NOT the full request state). Fires
+     * only when EVERY condition holds:
+     *   - old_pos == 0        session was truly empty at entry (turn 1)
+     *   - cached == 0         no cache path fired; we're cold-prefilling
+     *   - sys_text_len > 0    the request has a system portion
+     *   - syscache configured with disk budget
+     *   - no existing .sys file for this sys hash
+     * On subsequent turns (or when any cache path fired), we skip the split
+     * — this is why the previous "save every turn" behaviour was wrong: it
+     * kept overwriting a shorter-and-shorter usable window as the session
+     * grew, and by turn 4 was storing a full 8600-token snapshot under the
+     * sys hash. */
+    if (old_pos == 0 && cached == 0 && sys_text_len > 0 &&
+        s->cache_mode == DS4_CACHE_CONVERSATION &&
+        s->syscache.opt.disk_budget_bytes > 0 &&
+        !ds4_syscache_has(&s->syscache, j->req.prompt_text, sys_text_len))
+    {
+        /* Tokenize the sys portion alone. BPE COULD merge across the
+         * <User> boundary in principle, but in the ds4 template `<｜User｜>`
+         * is a distinct control token that never merges with prior bytes,
+         * so token counts align exactly. */
+        char *sys_dup = strndup(j->req.prompt_text, sys_text_len);
+        if (sys_dup) {
+            ds4_tokens sys_tok = {0};
+            ds4_tokenize_rendered_chat(s->engine, sys_dup, &sys_tok);
+            free(sys_dup);
+            const int sys_n = sys_tok.len;
+            /* Guard: the sys token boundary must sit strictly inside the
+             * full prompt AND the tokens up to that boundary must match
+             * exactly what the full-prompt tokenisation produced (defence
+             * against BPE drift). If either check fails, fall through to
+             * the normal single-phase sync — no split, no sys save. */
+            bool tokens_align = sys_n > 0 && sys_n < prompt_for_sync->len;
+            for (int i = 0; tokens_align && i < sys_n; i++) {
+                if (sys_tok.v[i] != prompt_for_sync->v[i]) {
+                    tokens_align = false;
+                }
+            }
+            if (tokens_align) {
+                ds4_tokens sys_view = {
+                    .v   = prompt_for_sync->v,
+                    .len = sys_n,
+                    .cap = sys_n,
+                };
+                char sync_err[160] = {0};
+                if (server_session_sync(s, slot, &sys_view,
+                                        sync_err, sizeof(sync_err)) == 0) {
+                    /* State is now at exactly the sys-prompt boundary —
+                     * cells [0..sys_n) populated, nothing beyond. Save. */
+                    char save_err[160] = {0};
+                    if (ds4_syscache_store(&s->syscache,
+                                           j->req.prompt_text, sys_text_len,
+                                           sys_n, slot->session,
+                                           save_err, sizeof(save_err)))
+                    {
+                        server_log(DS4_LOG_KVCACHE,
+                                   "ds4-server: syscache stored sys_tokens=%d bytes=%zu",
+                                   sys_n, sys_text_len);
+                    } else if (save_err[0]) {
+                        server_log(DS4_LOG_WARNING,
+                                   "ds4-server: syscache store failed: %s",
+                                   save_err);
+                    }
+                    /* Phase-2: the main sync below will advance the state
+                     * from sys_n to prompt_for_sync->len — this is the
+                     * user-turn portion. Nothing else to do here. */
+                }
+                /* On phase-1 sync failure we fall through; the main sync
+                 * below will retry from position 0. */
+            }
+            ds4_tokens_free(&sys_tok);
+        }
+    }
+
+    if (server_session_sync(s, slot, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -12161,6 +12632,17 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    /* NOTE: syscache save moved earlier in generate_job — see the two-phase
+     * sync block above. The prior end-of-turn save had two fatal bugs:
+     *   1. It ran on EVERY turn, and once the session grew past turn 1 it
+     *      was writing the whole live session (user turns, tool calls,
+     *      assistant replies, everything) under the sys hash — polluting
+     *      every future fresh session that reloaded it.
+     *   2. Even on turn 1 it saved the FULL request state, which includes
+     *      cells past the sys-prompt boundary, so on load those cells were
+     *      still populated with old data past the intended checkpoint. */
+    log_session_state(s, slot, "exit ",
+                      j->req.kind == REQ_CHAT ? "chat" : "compl");
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -12662,6 +13144,13 @@ typedef struct {
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
+    /* New conversation-cache mode. When set, replaces the prefix cache. */
+    ds4_cache_mode cache_mode;
+    uint64_t kv_conv_ram_mb;
+    uint64_t kv_conv_disk_mb;
+    const char *kv_conv_disk_dir;
+    uint64_t kv_conv_sys_disk_mb;      /* system-prompt cache budget */
+    const char *kv_conv_sys_disk_dir;  /* defaults to <disk_dir>/../sys */
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
     bool enable_cors;
@@ -12895,6 +13384,27 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--kv-cache-mode")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "prefix")) {
+                c.cache_mode = DS4_CACHE_PREFIX;
+            } else if (!strcmp(v, "conversation") || !strcmp(v, "conv")) {
+                c.cache_mode = DS4_CACHE_CONVERSATION;
+            } else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-cache-mode must be 'prefix' or 'conversation'");
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--kv-conv-ram-mb")) {
+            c.kv_conv_ram_mb = (uint64_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-conv-disk-mb")) {
+            c.kv_conv_disk_mb = (uint64_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-conv-disk-dir")) {
+            c.kv_conv_disk_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--kv-conv-sys-disk-mb")) {
+            c.kv_conv_sys_disk_mb = (uint64_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--kv-conv-sys-disk-dir")) {
+            c.kv_conv_sys_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -13135,9 +13645,61 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+    /* Cache subsystem selection (mutually exclusive), after slots exist. */
+    s.cache_mode = cfg.cache_mode;
+    if (s.cache_mode == DS4_CACHE_PREFIX) {
+        if (cfg.kv_disk_dir) {
+            kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                          cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        }
+    } else {
+        /* Conversation cache: RAM-first, optional disk backing. Mutually
+         * exclusive with the prefix cache; --kv-* flags for the prefix cache
+         * are ignored in this mode. Shared across slots; access is serialised
+         * by s.inference_mu in generate_job (see the conversation-switch and
+         * two-phase-sys blocks). */
+        ds4_convcache_opt cco = {
+            .ram_budget_bytes  = cfg.kv_conv_ram_mb  * 1024ULL * 1024ULL,
+            .disk_budget_bytes = cfg.kv_conv_disk_mb * 1024ULL * 1024ULL,
+            .disk_dir          = (char *)cfg.kv_conv_disk_dir,
+        };
+        if (cco.ram_budget_bytes == 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --kv-cache-mode conversation requires --kv-conv-ram-mb > 0");
+            server_close_resources(&s);
+            return 1;
+        }
+        if (!ds4_convcache_init(&s.convcache, &cco)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to initialise conversation cache");
+            server_close_resources(&s);
+            return 1;
+        }
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: conversation cache mode ram=%llu MiB disk=%llu MiB dir=%s",
+                   (unsigned long long)cfg.kv_conv_ram_mb,
+                   (unsigned long long)cfg.kv_conv_disk_mb,
+                   cfg.kv_conv_disk_dir ? cfg.kv_conv_disk_dir : "-");
+
+        /* System-prompt cache: separate budget, separate directory. Only
+         * initialised when disk_mb > 0 and a directory is available. */
+        if (cfg.kv_conv_sys_disk_mb > 0 && cfg.kv_conv_sys_disk_dir) {
+            ds4_syscache_opt sco = {
+                .disk_budget_bytes = cfg.kv_conv_sys_disk_mb * 1024ULL * 1024ULL,
+                .disk_dir          = (char *)cfg.kv_conv_sys_disk_dir,
+            };
+            if (!ds4_syscache_init(&s.syscache, &sco)) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: failed to initialise system-prompt cache");
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: sys-prompt cache disk=%llu MiB dir=%s used=%llu bytes entries=%d",
+                           (unsigned long long)cfg.kv_conv_sys_disk_mb,
+                           cfg.kv_conv_sys_disk_dir,
+                           (unsigned long long)ds4_syscache_disk_used(&s.syscache),
+                           ds4_syscache_entry_count(&s.syscache));
+            }
+        }
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -13271,14 +13833,56 @@ int main(int argc, char **argv) {
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
-        server_slot *slot = &s.slots[i];
-        const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-        if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
+    if (s.cache_mode == DS4_CACHE_PREFIX) {
+        for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
+            server_slot *slot = &s.slots[i];
+            const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+            if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
+                       i, tokens->len);
+            kv_cache_store_current(&s, slot, "shutdown");
+        }
+    } else {
+        /* Conversation-cache mode: snapshot every currently-live slot session
+         * into the RAM cache first, then flush every entry to disk. Without the
+         * live snapshot the active conversation is lost on any shutdown
+         * (idle-timeout kill, launchd stop, upgrade restart) even though
+         * hibernated ones would survive. */
+        for (int i = 0; i < s.slot_count; i++) {
+            server_slot *slot = &s.slots[i];
+            const ds4_tokens *live = ds4_session_tokens(slot->session);
+            if (!live || live->len == 0) continue;
+            size_t live_text_len = 0;
+            char *live_text = render_tokens_text(s.engine, live, &live_text_len);
+            if (!live_text) continue;
+            char sto_err[160] = {0};
+            uint8_t *tool_blob = NULL;
+            size_t tool_blob_len = 0;
+            tool_memory_snapshot(&s, &tool_blob, &tool_blob_len);
+            int idx = ds4_convcache_store(&s.convcache, s.engine, slot->session,
+                                          live_text, live_text_len,
+                                          ds4_engine_model_id(s.engine),
+                                          ds4_engine_routed_quant_bits(s.engine),
+                                          ds4_session_ctx(slot->session),
+                                          (int)live->len,
+                                          NULL, 0,
+                                          tool_blob, (uint32_t)tool_blob_len,
+                                          sto_err, sizeof(sto_err));
+            free(tool_blob);
+            if (idx < 0) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: live snapshot on shutdown failed slot=%d: %s",
+                           i, sto_err);
+            }
+            free(live_text);
+        }
         server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
-                   i, tokens->len);
-        kv_cache_store_current(&s, slot, "shutdown");
+                   "ds4-server: flushing %d hibernated conversations to disk",
+                   ds4_convcache_len(&s.convcache));
+        ds4_convcache_flush_to_disk(&s.convcache);
+        ds4_convcache_free(&s.convcache);
+        ds4_syscache_free(&s.syscache);
     }
     server_close_resources(&s);
     return 0;

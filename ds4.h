@@ -416,6 +416,18 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
+
+/* Streaming-expert-cache resident-set swap. Intersection-preserving: any
+ * currently-resident expert also present in `target` is kept; residents not
+ * in target are evicted; targets not yet resident are seeded (per-layer,
+ * in the priority order the caller supplied). Metal-only; other backends
+ * treat this as a no-op. Returns true on success (including the no-op
+ * backends). */
+#include "ds4_gpu.h"   /* ds4_stream_expert_ref */
+bool ds4_engine_swap_experts_from_refs(ds4_engine *e,
+                                       const ds4_stream_expert_ref *target,
+                                       uint32_t n_target);
+
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);

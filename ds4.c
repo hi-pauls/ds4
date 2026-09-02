@@ -57333,6 +57333,93 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+/* Intersection-preserving swap of the streaming-expert-cache resident set.
+ *
+ *   1. Enumerate current residents.
+ *   2. For every current NOT in target → evict.
+ *   3. Group target NOT in current by layer, seed in the supplied priority
+ *      order (already sorted desc by ds4_gpu_stream_expert_cache_enum_residents).
+ *
+ * Metal is the only backend with a real streaming cache; on other backends
+ * the enum returns 0 and evict is a no-op, so the call is harmless. */
+bool ds4_engine_swap_experts_from_refs(ds4_engine *e,
+                                       const ds4_stream_expert_ref *target,
+                                       uint32_t n_target) {
+    if (!e) return false;
+#ifdef DS4_NO_GPU
+    (void)target; (void)n_target;
+    return true;
+#else
+    const size_t max_l = DS4_MAX_LAYER;
+    const size_t max_e = DS4_MAX_EXPERT;
+    const size_t bytes = (max_l * max_e + 7) / 8;
+    uint8_t *tgt_bm = (uint8_t *)calloc(bytes, 1);
+    uint8_t *cur_bm = (uint8_t *)calloc(bytes, 1);
+    if (!tgt_bm || !cur_bm) { free(tgt_bm); free(cur_bm); return false; }
+    for (uint32_t i = 0; i < n_target; i++) {
+        if (target[i].layer >= max_l || target[i].expert >= max_e) continue;
+        size_t bi = (size_t)target[i].layer * max_e + target[i].expert;
+        tgt_bm[bi >> 3] |= (uint8_t)(1u << (bi & 7));
+    }
+    uint32_t rtotal = ds4_gpu_stream_expert_cache_enum_residents(NULL, 0);
+    ds4_stream_expert_ref *cur = NULL;
+    uint32_t n_cur = 0;
+    if (rtotal > 0) {
+        cur = (ds4_stream_expert_ref *)malloc((size_t)rtotal * sizeof(*cur));
+        if (cur) n_cur = ds4_gpu_stream_expert_cache_enum_residents(cur, rtotal);
+    }
+    for (uint32_t i = 0; i < n_cur; i++) {
+        if (cur[i].layer >= max_l || cur[i].expert >= max_e) continue;
+        size_t bi = (size_t)cur[i].layer * max_e + cur[i].expert;
+        cur_bm[bi >> 3] |= (uint8_t)(1u << (bi & 7));
+    }
+    for (uint32_t i = 0; i < n_cur; i++) {
+        size_t bi = (size_t)cur[i].layer * max_e + cur[i].expert;
+        if (!(tgt_bm[bi >> 3] & (uint8_t)(1u << (bi & 7)))) {
+            ds4_gpu_stream_expert_cache_evict_one(cur[i].layer, cur[i].expert);
+        }
+    }
+    free(cur);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        uint32_t layer_count = 0;
+        for (uint32_t i = 0; i < n_target; i++) {
+            if (target[i].layer != il) continue;
+            size_t bi = (size_t)il * max_e + target[i].expert;
+            if (cur_bm[bi >> 3] & (uint8_t)(1u << (bi & 7))) continue;
+            layer_count++;
+        }
+        if (layer_count == 0) continue;
+        int32_t *ids = (int32_t *)malloc((size_t)layer_count * sizeof(*ids));
+        uint32_t *pris = (uint32_t *)malloc((size_t)layer_count * sizeof(*pris));
+        if (!ids || !pris) { free(ids); free(pris); free(tgt_bm); free(cur_bm); return false; }
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < n_target; i++) {
+            if (target[i].layer != il) continue;
+            size_t bi = (size_t)il * max_e + target[i].expert;
+            if (cur_bm[bi >> 3] & (uint8_t)(1u << (bi & 7))) continue;
+            ids[k]  = (int32_t)target[i].expert;
+            pris[k] = target[i].priority;
+            k++;
+        }
+        const ds4_layer_weights *layer_w = &e->weights.layer[il];
+        if (!layer_w->ffn_gate_exps || !layer_w->ffn_down_exps) {
+            free(ids); free(pris); continue;
+        }
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer_w->ffn_gate_exps);
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer_w->ffn_down_exps);
+        const uint64_t gate_expert_bytes = layer_w->ffn_gate_exps->dim[1] * gate_row_bytes;
+        const uint64_t down_expert_bytes = layer_w->ffn_down_exps->dim[1] * down_row_bytes;
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(&e->model, layer_w, il,
+                                           gate_expert_bytes, down_expert_bytes);
+        (void)ds4_gpu_stream_expert_cache_seed_experts(&table, ids, pris, k);
+        free(ids); free(pris);
+    }
+    free(tgt_bm); free(cur_bm);
+    return true;
+#endif
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
