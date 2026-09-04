@@ -7095,9 +7095,11 @@ static bool glm_stream_selected_expert_cache_supported(
 
     if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
 #ifdef __APPLE__
-        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts. The
-         * separate IQ2/IQ2 address-table path below supports up to eight. */
-        if (DS4_N_EXPERT_USED != 6) return false;
+        /* Metal has two IQ2/Q2 down paths: the fixed-6 selected-slot sum kernel
+         * (n_expert_used == 6) and the dynamic per-expert Q2_K address-table down
+         * (kernel_mul_mv_addr_q2_K_f32), which serves any count up to the routed
+         * cap. So the cache is available for GLM-5.3's 8 experts, not just 6. */
+        if (DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > 8) return false;
 #endif
         return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
                                       "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
@@ -41382,6 +41384,14 @@ static bool glm_graph_memory_guard_for_compact_cap(
                                         include_output);
     uint64_t required = glm_graph_saturating_add_u64(model_bytes, graph_bytes);
     required = glm_graph_saturating_add_u64(required, transient_extra_bytes);
+    /* For SSD streaming, model_bytes is a no-copy mmap wrap of the GGUF (mlock'd via
+     * DS4_MLOCK_NONROUTED, not a wired Metal device allocation), so it does not
+     * compete for the wired budget the way graph buffers + the expert cache do.
+     * Validated empirically: a guard-off load reporting ~47 GiB "planned" ran at
+     * ~33 GiB RSS with no OOM. Check only the device allocations against the wired
+     * budget; `required` (total) is still bounded by physical RAM below and logged. */
+    const uint64_t wired_required = ssd_streaming ?
+        glm_graph_saturating_add_u64(graph_bytes, transient_extra_bytes) : required;
 
     uint64_t budget_base = 0;
     uint64_t budget = 0;
@@ -41397,7 +41407,9 @@ static bool glm_graph_memory_guard_for_compact_cap(
         return true;
     }
 
-    if (required <= budget) {
+    /* Total footprint (incl. the mmap model) must still fit host RAM with a margin. */
+    const uint64_t physical_cap = budget_base - budget_base / 8u;  /* ~87.5% of host RAM */
+    if (wired_required <= budget && required <= physical_cap) {
         const char *report = getenv("DS4_GLM_MEMORY_GUARD_REPORT");
         if (report && report[0]) {
             fprintf(stderr,
@@ -60859,8 +60871,19 @@ static void ds4_engine_fit_glm_streaming_budget(
     }
     const uint64_t fixed_bytes = glm_graph_saturating_add_u64(
             model_bytes, graph_mem.total_bytes);
-    const uint64_t available = budget > fixed_bytes ?
+    uint64_t available = budget > fixed_bytes ?
         budget - fixed_bytes : 0;
+    /* model_bytes is the no-copy mmap model map (mlock'd), which doesn't fully
+     * consume the wired budget -- see the guard-accounting note in
+     * glm_graph_memory_guard_for_compact_cap. Reclaim a bounded 2 GiB of it for the
+     * expert cache: enough to lift decode without pushing into memory pressure.
+     * (The guard's wired check + physical cap still bound the resulting footprint.) */
+    if (model_bytes != 0) {
+        const uint64_t glm_cache_reclaim = 2ull * 1024 * 1024 * 1024;
+        const uint64_t reclaim = model_bytes < glm_cache_reclaim ?
+            model_bytes : glm_cache_reclaim;
+        available = glm_graph_saturating_add_u64(available, reclaim);
+    }
 
     uint64_t per_expert_bytes = 0;
     const bool has_routed_experts =
@@ -60932,8 +60955,10 @@ static void ds4_engine_fit_glm_streaming_budget(
         g_glm_streaming_full_resident_layers = 0;
     }
 
-    uint64_t option_bytes = available > decode_map_extra_bytes ?
-        available - decode_map_extra_bytes : 0;
+    /* EXPERIMENT: don't subtract the no-copy/mlock'd decode map from the cache
+     * budget (see guard-accounting investigation). Paired with DS4_GLM_MEMORY_GUARD=0
+     * to test whether the mlock'd resident actually competes for the Metal budget. */
+    uint64_t option_bytes = available;
     uint64_t prefill_headroom = old_prefill_headroom;
     if (prefill_headroom > option_bytes) prefill_headroom = option_bytes;
     option_bytes -= prefill_headroom;

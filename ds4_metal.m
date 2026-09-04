@@ -148,6 +148,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipelin
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_mxfp4_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_f32_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline;
@@ -7402,6 +7403,26 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_addr_q2_K_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_addr_q2_k_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_addr_q2_k_f32_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_addr_q2_K_sum6_f32"
                            constantValues:moe_mv_id_constants
                                     error:&error];
@@ -10314,6 +10335,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_slots6_mxfp4_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pipeline = nil;
+        g_moe_mul_mv_addr_q2_k_f32_pipeline = nil;
         g_moe_mul_mv_addr_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline = nil;
         g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline = nil;
@@ -39184,7 +39206,9 @@ int ds4_gpu_routed_moe_one_tensor(
             !force_resident &&
             g_ssd_streaming_mode &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
-            down_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            (down_type == DS4_METAL_TENSOR_IQ2_XXS ||
+             (down_type == DS4_METAL_TENSOR_Q2_K &&
+              g_moe_mul_mv_addr_q2_k_f32_pipeline != nil)) &&
             n_expert <= DS4_METAL_MAX_ROUTED_EXPERT_USED &&
             n_tokens == 1 &&
             fuse_pair_swiglu &&
@@ -40996,6 +41020,28 @@ int ds4_gpu_routed_moe_one_tensor(
                 if (down_type == DS4_METAL_TENSOR_IQ2_XXS) {
                     ok = ds4_gpu_encode_mul_mv_addr_iq2(cb,
                                                         g_moe_mul_mv_addr_iq2_xxs_pipeline,
+                                                        &down_args,
+                                                        stream_slot_entries,
+                                                        n_expert,
+                                                        stream_down_addr_buf,
+                                                        midbuf,
+                                                        ds4_gpu_tensor_offset(mid),
+                                                        down_dst,
+                                                        down_dst_off,
+                                                        selected_exec_buf,
+                                                        selected_exec_off,
+                                                        down_smem,
+                                                        2,
+                                                        false);
+                } else if (use_iq2_stream_addr_table &&
+                           down_type == DS4_METAL_TENSOR_Q2_K &&
+                           !use_stream_expert_masked_addr_table) {
+                    // IQ2 gate/up + Q2_K down (GLM-5.3): per-expert dynamic addr
+                    // down (up to 8 experts), reusing the quant-agnostic per-expert
+                    // encode with the Q2_K addr kernel. Writes per-expert to
+                    // down_dst; moe_sum_experts sums, exactly like the IQ2 branch.
+                    ok = ds4_gpu_encode_mul_mv_addr_iq2(cb,
+                                                        g_moe_mul_mv_addr_q2_k_f32_pipeline,
                                                         &down_args,
                                                         stream_slot_entries,
                                                         n_expert,
