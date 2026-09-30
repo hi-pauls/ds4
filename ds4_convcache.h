@@ -96,7 +96,9 @@ int ds4_convcache_find_prefix(ds4_convcache *cc,
 /* Store the live session as a new entry keyed by sha ------------------- */
 
 /* Snapshots the current live session and adds it to the RAM cache. `text`
- * / `text_len` is the rendered live text at save time — used both as the
+ * / `text_len` is the key the live state answers to — the rendered live text,
+ * or, when the live state holds hidden reasoning the client does not replay,
+ * the visible transcript up to the live frontier. It serves both as the
  * entry's identity (SHA-1 keyed off it) and for prefix-match lookups by
  * ds4_convcache_find_prefix(). If the RAM budget would be exceeded, oldest
  * entries are evicted first (to disk when disk_budget_bytes > 0, otherwise
@@ -139,7 +141,8 @@ bool ds4_convcache_load(ds4_convcache *cc,
 /* Scan the disk dir for the best-matching .conv entry (longest common
  * byte-prefix with `incoming_text`) and load its snapshot into the session.
  * On success `*loaded_token_count_out` is set to the entry's stored token
- * count so the caller can rewind live to the appropriate position. If
+ * count and `*loaded_text_len_out` to the length of its stored key, so the
+ * caller knows where the request's new text starts. If
  * `out_residents` is non-NULL, the residents block from the file is
  * malloc'd and returned (caller frees). */
 bool ds4_convcache_load_from_disk(ds4_convcache *cc,
@@ -147,6 +150,7 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
                                   size_t incoming_text_len,
                                   ds4_session *session,
                                   int *loaded_token_count_out,
+                                  size_t *loaded_text_len_out,
                                   ds4_stream_expert_ref **out_residents,
                                   uint32_t *out_residents_len,
                                   uint8_t **out_aux_blob,

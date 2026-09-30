@@ -169,6 +169,47 @@ static void write_entry_atomic(const char *path,
     free(tmp);
 }
 
+/* Delete the least recently written .conv files until the directory fits the
+ * disk budget again. keep_path, when given, is the file just written and is
+ * never deleted, so an entry larger than the whole budget still survives
+ * until the next write. mtime is the recency key: files are only ever
+ * rewritten whole, when their entry is evicted from RAM or flushed. */
+static void trim_disk_to_budget(const ds4_convcache *cc, const char *keep_path) {
+    if (!cc || cc->opt.disk_budget_bytes == 0 || !cc->opt.disk_dir) return;
+    for (;;) {
+        DIR *dir = opendir(cc->opt.disk_dir);
+        if (!dir) return;
+        uint64_t total = 0;
+        char *oldest = NULL;
+        time_t oldest_mtime = 0;
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL) {
+            const size_t n = strlen(de->d_name);
+            if (n < 6 || strcmp(de->d_name + n - 5, ".conv") != 0) continue;
+            const size_t plen = strlen(cc->opt.disk_dir) + 1 + n + 1;
+            char *path = (char *)malloc(plen);
+            if (!path) continue;
+            snprintf(path, plen, "%s/%s", cc->opt.disk_dir, de->d_name);
+            struct stat st;
+            if (stat(path, &st) != 0) { free(path); continue; }
+            total += (uint64_t)st.st_size;
+            if ((keep_path && strcmp(path, keep_path) == 0) ||
+                (oldest && st.st_mtime >= oldest_mtime)) {
+                free(path);
+                continue;
+            }
+            free(oldest);
+            oldest = path;
+            oldest_mtime = st.st_mtime;
+        }
+        closedir(dir);
+        const bool over = total > cc->opt.disk_budget_bytes && oldest != NULL;
+        const bool removed = over && unlink(oldest) == 0;
+        free(oldest);
+        if (!removed) return;
+    }
+}
+
 /* Read just the text-header portion of a .conv file. Returns malloc'd text
  * (caller frees) on success, NULL on any error. Sets *text_len_out to the
  * length. Leaves the FILE* positioned just past the text (i.e. at the start
@@ -245,6 +286,7 @@ static void evict_entry(ds4_convcache *cc, int i, bool write_to_disk) {
                                e->residents, e->residents_len,
                                e->aux_blob, e->aux_blob_len,
                                e->snap.ptr, e->snap.len);
+            trim_disk_to_budget(cc, path);
             free(path);
         }
     }
@@ -437,6 +479,7 @@ int ds4_convcache_store(ds4_convcache *cc,
                                    residents, residents_len,
                                    aux_blob, aux_blob_len,
                                    snap.ptr, snap.len);
+                trim_disk_to_budget(cc, path);
                 free(path);
             }
         }
@@ -646,6 +689,7 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
                                   size_t incoming_text_len,
                                   ds4_session *session,
                                   int *loaded_token_count_out,
+                                  size_t *loaded_text_len_out,
                                   ds4_stream_expert_ref **out_residents,
                                   uint32_t *out_residents_len,
                                   uint8_t **out_aux_blob,
@@ -747,6 +791,7 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
         return false;
     }
     if (loaded_token_count_out) *loaded_token_count_out = best_token_count;
+    if (loaded_text_len_out) *loaded_text_len_out = text_len;
     /* Transfer residents / aux_blob to caller (or free if unwanted). */
     if (out_residents && out_residents_len && residents) {
         *out_residents     = residents;
@@ -789,6 +834,7 @@ void ds4_convcache_flush_to_disk(ds4_convcache *cc) {
                            e->snap.ptr, e->snap.len);
         free(path);
     }
+    trim_disk_to_budget(cc, NULL);
 }
 
 uint64_t ds4_convcache_ram_used(const ds4_convcache *cc) {
