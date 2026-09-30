@@ -39207,7 +39207,10 @@ int ds4_gpu_routed_moe_one_tensor(
             g_ssd_streaming_mode &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             (down_type == DS4_METAL_TENSOR_IQ2_XXS ||
+             /* Q2_K down only where the fixed-6 sum path can't serve (GLM's 8
+              * experts); DeepSeek-V4's 6 must keep its original path. */
              (down_type == DS4_METAL_TENSOR_Q2_K &&
+              n_expert != 6 &&
               g_moe_mul_mv_addr_q2_k_f32_pipeline != nil)) &&
             n_expert <= DS4_METAL_MAX_ROUTED_EXPERT_USED &&
             n_tokens == 1 &&
