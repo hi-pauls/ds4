@@ -60955,10 +60955,8 @@ static void ds4_engine_fit_glm_streaming_budget(
         g_glm_streaming_full_resident_layers = 0;
     }
 
-    /* EXPERIMENT: don't subtract the no-copy/mlock'd decode map from the cache
-     * budget (see guard-accounting investigation). Paired with DS4_GLM_MEMORY_GUARD=0
-     * to test whether the mlock'd resident actually competes for the Metal budget. */
-    uint64_t option_bytes = available;
+    uint64_t option_bytes = available > decode_map_extra_bytes ?
+        available - decode_map_extra_bytes : 0;
     uint64_t prefill_headroom = old_prefill_headroom;
     if (prefill_headroom > option_bytes) prefill_headroom = option_bytes;
     option_bytes -= prefill_headroom;
