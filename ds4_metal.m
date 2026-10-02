@@ -1973,6 +1973,30 @@ static int ds4_gpu_moe_selected_trace_record(
     return 1;
 }
 
+/* DS4_MOE_RECORD_ROUTING_TRACE=path: one record of int32 {layer, 6 expert
+ * ids} per routed decode layer, for replaying expert-cache policies offline. */
+static int ds4_gpu_moe_routing_trace_record(
+        uint32_t      layer,
+        const int32_t selected_ids[6],
+        uint32_t      n_selected) {
+    static FILE *fp;
+    static int opened;
+    const char *path = getenv("DS4_MOE_RECORD_ROUTING_TRACE");
+    int ok = 1;
+    if (path && path[0] && n_selected == 6) {
+        if (!opened) {
+            opened = 1;
+            fp = fopen(path, "wb");
+            if (!fp) fprintf(stderr, "ds4: failed to open routing trace file %s\n", path);
+        }
+        const int32_t record[7] = { (int32_t)layer, selected_ids[0], selected_ids[1], selected_ids[2],
+                                    selected_ids[3], selected_ids[4], selected_ids[5] };
+        ok = fp && fwrite(record, sizeof(record), 1, fp) == 1 && fflush(fp) == 0;
+        if (!ok) fprintf(stderr, "ds4: failed to write routing trace file %s\n", path);
+    }
+    return ok;
+}
+
 static int ds4_gpu_moe_selected_trace_replay(
         int32_t  selected_ids[6],
         uint32_t n_selected) {
@@ -41756,6 +41780,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                                   selected_ids,
                                                                   n_expert);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
+                    !ds4_gpu_moe_routing_trace_record(layer_index, selected_ids, n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          selected_ids,
                                                          n_expert,
