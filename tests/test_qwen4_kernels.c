@@ -3441,6 +3441,77 @@ static void bench_iq2_rows(arena_t *a) {
     unsetenv("DS4_QWEN4_Q2K_DOWN");
 }
 
+/* rows Q8_0 rows of cols, quantized as base_rows and repeated, so the output
+ * head fits the arena without a 5 GB double shadow. */
+static uint64_t arena_q8_repeated(arena_t *a, uint64_t rows, uint64_t cols, uint64_t base_rows) {
+    double *sh;
+    const uint64_t row_bytes = cols / 32u * 34u;
+    const uint64_t off = arena_q8_0(a, base_rows, cols, &sh, 0.05f);
+    free(sh);
+    if (rows > base_rows) {
+        const uint64_t rest = arena_alloc(a, (rows - base_rows) * row_bytes);
+        require_ok(rest == off + base_rows * row_bytes, "repeated Q8 rows are contiguous");
+        for (uint64_t r = base_rows; r < rows; r += base_rows) {
+            const uint64_t n = rows - r < base_rows ? rows - r : base_rows;
+            memcpy(a->base + off + r * row_bytes, a->base + off, n * row_bytes);
+        }
+    }
+    return off;
+}
+
+/* QWEN4_BENCH_Q8=1: the dense Q8 decode projections at model shapes, cycling
+ * enough copies that the rows come from DRAM.  With DS4_METAL_CB_TIMES=1 the
+ * "ds4: cb" line after each bench-q8 marker carries that pass's GPU time. */
+static void bench_q8_rows(arena_t *a) {
+    const uint32_t shapes[4][3] = { {10240, 2560, 8}, {6144, 2560, 8}, {2560, 6144, 8}, {248320, 2560, 1} };
+    uint64_t offs[4][8];
+    for (uint32_t s = 0; s < 4; s++)
+        for (uint32_t c = 0; c < shapes[s][2]; c++) offs[s][c] = arena_q8_repeated(a, shapes[s][0], shapes[s][1], 1024);
+    ds4_gpu_tensor *gx = upload(NULL, 2u * 6144u);
+    ds4_gpu_tensor *gy = upload(NULL, 2u * 248320u);
+    float *xv = rand_vec(2u * 6144u, 1.0f);
+    require_ok(ds4_gpu_tensor_write(gx, 0, xv, 2u * 6144u * sizeof(float)), "q8 bench input");
+    free(xv);
+    for (uint32_t T = 1; T <= 2; T++)
+        for (uint32_t s = 0; s < 4; s++) {
+            const uint32_t calls = shapes[s][2] == 1 ? 8u : 64u;
+            /* The first five passes bring the GPU clock back up after host-side setup. */
+            for (uint32_t rep = 0; rep < 10; rep++) {
+                require_ok(ds4_gpu_begin_commands(), "begin");
+                for (uint32_t c = 0; c < calls; c++)
+                    require_ok(ds4_gpu_matmul_q8_0_tensor(gy, a->base, a->size, offs[s][c % shapes[s][2]],
+                                                          shapes[s][1], shapes[s][0], gx, T), "bench q8");
+                fprintf(stderr, "bench-q8 T=%u out=%u in=%u rep=%u calls=%u bytes=%llu\n", T, shapes[s][0], shapes[s][1],
+                        rep, calls, (unsigned long long)shapes[s][0] * (shapes[s][1] / 32u) * 34u);
+                require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "bench sync");
+            }
+        }
+    ds4_gpu_tensor_free(gx);
+    ds4_gpu_tensor_free(gy);
+    /* The F16 hyper-connection rows: the 10240 -> 320 down GEMV and the
+     * 320 -> 10240 up rows fused into the gate mix, 16 copies each. */
+    uint64_t hdown[16], hup[16];
+    double *sh;
+    for (uint32_t c = 0; c < 16; c++) {
+        hdown[c] = arena_f16(a, 320ull * 10240, &sh, 0.05f); free(sh);
+        hup[c] = arena_f16(a, 10240ull * 320, &sh, 0.05f); free(sh);
+    }
+    ds4_gpu_tensor *gxn = upload(NULL, 2u * 10240u), *glo = upload(NULL, 2u * 320u), *gout = upload(NULL, 2u * 2560u);
+    for (uint32_t T = 1; T <= 2; T++)
+        for (uint32_t s = 0; s < 2; s++)
+            for (uint32_t rep = 0; rep < 10; rep++) {
+                require_ok(ds4_gpu_begin_commands(), "begin");
+                for (uint32_t c = 0; c < 64; c++)
+                    require_ok(s == 0 ? ds4_gpu_matmul_f16_tensor(glo, a->base, a->size, hdown[c % 16], 10240, 320, gxn, T)
+                                      : ds4_gpu_qwen4_hc_gate_mix_tensor(gout, gxn, glo, a->base, a->size, hup[c % 16],
+                                                                         1u, T, 2560, 4, 320), "bench hc");
+                fprintf(stderr, "bench-q8 T=%u out=%u in=%u rep=%u calls=64 bytes=%llu\n", T, s ? 10240u : 320u,
+                        s ? 320u : 10240u, rep, 320ull * 10240u * 2u);
+                require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "bench sync");
+            }
+    ds4_gpu_tensor_free(gxn); ds4_gpu_tensor_free(glo); ds4_gpu_tensor_free(gout);
+}
+
 /* four projections of one input, mixed weight types (q8_0, bf16, q4_0, f16) */
 static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     const uint32_t rows[4] = { 64, 48, 32, 16 };
@@ -3715,6 +3786,10 @@ int main(void) {
     }
     if (getenv("QWEN4_BENCH_IQ2")) {
         bench_iq2_rows(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_BENCH_Q8")) {
+        bench_q8_rows(&arena);
         return 0;
     }
     printf("hyper-connections\n");

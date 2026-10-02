@@ -5395,8 +5395,16 @@ typedef struct {
 
 static int ds4_gpu_tp_world_is_two(void);
 
+/* Two SIMD groups per Q8_0 matvec threadgroup on the M1 Max: ~310 -> 328 GB/s
+ * on the 2560-wide projections (6144-wide ones lose ~2 us), and 199 -> 360
+ * GB/s on a 248k-row output head, which otherwise takes eight groups
+ * (3.4 -> 1.9 ms per token). */
+static bool ds4_gpu_q8_0_mv_two_groups(void) {
+    return ds4_gpu_tp_world_is_two() || ds4_gpu_device_name_contains("M1 Max");
+}
+
 static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
-    const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
+    const uint64_t default_nsg = ds4_gpu_q8_0_mv_two_groups() ? 2u : 4u;
     const int16_t nsg =
         (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG", default_nsg, 1u, 8u);
     return (ds4_gpu_mv_dispatch) {
@@ -19424,7 +19432,10 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
 
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
-            if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            if (out_dim > 65536u) {
+                mv_dispatch.nsg = (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_WIDE_NSG",
+                    ds4_gpu_device_name_contains("M1 Max") ? 2u : 8u, 1u, 8u);
+            }
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
@@ -48719,10 +48730,12 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     }
     const bool pair = n_tokens == 2u && getenv("DS4_QWEN4_NO_HC_PAIR") == NULL;
     /* Register-prefetched F16 rows (same lane order and rounding, pinned
-     * against the plain kernel by tests/test_qwen4_kernels.c); M5 default. */
+     * against the plain kernel by tests/test_qwen4_kernels.c); M5 default,
+     * and M1 Max, where it takes the 10240x320 mix from ~32 to ~24 us. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_HC_MIX_PREFETCH");
     const bool prefetch = weight_type == 1u &&
-        (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (prefetch_override >= 0 ? prefetch_override > 0 :
+         ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M1 Max"));
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
                                               QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
