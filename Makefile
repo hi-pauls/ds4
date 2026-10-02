@@ -532,8 +532,14 @@ ds4_prompt_prefix.o: ds4_prompt_prefix.c ds4_prompt_prefix.h ds4.h
 ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_gpu_args.c
 
-ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_convcache.h ds4_syscache.h ds4_gpu.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
+
+ds4_convcache.o: ds4_convcache.c ds4_convcache.h ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_convcache.c
+
+ds4_syscache.o: ds4_syscache.c ds4_syscache.h ds4.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_syscache.c
 
 ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
