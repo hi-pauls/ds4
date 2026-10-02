@@ -48291,6 +48291,12 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    QWEN4_K_MOE_MID_IQ2XXS_NR1,
+    QWEN4_K_MOE_MID_IQ2XXS_NR2,
+    QWEN4_K_MOE_MID_IQ2XXS_NR4,
+    QWEN4_K_MOE_DOWN_Q2K_NR2,
+    QWEN4_K_MOE_DOWN_Q2K_NR4,
+    QWEN4_K_MOE_DOWN_Q2K_NR8,
     QWEN4_K_COUNT,
 };
 
@@ -48396,6 +48402,12 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen4_moe_mid_iq2xxs_nr1",
+    "kernel_qwen4_moe_mid_iq2xxs_nr2",
+    "kernel_qwen4_moe_mid_iq2xxs_nr4",
+    "kernel_qwen4_moe_down_q2k_nr2",
+    "kernel_qwen4_moe_down_q2k_nr4",
+    "kernel_qwen4_moe_down_q2k_nr8",
 };
 
 typedef struct {
@@ -48437,6 +48449,21 @@ static bool qwen4_moe_mv_specialize(uint32_t type) {
     return override >= 0 ? override != 0 :
         ((type == 16u || type == 10u || type == 39u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         (type == 39u && ds4_gpu_device_is_m5_apple_silicon());
+}
+
+/* IQ2_XXS gate/up and Q2_K down decode kernels for the Q2 pack: bit-identical
+ * to the generic rows and ~25% faster per layer on the M1 Max, where they are
+ * the default; other devices opt in with the environment switch.  More rows
+ * per SIMD group measured slower there: the rows are ALU-bound on the 2-bit
+ * decode, and fewer threads hide less of it. */
+#define QWEN4_IQ2_MID_NR 1u
+#define QWEN4_IQ2_MID_NSG 4u
+#define QWEN4_Q2K_DOWN_NR 2u
+#define QWEN4_Q2K_DOWN_NSG 4u
+
+static bool qwen4_iq2_rows_enabled(const char *env) {
+    const int override = ds4_gpu_env_bool(env);
+    return override >= 0 ? override != 0 : ds4_gpu_device_name_contains("M1 Max");
 }
 
 static uint32_t qwen4_moe_mv_rows(void) {
@@ -49676,6 +49703,16 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     const uint32_t nsg = q4k ?
         (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q4K_MID_NSG", default_nsg, 1u, 8u) :
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
+    if (weight_type == 16u && !specialize && qwen4_iq2_rows_enabled("DS4_QWEN4_IQ2_MID")) {
+        const uint32_t inr = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_IQ2_MID_NR", QWEN4_IQ2_MID_NR, 1u, 4u);
+        const uint32_t insg = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_IQ2_MID_NSG", QWEN4_IQ2_MID_NSG, 1u, 16u);
+        const uint32_t irows = (inr >= 4u ? 4u : inr >= 2u ? 2u : 1u) * insg;
+        const int ikernel = inr >= 4u ? QWEN4_K_MOE_MID_IQ2XXS_NR4 :
+                            inr >= 2u ? QWEN4_K_MOE_MID_IQ2XXS_NR2 : QWEN4_K_MOE_MID_IQ2XXS_NR1;
+        return qwen4_dispatch(ikernel, &args, sizeof(args), b, 7,
+                              MTLSizeMake((ff_dim + irows - 1) / irows, n_out, n_tokens),
+                              MTLSizeMake(32u * insg, 1, 1), 256u * sizeof(uint64_t));
+    }
     const uint32_t rows_per_tg = nr * nsg;
     const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
@@ -49712,6 +49749,16 @@ int ds4_gpu_qwen4_moe_down_tensor(
         if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, shared_bytes, "shared down")) return 0;
     } else {
         b[4] = b[0];
+    }
+    if (weight_type == 10u && !qwen4_moe_mv_specialize(weight_type) && qwen4_iq2_rows_enabled("DS4_QWEN4_Q2K_DOWN")) {
+        const uint32_t dnr = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q2K_DOWN_NR", QWEN4_Q2K_DOWN_NR, 2u, 8u);
+        const uint32_t dnsg = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_Q2K_DOWN_NSG", QWEN4_Q2K_DOWN_NSG, 1u, 16u);
+        const uint32_t drows = (dnr >= 8u ? 8u : dnr >= 4u ? 4u : 2u) * dnsg;
+        const int dkernel = dnr >= 8u ? QWEN4_K_MOE_DOWN_Q2K_NR8 :
+                            dnr >= 4u ? QWEN4_K_MOE_DOWN_Q2K_NR4 : QWEN4_K_MOE_DOWN_Q2K_NR2;
+        return qwen4_dispatch(dkernel, &args, sizeof(args), b, 5,
+                              MTLSizeMake((out_dim + drows - 1) / drows, n_out, n_tokens),
+                              MTLSizeMake(32u * dnsg, 1, 1), 0);
     }
     const uint32_t nsg = qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_groups(weight_type) : 4u;
     const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows() : 2u);

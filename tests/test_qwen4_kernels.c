@@ -1746,6 +1746,41 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
         unsetenv("DS4_QWEN4_MOE_MV_NSG");
         free(bm); free(bp); free(am); free(ap);
     }
+    if (wtype == 16u && dtype == 10u && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
+        /* The row-batched IQ2_XXS mid and Q2_K down kernels must match the
+         * generic rows bit for bit at every row/group geometry. */
+        const uint64_t nm = (uint64_t)T * n_out * F, np = (uint64_t)T * n_out * E;
+        float *bm = malloc(nm * sizeof(float)), *bp = malloc(np * sizeof(float));
+        float *am = malloc(nm * sizeof(float)), *ap = malloc(np * sizeof(float));
+        require_ok(bm && bp && am && ap, "row-batched exact allocation");
+        const char *geo[][4] = { {"1", "4", "2", "4"}, {"2", "4", "4", "4"}, {"4", "4", "8", "4"},
+                                 {"2", "8", "4", "16"}, {"4", "2", "2", "8"}, {"1", "16", "8", "2"} };
+        setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", "0", 1);
+        for (uint32_t mode = 0; mode <= sizeof(geo) / sizeof(geo[0]); mode++) {
+            setenv("DS4_QWEN4_IQ2_MID", mode ? "1" : "0", 1);
+            setenv("DS4_QWEN4_Q2K_DOWN", mode ? "1" : "0", 1);
+            if (mode) {
+                setenv("DS4_QWEN4_IQ2_MID_NR", geo[mode - 1][0], 1);
+                setenv("DS4_QWEN4_IQ2_MID_NSG", geo[mode - 1][1], 1);
+                setenv("DS4_QWEN4_Q2K_DOWN_NR", geo[mode - 1][2], 1);
+                setenv("DS4_QWEN4_Q2K_DOWN_NSG", geo[mode - 1][3], 1);
+            }
+            require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, gsel, a->base, a->size,
+                gate_off, up_off, wtype, NE, T, slots, E, F, sg_off, su_off, shared_type), "row-batched mid");
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size,
+                down_off, dtype, NE, T, slots, F, E, sd_off, shared_type), "row-batched down");
+            require_ok(ds4_gpu_tensor_read(gmid, 0, am, nm * sizeof(float)) &&
+                       ds4_gpu_tensor_read(gpart, 0, ap, np * sizeof(float)), "row-batched read");
+            if (!mode) { memcpy(bm, am, nm * sizeof(float)); memcpy(bp, ap, np * sizeof(float)); }
+            else { check_exact_f32("row-batched IQ2 mid", am, bm, nm);
+                   check_exact_f32("row-batched Q2 down", ap, bp, np); }
+        }
+        const char *vars[] = { "DS4_QWEN4_MOE_MV_SPECIALIZE", "DS4_QWEN4_IQ2_MID", "DS4_QWEN4_Q2K_DOWN",
+                               "DS4_QWEN4_IQ2_MID_NR", "DS4_QWEN4_IQ2_MID_NSG",
+                               "DS4_QWEN4_Q2K_DOWN_NR", "DS4_QWEN4_Q2K_DOWN_NSG" };
+        for (uint32_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) unsetenv(vars[i]);
+        free(bm); free(bp); free(am); free(ap);
+    }
     if (dtype == 39u && getenv("DS4_TEST_QWEN4_MV_EXACT")) {
         /* The prefetched MXFP4 down rows must match the plain kernel byte for
          * bit, shared Q8 slot included, at the default and generic geometries. */
@@ -3323,6 +3358,89 @@ static void bench_dispatch(arena_t *a) {
     bench_run("moe_mid q4_K 10+1 slots T=2", bench_moe_mid_q4k, &c, 100);
 }
 
+/* Appends NE experts of a routed tier by quantizing 16 and repeating them, so
+ * a full 512-expert layer fits the arena without a 512-expert double shadow. */
+static uint64_t arena_tier_repeated(arena_t *a, uint32_t wtype, uint32_t NE, uint64_t rows, uint64_t cols,
+                                    uint64_t expert_bytes) {
+    double *sh;
+    const uint64_t off = arena_tier(a, wtype, 16u * rows, cols, &sh);
+    free(sh);
+    const uint64_t rest = arena_alloc(a, (uint64_t)(NE - 16u) * expert_bytes);
+    require_ok(rest == off + 16u * expert_bytes, "repeated experts are contiguous");
+    for (uint32_t e = 16; e < NE; e++)
+        memcpy(a->base + off + (uint64_t)e * expert_bytes, a->base + off + (uint64_t)(e % 16u) * expert_bytes, expert_bytes);
+    return off;
+}
+
+/* QWEN4_BENCH_IQ2=1: the Q2 pack's routed decode rows at full-layer size (512
+ * experts, IQ2_XXS gate/up, Q2_K down padded to 768, shared Q8), cycling 64
+ * selections so the routed rows come from DRAM rather than the system cache.
+ * Generic and row-batched kernels alternate; prints medians of 7 runs. */
+static void bench_iq2_rows(arena_t *a) {
+    const uint32_t NE = 512, slots = 10, E = 2560, F = 640, DF = 768, n_sel = 64, calls = 256;
+    const uint64_t mid_expert = (uint64_t)F * (E / 256u) * 66u, down_expert = (uint64_t)E * (DF / 256u) * 84u;
+    const uint64_t gate_off = arena_tier_repeated(a, 16u, NE, F, E, mid_expert);
+    const uint64_t up_off = arena_tier_repeated(a, 16u, NE, F, E, mid_expert);
+    const uint64_t down_off = arena_tier_repeated(a, 10u, NE, E, DF, down_expert);
+    double *sh;
+    const uint64_t sg_off = arena_q8_0(a, F, E, &sh, 0.05f); free(sh);
+    const uint64_t su_off = arena_q8_0(a, F, E, &sh, 0.05f); free(sh);
+    const uint64_t sd_off = arena_q8_0(a, E, F, &sh, 0.05f); free(sh);
+    for (uint32_t T = 1; T <= 2; T++) {
+        ds4_gpu_tensor *sel[64];
+        uint32_t seed = 99u + T;
+        for (uint32_t s = 0; s < n_sel; s++) {
+            int32_t ids[20];
+            for (uint32_t i = 0; i < T * slots; i++) { seed = seed * 1664525u + 1013904223u; ids[i] = (int32_t)((seed >> 8) % NE); }
+            sel[s] = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+            require_ok(sel[s] && ds4_gpu_tensor_write(sel[s], 0, ids, (uint64_t)T * slots * 4), "iq2 bench selection");
+        }
+        float *xv = rand_vec((uint64_t)T * E, 1.0f);
+        ds4_gpu_tensor *gx = upload(xv, (uint64_t)T * E);
+        free(xv);
+        ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * (slots + 1) * F);
+        ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * (slots + 1) * E);
+        double samples[2][3][7];
+        for (uint32_t rep = 0; rep < 8; rep++) for (uint32_t order = 0; order < 2; order++) {
+            const uint32_t mode = (rep + order) & 1u;
+            setenv("DS4_QWEN4_IQ2_MID", mode ? "1" : "0", 1);
+            setenv("DS4_QWEN4_Q2K_DOWN", mode ? "1" : "0", 1);
+            for (uint32_t part = 0; part < 3; part++) {
+                require_ok(ds4_gpu_begin_commands(), "begin");
+                const double t0 = bench_now();
+                for (uint32_t c = 0; c < calls; c++) {
+                    ds4_gpu_tensor *s = sel[c % n_sel];
+                    if (part != 1)
+                        require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, s, a->base, a->size, gate_off, up_off, 16u,
+                                                                NE, T, slots, E, F, sg_off, su_off, 8u), "bench mid");
+                    if (part != 0)
+                        require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, s, a->base, a->size, down_off, 10u,
+                                                                 NE, T, slots, F, E, sd_off, 8u), "bench down");
+                }
+                /* With DS4_METAL_CB_TIMES=1 the next "ds4: cb" line carries this pass's GPU time,
+                 * free of the encoding cost included below. */
+                fprintf(stderr, "bench-cb T=%u mode=%u part=%u rep=%u calls=%u\n", T, mode, part, rep, calls);
+                require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "bench sync");
+                if (rep) samples[mode][part][rep - 1] = 1e6 * (bench_now() - t0) / calls;
+            }
+        }
+        const char *names[3] = { "mid", "down", "mid+down" };
+        const double mbytes[3] = { 2.0 * slots * mid_expert + 2.0 * F * (E / 32u) * 34u,
+                                   (double)slots * down_expert + (double)E * (F / 32u) * 34u, 0.0 };
+        for (uint32_t part = 0; part < 3; part++) {
+            const double bytes = part < 2 ? mbytes[part] : mbytes[0] + mbytes[1];
+            const double base = hc_norm_median7(samples[0][part]), rows = hc_norm_median7(samples[1][part]);
+            printf("  T=%u %-9s generic %7.1f us (%5.1f GB/s)  row-batched %7.1f us (%5.1f GB/s)  %+.1f%%\n",
+                   T, names[part], base, T * bytes / base * 1e-3, rows, T * bytes / rows * 1e-3,
+                   100.0 * (base / rows - 1.0));
+        }
+        for (uint32_t s = 0; s < n_sel; s++) ds4_gpu_tensor_free(sel[s]);
+        ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
+    }
+    unsetenv("DS4_QWEN4_IQ2_MID");
+    unsetenv("DS4_QWEN4_Q2K_DOWN");
+}
+
 /* four projections of one input, mixed weight types (q8_0, bf16, q4_0, f16) */
 static void test_multi_gemv(arena_t *a, uint32_t E, uint32_t T) {
     const uint32_t rows[4] = { 64, 48, 32, 16 };
@@ -3593,6 +3711,10 @@ int main(void) {
     }
     if (getenv("QWEN4_BENCH")) {
         bench_dispatch(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_BENCH_IQ2")) {
+        bench_iq2_rows(&arena);
         return 0;
     }
     printf("hyper-connections\n");
