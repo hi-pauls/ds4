@@ -3215,13 +3215,19 @@ kernel void kernel_qwen4_moe_down_q2k(
 #pragma unroll
         for (uint r = 0; r < NR; r++) {
             if (row0 + r >= args.out_rows) break;
+            /* Four 2-bit weights per word op: the lane's eight quant bytes
+             * arrive as two words (4-byte aligned: rows and blocks are), are
+             * shifted and masked together and widened as uchar4 vectors. */
             device const uchar *blk = rows + (uint64_t)r * args.row_bytes + (uint64_t)ib * 84;
-            const float d = (float)(*(device const half *)(blk + 80));
-            const float dmin = (float)(*(device const half *)(blk + 82));
+            const half2 dd = as_type<half2>(*(device const uint *)(blk + 80));
+            const float d = (float)dd.x, dmin = (float)dd.y;
             const uint sc = blk[group];
             const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
-            device const uchar *qs = blk + 16 + q_base + l;
-            for (uint i = 0; i < 8; i++) acc[r] += (ds * (float)((qs[i] >> shift) & 3u) - dm) * y[i];
+            device const uint *qw = (device const uint *)(blk + 16 + q_base + l);
+            const float4 qa = float4(as_type<uchar4>((qw[0] >> shift) & 0x03030303u));
+            const float4 qb = float4(as_type<uchar4>((qw[1] >> shift) & 0x03030303u));
+            const float q[8] = { qa.x, qa.y, qa.z, qa.w, qb.x, qb.y, qb.z, qb.w };
+            for (uint i = 0; i < 8; i++) acc[r] += (ds * q[i] - dm) * y[i];
         }
     }
 #pragma unroll
