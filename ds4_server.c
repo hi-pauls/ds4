@@ -13850,15 +13850,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             }
             pthread_mutex_lock(&s->inference_mu);
             const ds4_tokens *live = ds4_session_tokens(slot->session);
-            if (old_pos > 0 && live && live->len == old_pos &&
-                ds4_session_checkpoint_valid(slot->session))
+            const bool checkpoint_ok = ds4_session_checkpoint_valid(slot->session);
+            const char *key_source = out_key ? "visible" : "rendered";
+            if (old_pos > 0 && live && live->len == old_pos && checkpoint_ok)
             {
                 size_t out_key_len = 0;
                 if (out_key) out_key_len = strlen(out_key);
                 else out_key = render_tokens_text(s->engine, live, &out_key_len);
                 if (out_key) {
                     char sto_err[160] = {0};
-                    ds4_convcache_store(&s->convcache, s->engine,
+                    const int stored = ds4_convcache_store(&s->convcache, s->engine,
                                         slot->session,
                                         out_key, out_key_len,
                                         model_id, quant_bits, ctx_size,
@@ -13866,7 +13867,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                         j->req.prompt_text, req_text_len,
                                         out_tool_blob, (uint32_t)out_tool_blob_len,
                                         sto_err, sizeof(sto_err));
+                    server_log(DS4_LOG_KVCACHE,
+                               "ds4-server: convcache store %s tokens=%d key=%s key_len=%zu%s%s",
+                               stored >= 0 ? "ok" : "failed", (int)live->len, key_source, out_key_len,
+                               stored >= 0 ? "" : " err=", stored >= 0 ? "" : sto_err);
                 }
+            } else if (old_pos > 0) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: convcache store skipped live=%d old_pos=%d checkpoint=%s",
+                           live ? (int)live->len : -1, old_pos, checkpoint_ok ? "valid" : "invalid");
             }
             free(out_key);
             free(out_tool_blob);
@@ -13925,6 +13934,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                            &prompt_for_sync);
                 if (cached > 0) cache_source = restored_from;
             }
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: convcache lookup prompt_len=%zu ram_entries=%d %s cached=%d",
+                       req_text_len, s->convcache.len, restored_from ? restored_from : "miss", cached);
             pthread_mutex_unlock(&s->inference_mu);
 
             /* The slot's remembered visible/tool bindings and rendered-text
