@@ -390,6 +390,13 @@ void ds4_gpu_stream_expert_cache_prefetch_finish(bool cancel);
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+/* Global prior for route hotness: expected selections per decoded token of
+ * every [layer][expert], from the recorded hotlist; new conversations start
+ * from it (Metal; no-op elsewhere). */
+void ds4_gpu_stream_expert_cache_set_hotness_prior(
+        const double *selections_per_token,
+        uint32_t      n_layer,
+        uint32_t      n_expert);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,

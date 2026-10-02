@@ -33767,6 +33767,10 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
+/* The CUDA cache keeps no route hotness table. */
+extern "C" void ds4_gpu_stream_expert_cache_set_hotness_prior(const double *, uint32_t, uint32_t) {
+}
+
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_selected_cache_release();
 }

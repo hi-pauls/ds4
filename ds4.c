@@ -33968,6 +33968,23 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         return false;
     }
     if (loaded == 0) return true;
+    if (from_file) {
+        /* Recorded hit counts as each layer's share of its selections per
+         * token: the prior a new conversation's eviction hotness starts from. */
+        double *prior = calloc((size_t)DS4_N_LAYER * DS4_N_EXPERT, sizeof(double));
+        if (prior) {
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                double layer_hits = 0.0;
+                for (uint32_t i = 0; i < counts[il]; i++) layer_hits += priorities[il][i];
+                for (uint32_t i = 0; i < counts[il] && layer_hits > 0.0; i++) {
+                    prior[(uint64_t)il * DS4_N_EXPERT + (uint32_t)experts[il][i]] =
+                        (double)DS4_N_EXPERT_USED * priorities[il][i] / layer_hits;
+                }
+            }
+            ds4_gpu_stream_expert_cache_set_hotness_prior(prior, DS4_N_LAYER, DS4_N_EXPERT);
+            free(prior);
+        }
+    }
 
     const double t0 = profile ? now_sec() : 0.0;
     uint32_t seeded_layers = 0;
