@@ -1350,12 +1350,14 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+static uint64_t ds4_gpu_env_u64(const char *name, uint64_t fallback, uint64_t min_value, uint64_t max_value);
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
-        if (n_printed < 400) {
+        if (n_printed < ds4_gpu_env_u64("DS4_METAL_CB_TIMES_MAX", 400u, 1u, UINT64_MAX)) {
             n_printed++;
             fprintf(stderr,
                     "ds4: cb %s: driver %.0f us, queue-wait %.0f us, gpu %.0f us, gap-from-prev-gpu-end %.0f us\n",
