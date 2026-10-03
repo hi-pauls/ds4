@@ -18298,27 +18298,34 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
 /* Streamed prefill expert staging. A large prefill chunk routes to nearly
  * every expert of a layer, and the mapped-model path pages whole layers in
  * through the file cache, ignoring what the expert cache already holds. Here
- * each layer's uncached experts are read straight into one half of a
- * two-layer staging buffer while the previous layer runs on the GPU, and the
+ * each layer's uncached experts are read straight into one slot of a
+ * three-layer staging ring while earlier layers run on the GPU, and the
  * batched MoE reads cached experts from the cache and the rest from staging
- * through per-expert address tables. The expert cache is not modified. */
+ * through per-expert address tables. The expert cache is not modified. Three
+ * slots let layer il+1 be read while layer il-1 still executes and layer il
+ * is being encoded, so the layers can be committed without waiting. */
+#define DS4_PREFILL_STAGE_SLOTS 3u
 typedef struct {
-    __strong id<MTLBuffer> buf[2];
-    __strong id<MTLBuffer> addr[2][3];
-    __strong id<MTLCommandBuffer> last_cb[2];
-    int32_t     layer[2];
-    const void *model_map[2];
-    int         pending[2];
-    ds4_gpu_stream_expert_cache_entry *res[2][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
-    uint32_t    n_res[2];
-    ds4_gpu_stream_expert_pread_task tasks[2][3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
-    uint32_t    n_tasks[2];
+    __strong id<MTLBuffer> buf[DS4_PREFILL_STAGE_SLOTS];
+    __strong id<MTLBuffer> addr[DS4_PREFILL_STAGE_SLOTS][3];
+    __strong id<MTLCommandBuffer> last_cb[DS4_PREFILL_STAGE_SLOTS];
+    int32_t     layer[DS4_PREFILL_STAGE_SLOTS];
+    const void *model_map[DS4_PREFILL_STAGE_SLOTS];
+    int         pending[DS4_PREFILL_STAGE_SLOTS];
+    ds4_gpu_stream_expert_cache_entry *res[DS4_PREFILL_STAGE_SLOTS][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t    n_res[DS4_PREFILL_STAGE_SLOTS];
+    ds4_gpu_stream_expert_pread_task tasks[DS4_PREFILL_STAGE_SLOTS][3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t    n_tasks[DS4_PREFILL_STAGE_SLOTS];
     uint64_t    staged_experts;
     uint64_t    cached_experts;
     double      wait_ms;
+    double      begin_ms[DS4_PREFILL_STAGE_SLOTS];
+    uint64_t    bytes[DS4_PREFILL_STAGE_SLOTS];
+    double      read_ms;
+    uint64_t    read_bytes;
 } ds4_gpu_prefill_stage;
 
-static ds4_gpu_prefill_stage g_prefill_stage = { .layer = { -1, -1 } };
+static ds4_gpu_prefill_stage g_prefill_stage = { .layer = { -1, -1, -1 } };
 
 int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
@@ -18327,41 +18334,44 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
         t->gate_expert_bytes == 0 || t->down_expert_bytes == 0) {
         return 0;
     }
-    const uint32_t half = t->layer & 1u;
-    if (s->pending[half ^ 1u]) {
+    const uint32_t ring = t->layer % DS4_PREFILL_STAGE_SLOTS;
+    const uint32_t prev = (ring + DS4_PREFILL_STAGE_SLOTS - 1u) % DS4_PREFILL_STAGE_SLOTS;
+    if (s->pending[prev]) {
         fprintf(stderr, "ds4: prefill staging for layer %u began before layer %d was waited\n",
-                t->layer, s->layer[half ^ 1u]);
+                t->layer, s->layer[prev]);
         return 0;
     }
     const uint64_t slot_bytes = 2u * t->gate_expert_bytes + t->down_expert_bytes;
     const uint64_t buf_bytes = slot_bytes * t->n_total_expert;
-    if (!s->buf[half] || [s->buf[half] length] < buf_bytes) {
-        s->buf[half] = [g_device newBufferWithLength:(NSUInteger)buf_bytes
+    if (!s->buf[ring] || [s->buf[ring] length] < buf_bytes) {
+        s->buf[ring] = [g_device newBufferWithLength:(NSUInteger)buf_bytes
                                              options:MTLResourceStorageModeShared];
         for (uint32_t k = 0; k < 3; k++) {
-            s->addr[half][k] = [g_device newBufferWithLength:DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t)
+            s->addr[ring][k] = [g_device newBufferWithLength:DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t)
                                                      options:MTLResourceStorageModeShared];
         }
-        if (!s->buf[half] || !s->addr[half][0] || !s->addr[half][1] || !s->addr[half][2]) {
+        if (!s->buf[ring] || !s->addr[ring][0] || !s->addr[ring][1] || !s->addr[ring][2]) {
             fprintf(stderr, "ds4: prefill staging could not allocate %.2f GiB\n", ds4_gpu_gib(buf_bytes));
-            s->buf[half] = nil;
+            s->buf[ring] = nil;
             return 0;
         }
     }
-    /* This half was last read by the layer two before; its GPU work must be done. */
-    if (s->last_cb[half]) {
-        [s->last_cb[half] waitUntilCompleted];
-        s->last_cb[half] = nil;
+    /* This slot was last read by the layer three before; its GPU work must be done. */
+    if (s->last_cb[ring]) {
+        const uint64_t tl_t0 = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+        [s->last_cb[ring] waitUntilCompleted];
+        s->last_cb[ring] = nil;
+        if (g_timeline_file) ds4_gpu_timeline_cpu("stage-cb-wait", tl_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     }
 
-    uint64_t *gate_addr = (uint64_t *)[s->addr[half][0] contents];
-    uint64_t *up_addr = (uint64_t *)[s->addr[half][1] contents];
-    uint64_t *down_addr = (uint64_t *)[s->addr[half][2] contents];
-    uint8_t *base = (uint8_t *)[s->buf[half] contents];
-    const uint64_t base_gpu = ds4_gpu_buffer_address(s->buf[half], 0);
+    uint64_t *gate_addr = (uint64_t *)[s->addr[ring][0] contents];
+    uint64_t *up_addr = (uint64_t *)[s->addr[ring][1] contents];
+    uint64_t *down_addr = (uint64_t *)[s->addr[ring][2] contents];
+    uint8_t *base = (uint8_t *)[s->buf[ring] contents];
+    const uint64_t base_gpu = ds4_gpu_buffer_address(s->buf[ring], 0);
     const int fd = ds4_gpu_model_fd_for_map(t->model_map);
-    s->n_res[half] = 0;
-    s->n_tasks[half] = 0;
+    s->n_res[ring] = 0;
+    s->n_tasks[ring] = 0;
     for (uint32_t e = 0; e < t->n_total_expert; e++) {
         const uint64_t g_off = t->gate_offset + (uint64_t)e * t->gate_expert_bytes;
         const uint64_t u_off = t->up_offset + (uint64_t)e * t->gate_expert_bytes;
@@ -18373,7 +18383,7 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
             gate_addr[e] = ds4_gpu_buffer_address(entry->gate_buffer, entry->gate_inner);
             up_addr[e] = ds4_gpu_buffer_address(entry->up_buffer, entry->up_inner);
             down_addr[e] = ds4_gpu_buffer_address(entry->down_buffer, entry->down_inner);
-            s->res[half][s->n_res[half]++] = entry;
+            s->res[ring][s->n_res[ring]++] = entry;
             s->cached_experts++;
         } else {
             const uint64_t slot = (uint64_t)e * slot_bytes;
@@ -18381,7 +18391,7 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
             const uint64_t offs[3] = { g_off, u_off, d_off };
             const uint64_t inner[3] = { 0, t->gate_expert_bytes, 2u * t->gate_expert_bytes };
             for (uint32_t k = 0; k < 3; k++) {
-                s->tasks[half][s->n_tasks[half]++] = (ds4_gpu_stream_expert_pread_task) {
+                s->tasks[ring][s->n_tasks[ring]++] = (ds4_gpu_stream_expert_pread_task) {
                     .offset = offs[k], .len = lens[k], .dst = base + slot + inner[k], .fd = fd,
                 };
             }
@@ -18391,16 +18401,19 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
             s->staged_experts++;
         }
     }
-    s->layer[half] = (int32_t)t->layer;
-    s->model_map[half] = t->model_map;
-    s->pending[half] = 0;
-    if (s->n_tasks[half] != 0) {
-        const uint32_t workers = ds4_gpu_stream_expert_pread_thread_count(s->n_tasks[half]);
-        if (ds4_gpu_stream_expert_pread_pool_begin(s->tasks[half], s->n_tasks[half], workers)) {
-            s->pending[half] = 1;
-        } else if (!ds4_gpu_stream_expert_pread_tasks(s->tasks[half], s->n_tasks[half],
+    s->layer[ring] = (int32_t)t->layer;
+    s->model_map[ring] = t->model_map;
+    s->pending[ring] = 0;
+    s->bytes[ring] = 0;
+    for (uint32_t i = 0; i < s->n_tasks[ring]; i++) s->bytes[ring] += s->tasks[ring][i].len;
+    s->begin_ms[ring] = ds4_gpu_now_ms();
+    if (s->n_tasks[ring] != 0) {
+        const uint32_t workers = ds4_gpu_stream_expert_pread_thread_count(s->n_tasks[ring]);
+        if (ds4_gpu_stream_expert_pread_pool_begin(s->tasks[ring], s->n_tasks[ring], workers)) {
+            s->pending[ring] = 1;
+        } else if (!ds4_gpu_stream_expert_pread_tasks(s->tasks[ring], s->n_tasks[ring],
                                                       t->model_map, NULL, NULL)) {
-            s->layer[half] = -1;
+            s->layer[ring] = -1;
             return 0;
         }
     }
@@ -18409,34 +18422,53 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
 
 int ds4_gpu_prefill_stage_wait(uint32_t layer) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
-    const uint32_t half = layer & 1u;
-    if (s->layer[half] != (int32_t)layer) return 0;
-    if (!s->pending[half]) return 1;
+    const uint32_t ring = layer % DS4_PREFILL_STAGE_SLOTS;
+    if (s->layer[ring] != (int32_t)layer) return 0;
+    if (!s->pending[ring]) return 1;
     const double t0 = ds4_gpu_now_ms();
+    const uint64_t tl_t0 = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     int ok = ds4_gpu_stream_expert_pread_pool_wait();
-    s->pending[half] = 0;
-    for (uint32_t i = 0; ok && i < s->n_tasks[half]; i++) ok = s->tasks[half][i].ok;
-    s->wait_ms += ds4_gpu_now_ms() - t0;
+    if (g_timeline_file) ds4_gpu_timeline_cpu("stage-read-wait", tl_t0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    s->pending[ring] = 0;
+    for (uint32_t i = 0; ok && i < s->n_tasks[ring]; i++) ok = s->tasks[ring][i].ok;
+    const double t1 = ds4_gpu_now_ms();
+    s->wait_ms += t1 - t0;
+    /* Only reads still running when waited on tell the pool's throughput. */
+    if (t1 - t0 > 1.0) {
+        s->read_ms += t1 - s->begin_ms[ring];
+        s->read_bytes += s->bytes[ring];
+    }
     if (!ok) {
         fprintf(stderr, "ds4: prefill staging reads failed for layer %u\n", layer);
-        s->layer[half] = -1;
+        s->layer[ring] = -1;
     }
     return ok;
 }
 
 void ds4_gpu_prefill_stage_end(void) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
-    for (uint32_t h = 0; h < 2; h++) {
-        if (s->pending[h]) {
+    /* The ring is ~5 GiB; decode must not keep it resident. */
+    for (uint32_t r = 0; r < DS4_PREFILL_STAGE_SLOTS; r++) {
+        if (s->pending[r]) {
             (void)ds4_gpu_stream_expert_pread_pool_wait();
-            s->pending[h] = 0;
+            s->pending[r] = 0;
         }
-        s->layer[h] = -1;
+        /* After a failed encode the last batch may never be committed, and
+         * waiting on it would hang; keep its staging buffer alive then. */
+        if (!s->last_cb[r] || s->last_cb[r].status >= MTLCommandBufferStatusCommitted)
+        {
+            if (s->last_cb[r]) [s->last_cb[r] waitUntilCompleted];
+            s->last_cb[r] = nil;
+            s->buf[r] = nil;
+        }
+        s->layer[r] = -1;
     }
     if (getenv("DS4_METAL_PREFILL_STAGE_STATS") != NULL) {
-        fprintf(stderr, "ds4: prefill staging staged=%llu cached=%llu read-wait=%.1f ms\n",
+        fprintf(stderr, "ds4: prefill staging staged=%llu cached=%llu read-wait=%.1f ms "
+                "waited-reads %.2f GiB at %.2f GB/s\n",
                 (unsigned long long)s->staged_experts, (unsigned long long)s->cached_experts,
-                s->wait_ms);
+                s->wait_ms, ds4_gpu_gib(s->read_bytes),
+                s->read_ms > 0.0 ? (double)s->read_bytes / (s->read_ms * 1e6) : 0.0);
     }
 }
 
@@ -18452,17 +18484,17 @@ static bool ds4_gpu_prefill_stage_lookup(
         ds4_gpu_stream_expert_cache_entry **resources,
         uint32_t *n_resources) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
-    const uint32_t half = layer & 1u;
-    if (s->layer[half] != (int32_t)layer || s->pending[half] || s->model_map[half] != model_map) {
+    const uint32_t ring = layer % DS4_PREFILL_STAGE_SLOTS;
+    if (s->layer[ring] != (int32_t)layer || s->pending[ring] || s->model_map[ring] != model_map) {
         return false;
     }
-    *gate_addrs = s->addr[half][0];
-    *up_addrs = s->addr[half][1];
-    *down_addrs = s->addr[half][2];
-    *staging = s->buf[half];
-    memcpy(resources, s->res[half], (size_t)s->n_res[half] * sizeof(resources[0]));
-    *n_resources = s->n_res[half];
-    s->last_cb[half] = cb;
+    *gate_addrs = s->addr[ring][0];
+    *up_addrs = s->addr[ring][1];
+    *down_addrs = s->addr[ring][2];
+    *staging = s->buf[ring];
+    memcpy(resources, s->res[ring], (size_t)s->n_res[ring] * sizeof(resources[0]));
+    *n_resources = s->n_res[ring];
+    s->last_cb[ring] = cb;
     return true;
 }
 

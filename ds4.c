@@ -37945,6 +37945,8 @@ static bool metal_graph_prefill_layer_major(
 #else
     const bool prefill_stage = false;
 #endif
+    const bool stage_async = prefill_stage && !split_profile && !imatrix &&
+                             !metal_graph_stream_prefill_selected_profile_enabled(g);
     const bool layer_prepare =
         !prefill_stage && (layer_pagein || layer_pread || layer_readahead || layer_madvise);
     const bool layer_prepare_overlap =
@@ -38250,7 +38252,7 @@ static bool metal_graph_prefill_layer_major(
                     (t_ffn_done - t_ffn_encoded) * 1000.0);
         } else {
             const double t_chunk0 = (profile || throttle) ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
+            ok = (stage_async && ds4_gpu_commands_active()) || ds4_gpu_begin_commands() != 0;
             if (ok) ok = metal_graph_encode_layer_batch(g,
                                                         model,
                                                         &weights->layer[il],
@@ -38277,7 +38279,10 @@ static bool metal_graph_prefill_layer_major(
             }
 #endif
             const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-            if (ok) ok = ds4_gpu_end_commands() != 0;
+            /* Staged layers are only committed: the GPU gets the next layer
+             * while the CPU encodes, and its submission latency overlaps the
+             * previous layer. The staging ring bounds how far ahead we run. */
+            if (ok) ok = (stage_async ? ds4_gpu_flush_commands() : ds4_gpu_end_commands()) != 0;
             const double t_done = (profile || throttle) ? now_sec() : 0.0;
 #ifdef DS4_ROCM_BUILD
             if (ok) {
@@ -38381,6 +38386,11 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 #ifdef __APPLE__
+    if (stage_async && ds4_gpu_end_commands() == 0) {
+        fprintf(stderr, "ds4: Metal staged layer-major prefill drain failed\n");
+        ds4_gpu_prefill_stage_end();
+        return false;
+    }
     if (prefill_stage) ds4_gpu_prefill_stage_end();
     /* Zero-prefix masks are shared across the 43 per-layer command batches,
      * then become dead weight. Release them before the output head and later
