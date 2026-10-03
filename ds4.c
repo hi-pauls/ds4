@@ -80806,11 +80806,23 @@ static int ds4_session_eval_dspark_speculative_argmax(
         }
         tp_verify_sent = true;
     }
+    /* Rows from bound_rows on were not verified against their own experts. */
+    int bound_rows = draft_n;
     if (ok) {
         for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
         verifier_may_have_mutated = true;
         ds4_verify_suffix_timing verify_timing;
         const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+#ifdef __APPLE__
+        const char *bound_env = getenv("DS4_DSPARK_STREAM_BOUND");
+        const bool bound = e->ssd_streaming && bound_env && bound_env[0];
+        if (bound) {
+            const char *keep_env = getenv("DS4_DSPARK_STREAM_BOUND_KEEP");
+            ds4_gpu_stream_verify_bound_begin(keep_env ? (uint32_t)strtoul(keep_env, NULL, 10) : 1u,
+                                              (uint32_t)strtoul(bound_env, NULL, 10),
+                                              (uint32_t)draft_n);
+        }
+#endif
         ok = metal_graph_verify_suffix_tops(&s->graph,
                                             &e->model,
                                             &e->weights,
@@ -80822,6 +80834,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             row_tops,
                                             NULL,
                                             stats_enabled ? &verify_timing : NULL);
+#ifdef __APPLE__
+        if (bound) bound_rows = (int)ds4_gpu_stream_verify_bound_end();
+#endif
         if (stats_enabled) {
             s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
             s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;
@@ -80846,7 +80861,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
     int commit_drafts = 0;
     if (ok) {
         commit_drafts = 1;
-        for (int i = 1; i < draft_n; i++) {
+        for (int i = 1; i < draft_n && i < bound_rows; i++) {
             if (row_tops[i - 1] != drafts[i]) break;
             commit_drafts++;
         }

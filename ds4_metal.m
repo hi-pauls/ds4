@@ -17643,6 +17643,104 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
     g_stream_expert_cache_layer_count[layer] = 0;
 }
 
+/* Expert-availability bound for streamed speculative verify passes. Rows
+ * below keep_rows always load their experts; later rows load while the
+ * layer's new misses stay within budget. The first row over budget and all
+ * rows after it get resident stand-ins for their missing experts, so they cost
+ * no SSD reads, and their outputs are invalid from that layer on. The cut is
+ * carried across layers and returned to the caller, which must not accept a
+ * draft verified by an invalid row. */
+static struct {
+    int      active;
+    uint32_t keep_rows;
+    uint32_t budget;
+    uint32_t limit;
+    uint64_t passes;
+    uint64_t rows;
+    uint64_t kept_rows;
+    uint64_t standins;
+} g_stream_verify_bound;
+
+static void ds4_gpu_stream_verify_bound_print_stats(void) {
+    fprintf(stderr,
+            "ds4: streamed verify bound budget=%u keep=%u: passes=%llu rows=%llu kept=%llu "
+            "(%.1f%%) stand-in experts=%llu\n",
+            g_stream_verify_bound.budget,
+            g_stream_verify_bound.keep_rows,
+            (unsigned long long)g_stream_verify_bound.passes,
+            (unsigned long long)g_stream_verify_bound.rows,
+            (unsigned long long)g_stream_verify_bound.kept_rows,
+            g_stream_verify_bound.rows
+                ? 100.0 * (double)g_stream_verify_bound.kept_rows / (double)g_stream_verify_bound.rows
+                : 0.0,
+            (unsigned long long)g_stream_verify_bound.standins);
+}
+
+void ds4_gpu_stream_verify_bound_begin(uint32_t keep_rows, uint32_t budget, uint32_t n_rows) {
+    static int registered;
+    if (!registered) {
+        atexit(ds4_gpu_stream_verify_bound_print_stats);
+        registered = 1;
+    }
+    g_stream_verify_bound.active = 1;
+    g_stream_verify_bound.keep_rows = keep_rows ? keep_rows : 1u;
+    g_stream_verify_bound.budget = budget;
+    g_stream_verify_bound.limit = n_rows;
+    g_stream_verify_bound.passes++;
+    g_stream_verify_bound.rows += n_rows;
+}
+
+uint32_t ds4_gpu_stream_verify_bound_end(void) {
+    g_stream_verify_bound.active = 0;
+    g_stream_verify_bound.kept_rows += g_stream_verify_bound.limit;
+    return g_stream_verify_bound.limit;
+}
+
+static bool ds4_gpu_stream_verify_bound_resident(const void *model_map, uint32_t layer, int32_t expert) {
+    const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][(uint32_t)expert];
+    return e->valid && e->model_map == model_map;
+}
+
+static void ds4_gpu_stream_verify_bound_apply(
+        const void *model_map,
+        uint32_t    layer,
+        int32_t    *ids,
+        uint32_t    n_tokens,
+        uint32_t    n_selected) {
+    bool kept[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
+    uint32_t limit = g_stream_verify_bound.limit < n_tokens ? g_stream_verify_bound.limit : n_tokens;
+    uint32_t extra = 0;
+    for (uint32_t r = 0; r < limit; r++) {
+        int32_t *row = ids + (uint64_t)r * n_selected;
+        uint32_t new_misses = 0;
+        for (uint32_t j = 0; j < n_selected; j++) {
+            bool repeat = false;
+            for (uint32_t k = 0; k < j; k++) repeat = repeat || row[k] == row[j];
+            if (!repeat && !kept[(uint32_t)row[j]] &&
+                !ds4_gpu_stream_verify_bound_resident(model_map, layer, row[j])) {
+                new_misses++;
+            }
+        }
+        if (r >= g_stream_verify_bound.keep_rows && extra + new_misses > g_stream_verify_bound.budget) {
+            limit = r;
+        } else {
+            if (r >= g_stream_verify_bound.keep_rows) extra += new_misses;
+            for (uint32_t j = 0; j < n_selected; j++) kept[(uint32_t)row[j]] = true;
+        }
+    }
+    g_stream_verify_bound.limit = limit;
+    for (uint32_t r = limit; r < n_tokens; r++) {
+        int32_t *row = ids + (uint64_t)r * n_selected;
+        for (uint32_t j = 0; j < n_selected; j++) {
+            if (!kept[(uint32_t)row[j]] &&
+                !ds4_gpu_stream_verify_bound_resident(model_map, layer, row[j])) {
+                row[j] = ids[j];    /* row 0 always loads, so its experts are present */
+                g_stream_verify_bound.standins++;
+            }
+        }
+    }
+}
+
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const void    *model_map,
         uint64_t       model_size,
@@ -17705,6 +17803,13 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                  ids,
                                  n_ids * sizeof(ids[0]));
     const double t_read = profile ? ds4_gpu_now_ms() : 0.0;
+    if (ok && g_stream_verify_bound.active) {
+        for (uint64_t i = 0; ok && i < n_ids; i++) ok = ids[i] >= 0 && (uint32_t)ids[i] < n_total_expert;
+        if (ok) {
+            ds4_gpu_stream_verify_bound_apply(model_map, layer, ids, n_tokens, n_selected);
+            ok = ds4_gpu_tensor_write((ds4_gpu_tensor *)selected, 0, ids, n_ids * sizeof(ids[0]));
+        }
+    }
 
     bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { 0 };

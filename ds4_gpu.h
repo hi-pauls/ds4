@@ -369,6 +369,8 @@ uint32_t ds4_gpu_stream_expert_cache_enum_residents(
  * No-op if the entry isn't currently resident. */
 void ds4_gpu_stream_expert_cache_evict_one(uint32_t layer, uint32_t expert);
 int ds4_gpu_stream_expert_cache_resident(uint32_t layer, uint32_t expert);
+void ds4_gpu_stream_verify_bound_begin(uint32_t keep_rows, uint32_t budget, uint32_t n_rows);
+uint32_t ds4_gpu_stream_verify_bound_end(void);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
