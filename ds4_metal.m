@@ -37319,10 +37319,19 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
             qk_dim == 256u &&
             row_bytes == 204u &&
             weight_type == DS4_METAL_TENSOR_Q8_0;
+        const int use_t8 =
+            !use_glm52_t4 &&
+            n_tokens >= 8u &&
+            (qk_nope % 32u) == 0 &&
+            qk_nope <= 256u &&
+            weight_type == DS4_METAL_TENSOR_Q8_0 &&
+            getenv("DS4_METAL_DISABLE_GLM_QK_LOWRANK_T8") == NULL;
         id<MTLComputePipelineState> pipeline =
             use_glm52_t4 ?
                 ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_glm52_t4_pipeline,
                                      "kernel_glm_qk_lowrank_q8_0_batch_glm52_t4") :
+            use_t8 ?
+                ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_t8") :
                 ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_pipeline,
                                      "kernel_glm_qk_lowrank_q8_0_batch");
         if (!pipeline) return 0;
@@ -37355,6 +37364,12 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
             [enc setThreadgroupMemoryLength:4u * 192u * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
                                                   ((NSUInteger)n_tokens + 3u) / 4u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else if (use_t8) {
+            [enc setThreadgroupMemoryLength:8u * qk_nope * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
+                                                  ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {

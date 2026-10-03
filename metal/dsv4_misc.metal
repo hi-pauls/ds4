@@ -2515,6 +2515,74 @@ kernel void kernel_glm_qk_lowrank_q8_0_batch(
     }
 }
 
+/* The Q8_0 batch kernel above, eight tokens per threadgroup: x is staged
+ * once and every weight row is read once per eight tokens. qk_nope must be a
+ * multiple of 32 (whole blocks). Each output keeps glm_q8_0_dot_row_dev_f32's
+ * block and element order. */
+kernel void kernel_glm_qk_lowrank_q8_0_batch_t8(
+        constant ds4_metal_args_glm_qk_lowrank_batch & args,
+        device const char *weight,
+        device const char *q,
+        device char *qk_low,
+        threadgroup float *x [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint kv_lora_dim = args.kv_lora_dim;
+    const uint qk_nope = args.qk_nope;
+    const uint qk_dim = args.qk_dim;
+    const uint n_blocks = qk_nope >> 5;
+    const uint row_bytes = args.row_bytes;
+    constexpr uint tile_tokens = 8u;
+
+    const uint head = tgpig.x + args.head_base;
+    const uint token0 = tgpig.y * tile_tokens;
+    const uint nth = ntg_u.x;
+    const uint64_t q_token_stride = (uint64_t)args.n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride = (uint64_t)args.n_head * kv_lora_dim * sizeof(float);
+
+    for (uint t = 0; t < tile_tokens; t++) {
+        const uint token = token0 + t;
+        threadgroup float *xt = x + t * qk_nope;
+        device const float *qh =
+            (device const float *)(q +
+                (uint64_t)token * q_token_stride +
+                (uint64_t)head * qk_dim * sizeof(float));
+        for (uint d = tid; d < qk_nope; d += nth) {
+            xt[d] = token < args.n_tokens ? qh[d] : 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = tid; j < kv_lora_dim; j += nth) {
+        device const char *row =
+            weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
+        float acc[tile_tokens];
+        FOR_UNROLL (uint t = 0; t < tile_tokens; t++) acc[t] = 0.0f;
+        for (uint block = 0; block < n_blocks; block++) {
+            device const char *block_base = row + (uint64_t)block * 34u;
+            const float d = (float)(*((device const half *)block_base));
+            device const int8_t *qs = (device const int8_t *)(block_base + 2u);
+            const uint base = block << 5;
+            FOR_UNROLL (uint qi = 0; qi < 32u; qi++) {
+                const float wq = d * (float)qs[qi];
+                FOR_UNROLL (uint t = 0; t < tile_tokens; t++) {
+                    acc[t] += wq * x[t * qk_nope + base + qi];
+                }
+            }
+        }
+        FOR_UNROLL (uint t = 0; t < tile_tokens; t++) {
+            if (token0 + t < args.n_tokens) {
+                device float *out =
+                    (device float *)(qk_low +
+                        (uint64_t)(token0 + t) * low_token_stride +
+                        (uint64_t)head * kv_lora_dim * sizeof(float));
+                out[j] = acc[t];
+            }
+        }
+    }
+}
+
 kernel void kernel_glm_qk_lowrank_q8_0_batch_glm52_t4(
         constant ds4_metal_args_glm_qk_lowrank_batch & args,
         device const char *weight,
