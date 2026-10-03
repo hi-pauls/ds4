@@ -37719,11 +37719,25 @@ static bool metal_graph_prefill_pipeline_stage_major(
 #ifdef __APPLE__
 /* Streamed prefill expert staging (ds4_gpu_prefill_stage_begin): uncached
  * experts of the next layer are read into staging while the current layer
- * runs, instead of paging whole layers in through the mapped model. */
-static bool metal_graph_prefill_stage_enabled(const ds4_gpu_graph *g, uint32_t n_tokens) {
+ * runs, instead of paging whole layers in through the mapped model. Only the
+ * IQ2_XXS gate/up + Q2_K down address kernels exist, and a staged layer
+ * cannot fall back to the mapped path, so every routed layer must match.
+ * On by default; DS4_METAL_STREAMING_PREFILL_STAGE=0 restores the mapped path. */
+static bool metal_graph_prefill_stage_enabled(const ds4_gpu_graph   *g,
+                                              const ds4_weights     *weights,
+                                              uint32_t               n_tokens) {
     const char *env = getenv("DS4_METAL_STREAMING_PREFILL_STAGE");
-    return g->ssd_streaming && g->tp_world < 2 && n_tokens >= 32u &&
-           env && env[0] && strcmp(env, "0") != 0;
+    bool enabled = g->ssd_streaming && g->tp_world < 2 && n_tokens >= 32u &&
+                   DS4_N_EXPERT_USED == 6 && DS4_N_LEADING_DENSE == 0 &&
+                   !(env && strcmp(env, "0") == 0);
+    for (uint32_t il = 0; enabled && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        enabled = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+                  l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+                  l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+                  l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    }
+    return enabled;
 }
 
 static bool metal_graph_prefill_stage_layer(
@@ -37942,7 +37956,7 @@ static bool metal_graph_prefill_layer_major(
         !layer_pagein && !layer_pread && !layer_readahead &&
         metal_graph_stream_prefill_layer_madvise_enabled(g);
 #ifdef __APPLE__
-    const bool prefill_stage = metal_graph_prefill_stage_enabled(g, n_tokens);
+    const bool prefill_stage = metal_graph_prefill_stage_enabled(g, weights, n_tokens);
 #else
     const bool prefill_stage = false;
 #endif
