@@ -367,6 +367,7 @@ uint32_t ds4_gpu_stream_expert_cache_enum_residents(
 /* Evict a specific (layer, expert) resident so subsequent lookups miss it.
  * No-op if the entry isn't currently resident. */
 void ds4_gpu_stream_expert_cache_evict_one(uint32_t layer, uint32_t expert);
+int ds4_gpu_stream_expert_cache_resident(uint32_t layer, uint32_t expert);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

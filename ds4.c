@@ -23555,6 +23555,10 @@ typedef struct metal_graph_selected_async_load {
      * thread cannot stage the cache load without waiting on GPU work. */
     bool                      ids_ok;
     ds4_gpu_tensor           *router_selected;
+    /* Only set where the DS4 softplus-sqrt router produced the selection;
+     * cache-aware rerouting needs both to rewrite ids and weights. */
+    ds4_gpu_tensor           *router_probs;
+    ds4_gpu_tensor           *router_weights;
     const ds4_model          *model;
     const ds4_layer_weights  *layer;
     uint32_t                  il;
@@ -23575,6 +23579,188 @@ static bool g_metal_graph_selected_async_load_thread_started = false;
 static bool g_metal_graph_selected_async_load_has_job = false;
 static bool g_metal_graph_selected_async_load_done = false;
 static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
+
+#ifdef __APPLE__
+/* Cache-aware rerouting for SSD streaming, colibri CACHE_ROUTE style. A
+ * selected expert that is not resident and whose probability is small next to
+ * the strongest selection is either replaced by the best-ranked resident
+ * expert within the top-M scores ("sub") or dropped with its slot pointed at a
+ * resident expert at weight zero ("drop"). Weights are renormalized over the
+ * resulting set exactly as kernel_dsv4_router_weights_one does. Lossy, off by
+ * default. A layer's misses load in parallel, so one remaining miss costs about
+ * as much as several: unless partial rerouting is asked for, a layer is only
+ * rerouted when every miss in it can be resolved. */
+enum {
+    METAL_CACHE_ROUTE_OFF = 0,
+    METAL_CACHE_ROUTE_DROP = 1,
+    METAL_CACHE_ROUTE_SUB = 2,
+};
+
+typedef struct metal_cache_route_config {
+    int      mode;
+    float    ratio;
+    uint32_t top_m;
+    uint32_t keep;
+    bool     partial;
+} metal_cache_route_config;
+
+static metal_cache_route_config g_metal_cache_route_config;
+static pthread_once_t g_metal_cache_route_once = PTHREAD_ONCE_INIT;
+static uint64_t g_metal_cache_route_layers;
+static uint64_t g_metal_cache_route_misses;
+static uint64_t g_metal_cache_route_rerouted;
+static uint64_t g_metal_cache_route_cleared;
+static double g_metal_cache_route_share;
+
+static void metal_cache_route_print_stats(void) {
+    const metal_cache_route_config *cfg = &g_metal_cache_route_config;
+    fprintf(stderr,
+            "ds4: cache-route mode=%s ratio=%.3f top_m=%u keep=%u partial=%d: layers=%llu "
+            "cleared=%llu misses=%llu rerouted=%llu (%.1f%% of misses) mean rerouted weight share=%.4f\n",
+            cfg->mode == METAL_CACHE_ROUTE_SUB ? "sub" : "drop",
+            cfg->ratio, cfg->top_m, cfg->keep, cfg->partial,
+            (unsigned long long)g_metal_cache_route_layers,
+            (unsigned long long)g_metal_cache_route_cleared,
+            (unsigned long long)g_metal_cache_route_misses,
+            (unsigned long long)g_metal_cache_route_rerouted,
+            g_metal_cache_route_misses
+                ? 100.0 * (double)g_metal_cache_route_rerouted / (double)g_metal_cache_route_misses
+                : 0.0,
+            g_metal_cache_route_rerouted
+                ? g_metal_cache_route_share / (double)g_metal_cache_route_rerouted
+                : 0.0);
+}
+
+static void metal_cache_route_config_init(void) {
+    metal_cache_route_config *cfg = &g_metal_cache_route_config;
+    const char *mode = getenv("DS4_METAL_CACHE_ROUTE");
+    const char *ratio = getenv("DS4_METAL_CACHE_ROUTE_RATIO");
+    const char *top_m = getenv("DS4_METAL_CACHE_ROUTE_TOPM");
+    const char *keep = getenv("DS4_METAL_CACHE_ROUTE_KEEP");
+    cfg->mode = METAL_CACHE_ROUTE_OFF;
+    if (mode && strcmp(mode, "sub") == 0) cfg->mode = METAL_CACHE_ROUTE_SUB;
+    else if (mode && strcmp(mode, "drop") == 0) cfg->mode = METAL_CACHE_ROUTE_DROP;
+    else if (mode && mode[0] != '\0') {
+        fprintf(stderr, "ds4: DS4_METAL_CACHE_ROUTE=%s ignored, expected sub or drop\n", mode);
+    }
+    cfg->ratio = ratio ? strtof(ratio, NULL) : 0.35f;
+    cfg->top_m = top_m ? (uint32_t)strtoul(top_m, NULL, 10) : 12u;
+    if (cfg->top_m > 32u) cfg->top_m = 32u;
+    cfg->keep = keep ? (uint32_t)strtoul(keep, NULL, 10) : 2u;
+    cfg->partial = getenv("DS4_METAL_CACHE_ROUTE_PARTIAL") != NULL;
+    if (cfg->mode != METAL_CACHE_ROUTE_OFF) atexit(metal_cache_route_print_stats);
+}
+
+static bool metal_cache_route_contains(const int32_t *ids, uint32_t n, int32_t id) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] == id) return true;
+    }
+    return false;
+}
+
+static void metal_cache_route_adjust(metal_graph_selected_async_load *job) {
+    pthread_once(&g_metal_cache_route_once, metal_cache_route_config_init);
+    const metal_cache_route_config *cfg = &g_metal_cache_route_config;
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+    const uint32_t n_expert = DS4_N_EXPERT;
+    if (cfg->mode == METAL_CACHE_ROUTE_OFF ||
+        !job->router_probs || !job->router_weights ||
+        job->layer->ffn_gate_tid2eid != NULL) {
+        return;
+    }
+
+    float probs[DS4_MAX_EXPERT];
+    if (ds4_gpu_tensor_read(job->router_probs, 0, probs,
+                            (uint64_t)n_expert * sizeof(probs[0])) == 0) {
+        return;
+    }
+    const float *bias = job->layer->ffn_exp_probs_b
+        ? (const float *)(job->model->map + job->layer->ffn_exp_probs_b->abs_offset)
+        : NULL;
+
+    uint32_t ranked[32];
+    float ranked_score[32];
+    uint32_t n_ranked = 0;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float s = bias ? probs[e] + bias[e] : probs[e];
+        if (n_ranked == cfg->top_m && (n_ranked == 0 || s <= ranked_score[n_ranked - 1])) continue;
+        uint32_t pos = n_ranked < cfg->top_m ? n_ranked++ : n_ranked - 1;
+        while (pos > 0 && ranked_score[pos - 1] < s) {
+            ranked[pos] = ranked[pos - 1];
+            ranked_score[pos] = ranked_score[pos - 1];
+            pos--;
+        }
+        ranked[pos] = e;
+        ranked_score[pos] = s;
+    }
+
+    int32_t ids[DS4_MAX_EXPERT_USED];
+    float p[DS4_MAX_EXPERT_USED];
+    float p_max = 0.0f;
+    float p_sum = 0.0f;
+    for (uint32_t i = 0; i < n_used; i++) {
+        ids[i] = job->selected_ids[i];
+        p[i] = probs[ids[i]];
+        p_max = fmaxf(p_max, p[i]);
+        p_sum += p[i];
+    }
+
+    uint32_t rerouted = 0;
+    uint32_t unresolved = 0;
+    double share = 0.0;
+    uint32_t next_cand = 0;
+    g_metal_cache_route_layers++;
+    for (uint32_t i = 0; i < n_used; i++) {
+        if (ds4_gpu_stream_expert_cache_resident(job->il, (uint32_t)ids[i])) continue;
+        g_metal_cache_route_misses++;
+        uint32_t rank = 0;
+        while (rank < n_ranked && ranked[rank] != (uint32_t)job->selected_ids[i]) rank++;
+        if (rank < cfg->keep || p[i] >= cfg->ratio * p_max) {
+            unresolved++;
+            continue;
+        }
+
+        int32_t cand = -1;
+        while (cand < 0 && next_cand < n_ranked) {
+            const int32_t e = (int32_t)ranked[next_cand++];
+            if (!metal_cache_route_contains(ids, n_used, e) &&
+                ds4_gpu_stream_expert_cache_resident(job->il, (uint32_t)e)) {
+                cand = e;
+            }
+        }
+        for (uint32_t e = 0; cand < 0 && cfg->mode == METAL_CACHE_ROUTE_DROP && e < n_expert; e++) {
+            if (!metal_cache_route_contains(ids, n_used, (int32_t)e) &&
+                ds4_gpu_stream_expert_cache_resident(job->il, e)) {
+                cand = (int32_t)e;
+            }
+        }
+        if (cand < 0) {
+            unresolved++;
+            continue;
+        }
+        rerouted++;
+        share += p_sum > 0.0f ? p[i] / p_sum : 0.0f;
+        ids[i] = cand;
+        p[i] = cfg->mode == METAL_CACHE_ROUTE_SUB ? probs[cand] : 0.0f;
+    }
+    if (rerouted == 0 || (unresolved > 0 && !cfg->partial)) return;
+    g_metal_cache_route_rerouted += rerouted;
+    g_metal_cache_route_share += share;
+    g_metal_cache_route_cleared += unresolved == 0;
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_used; i++) sum += p[i];
+    sum = fmaxf(sum, 6.103515625e-5f);
+    float w[DS4_MAX_EXPERT_USED];
+    for (uint32_t i = 0; i < n_used; i++) w[i] = p[i] / sum * DS4_EXPERT_WEIGHT_SCALE;
+    if (ds4_gpu_tensor_write(job->router_selected, 0, ids, (uint64_t)n_used * sizeof(ids[0])) == 0 ||
+        ds4_gpu_tensor_write(job->router_weights, 0, w, (uint64_t)n_used * sizeof(w[0])) == 0) {
+        fprintf(stderr, "ds4: cache-route could not rewrite layer %u selection\n", job->il);
+        return;
+    }
+    memcpy(job->selected_ids, ids, (size_t)n_used * sizeof(ids[0]));
+}
+#endif
 
 static void metal_graph_selected_async_load_run(
         metal_graph_selected_async_load *job) {
@@ -23622,6 +23808,9 @@ static void metal_graph_selected_async_load_run(
             return;
         }
     }
+#ifdef __APPLE__
+    metal_cache_route_adjust(job);
+#endif
     job->ids_ok = true;
     const ds4_gpu_stream_expert_table table =
         graph_stream_expert_table_make(job->model,
@@ -23694,6 +23883,8 @@ static bool metal_graph_selected_async_load_ensure_worker(void) {
 static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
         metal_graph_selected_async_load *job,
         ds4_gpu_tensor                  *router_selected,
+        ds4_gpu_tensor                  *router_probs,
+        ds4_gpu_tensor                  *router_weights,
         const ds4_model                 *model,
         const ds4_layer_weights         *layer,
         uint32_t                         il,
@@ -23704,6 +23895,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     if (!metal_graph_selected_async_load_ensure_worker()) return false;
     memset(job, 0, sizeof(*job));
     job->router_selected = router_selected;
+    job->router_probs = router_probs;
+    job->router_weights = router_weights;
     job->model = model;
     job->layer = layer;
     job->il = il;
@@ -23738,6 +23931,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start(
     return metal_graph_selected_async_load_start_tensor(
             job,
             g ? metal_graph_router_selected(g) : NULL,
+            g ? metal_graph_router_probs(g) : NULL,
+            g ? metal_graph_router_weights(g) : NULL,
             model,
             layer,
             il,
@@ -49115,6 +49310,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                 async_load_started = metal_graph_selected_async_load_start_tensor(
                         &async_load,
                         g->router_selected,
+                        NULL,
+                        NULL,
                         model,
                         l,
                         il,

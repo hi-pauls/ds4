@@ -13191,6 +13191,12 @@ void ds4_gpu_stream_expert_cache_evict_one(uint32_t layer, uint32_t expert) {
     ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 1);
 }
 
+int ds4_gpu_stream_expert_cache_resident(uint32_t layer, uint32_t expert) {
+    return layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
+           expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+           g_stream_expert_cache[layer][expert].valid;
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
