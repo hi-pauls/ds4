@@ -89,6 +89,9 @@ typedef struct {
 @end
 
 static BOOL g_timeline_enabled;
+/* DS4_METAL_TIMELINE_CB_ONLY: command-buffer and CPU spans only, without the
+ * per-encoder split and counter sampling that roughly double GPU time. */
+static BOOL g_timeline_cb_only;
 static FILE *g_timeline_file;
 static pthread_mutex_t g_timeline_mutex = PTHREAD_MUTEX_INITIALIZER;
 static DS4TimelineBatch *g_timeline_batch;
@@ -222,6 +225,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
         return;
     }
     g_timeline_enabled = YES;
+    g_timeline_cb_only = getenv("DS4_METAL_TIMELINE_CB_ONLY") != NULL;
     Class dev_cls = object_getClass(device);
     ds4_gpu_timeline_swizzle(dev_cls,
         @selector(newComputePipelineStateWithFunction:error:),
@@ -279,6 +283,16 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
         if (end) prev_end = end;
     }
     fflush(g_timeline_file);
+    pthread_mutex_unlock(&g_timeline_mutex);
+}
+
+/* CPU spans on the same clock as the B lines (GPUStartTime is mach absolute
+ * time), so CPU waits, readbacks and loads can be laid against GPU work. */
+static void ds4_gpu_timeline_cpu(const char *name, uint64_t t0_ns, uint64_t t1_ns) {
+    if (!g_timeline_file) return;
+    pthread_mutex_lock(&g_timeline_mutex);
+    fprintf(g_timeline_file, "C %llu %llu %s\n",
+            (unsigned long long)t0_ns, (unsigned long long)t1_ns, name);
     pthread_mutex_unlock(&g_timeline_mutex);
 }
 
@@ -1326,7 +1340,7 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
-        if (g_timeline_enabled && g_timeline_batch) {
+        if (g_timeline_enabled && g_timeline_batch && !g_timeline_cb_only) {
             /* Diagnostic: one timestamped pass per dispatch group. A
              * concurrent section keeps its single encoder. */
             if (g_batch_enc && !g_batch_encoder_concurrent) {
@@ -1606,11 +1620,16 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     if (!owned) return 1;
 
     const double t_commit = ds4_gpu_now_ms();
+    const uint64_t tl_commit_ns = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
         ok = 0;
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
+    }
+    if (g_timeline_file) {
+        ds4_gpu_timeline_cpu(label ? label : "finish", tl_commit_ns,
+                             clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     }
     if (getenv("DS4_METAL_CB_TIMES")) {
         const double t_done = ds4_gpu_now_ms();
@@ -16731,10 +16750,16 @@ static int ds4_gpu_stream_expert_pending_load_finish(
     if (!p->active) return 1;
 
     const double start_ms = p->start_ms;
+    const uint64_t tl_wait0 = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     if (!ds4_gpu_stream_expert_pread_pool_wait()) {
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
         p->active = 0;
         return 0;
+    }
+    if (g_timeline_file) {
+        char name[48];
+        snprintf(name, sizeof(name), "load-wait:L%u:n%u", p->layer, p->n_loads);
+        ds4_gpu_timeline_cpu(name, tl_wait0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
     }
     const double elapsed_ms = ds4_gpu_now_ms() - start_ms;
     p->active = 0;
@@ -16843,6 +16868,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     p->prepare_ms = 0.0;
     const int load_timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double load_prepare_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+    const uint64_t tl_begin0 = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
         p->selected_ids[i] = -1;
         p->load_slots[i] = 0;
@@ -17041,6 +17067,11 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         ds4_gpu_stream_expert_pread_thread_count(p->n_tasks);
     const int pread_fd = ds4_gpu_model_fd_for_map(p->model_map);
     for (uint32_t i = 0; i < p->n_tasks; i++) p->tasks[i].fd = pread_fd;
+    if (g_timeline_file) {
+        char name[48];
+        snprintf(name, sizeof(name), "load-prep:L%u:n%u", layer, p->n_loads);
+        ds4_gpu_timeline_cpu(name, tl_begin0, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    }
     p->start_ms = ds4_gpu_now_ms();
     if (load_timing) {
         p->prepare_ms = p->start_ms - load_prepare_t0;
@@ -17816,6 +17847,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     const bool profile =
         getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE") != NULL;
     const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
+    const uint64_t tl_t0 = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     int ok = ds4_gpu_tensor_read(selected,
                                  0,
                                  ids,
@@ -18035,6 +18067,8 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             n_loads++;
         }
     }
+    const uint64_t tl_pread0 = g_timeline_file ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    uint64_t tl_pread1 = tl_pread0;
     if (ok && n_loads != 0) {
         if (load_timing_t0 != 0.0) {
             const double now_ms = ds4_gpu_now_ms();
@@ -18048,6 +18082,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                model_map,
                                                &read_bytes,
                                                &read_ms);
+        if (g_timeline_file) tl_pread1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         if (ok) {
             ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
         }
@@ -18198,6 +18233,15 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         return 0;
     }
     *unique_out = *n_resources + view_served;
+    if (g_timeline_file) {
+        char name[64];
+        snprintf(name, sizeof(name), "batch-prep:L%u:t%u", layer, n_tokens);
+        ds4_gpu_timeline_cpu(name, tl_t0, tl_pread0);
+        snprintf(name, sizeof(name), "batch-pread:L%u:n%u", layer, n_loads);
+        ds4_gpu_timeline_cpu(name, tl_pread0, tl_pread1);
+        snprintf(name, sizeof(name), "batch-post:L%u", layer);
+        ds4_gpu_timeline_cpu(name, tl_pread1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    }
     if (view_served != 0 &&
         ds4_gpu_stream_expert_timing_summary_enabled()) {
         fprintf(stderr,
