@@ -37754,6 +37754,76 @@ static bool metal_graph_prefill_stage_layer(
 }
 #endif
 
+/* Logits for the last row of the prefill batch held in batch_cur_hc. The
+ * times (seconds) feed the prefill profile. */
+static bool metal_graph_prefill_output_head(
+        ds4_gpu_graph     *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           n_tokens,
+        float             *logits,
+        double            *encode_s,
+        double            *execute_s,
+        double            *read_s) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    uint32_t output_row = n_tokens - 1u;
+    const char *output_row_env = glm_graph_env_value(
+            "DS4_ROCM_GRAPH_OUTPUT_ROW",
+            "DS4_METAL_GRAPH_OUTPUT_ROW");
+    if (output_row_env && output_row_env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(output_row_env, &end, 10);
+        if (end != output_row_env && v < (unsigned long)n_tokens) {
+            output_row = (uint32_t)v;
+        }
+    }
+    bool ok = true;
+    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
+    ds4_gpu_tensor *last_hc = NULL;
+
+    const double t_head0 = now_sec();
+    if (logits) {
+        last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g),
+                                              output_row,
+                                              hc_dim);
+        ok = last_hc != NULL;
+    }
+    if (ok && logits && g->ssd_streaming) {
+        const bool static_decode_map =
+            metal_graph_stream_decode_static_map_enabled() &&
+            weights_model_map_decode_static_supported(weights);
+        const bool static_map_state_cache =
+            static_decode_map &&
+            metal_graph_stream_decode_static_map_state_cache_enabled();
+        g->streaming_static_decode_map_current = false;
+        if (static_map_state_cache) {
+            ok = metal_graph_stream_map_decode_static_all(model, weights);
+            if (ok) g->streaming_static_decode_map_current = true;
+        } else {
+            ok = metal_graph_stream_map_output(model, weights);
+        }
+    }
+    if (ok && logits) {
+        g->cur_hc_by_tier[g->active_tier] = last_hc;
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    const double t_head_encoded = now_sec();
+    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    const double t_head_done = now_sec();
+    g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    if (last_hc) ds4_gpu_tensor_free(last_hc);
+
+    const double t_before_read = now_sec();
+    if (ok && logits) {
+        ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    *encode_s = t_head_encoded - t_head0;
+    *execute_s = t_head_done - t_head_encoded;
+    *read_s = now_sec() - t_before_read;
+    return ok;
+}
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -38436,79 +38506,189 @@ static bool metal_graph_prefill_layer_major(
         return false;
     }
 
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = glm_graph_env_value(
-            "DS4_ROCM_GRAPH_OUTPUT_ROW",
-            "DS4_METAL_GRAPH_OUTPUT_ROW");
-    if (output_row_env && output_row_env[0]) {
-        char *end = NULL;
-        unsigned long v = strtoul(output_row_env, &end, 10);
-        if (end != output_row_env && v < (unsigned long)n_tokens) {
-            output_row = (uint32_t)v;
-        }
-    }
-    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
-    ds4_gpu_tensor *last_hc = NULL;
-
-    const double t_head0 = profile ? now_sec() : 0.0;
-    if (logits) {
-        last_hc = metal_graph_tensor_row_view(metal_graph_batch_cur_hc(g),
-                                              output_row,
-                                              hc_dim);
-        ok = last_hc != NULL;
-    }
-    if (ok && logits && g->ssd_streaming) {
-        const bool static_decode_map =
-            metal_graph_stream_decode_static_map_enabled() &&
-            weights_model_map_decode_static_supported(weights);
-        const bool static_map_state_cache =
-            static_decode_map &&
-            metal_graph_stream_decode_static_map_state_cache_enabled();
-        g->streaming_static_decode_map_current = false;
-        if (static_map_state_cache) {
-            ok = metal_graph_stream_map_decode_static_all(model, weights);
-            if (ok) g->streaming_static_decode_map_current = true;
-        } else {
-            ok = metal_graph_stream_map_output(model, weights);
-        }
-    }
-    if (ok && logits) {
-        g->cur_hc_by_tier[g->active_tier] = last_hc;
-        ok = ds4_gpu_begin_commands() != 0;
-    }
-    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
-    const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
-    const double t_head_done = profile ? now_sec() : 0.0;
-    g->cur_hc_by_tier[g->active_tier] = saved_cur;
-    if (last_hc) ds4_gpu_tensor_free(last_hc);
-    if (!ok) return false;
-
-    const double t_before_read = profile ? now_sec() : 0.0;
-    if (logits) {
-        ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    if (profile) {
-        const double t_read = now_sec();
-        encode_s += t_head_encoded - t_head0;
-        execute_s += t_head_done - t_head_encoded;
+    double head_encode_s = 0.0, head_execute_s = 0.0, read_s = 0.0;
+    ok = metal_graph_prefill_output_head(g, model, weights, n_tokens, logits,
+                                         &head_encode_s, &head_execute_s, &read_s);
+    if (ok && profile) {
+        encode_s += head_encode_s;
+        execute_s += head_execute_s;
         if (split_profile) {
             fprintf(stderr,
                     "ds4: gpu layer-major prefill head encode=%.3f ms execute=%.3f ms\n",
-                    (t_head_encoded - t_head0) * 1000.0,
-                    (t_head_done - t_head_encoded) * 1000.0);
+                    head_encode_s * 1000.0,
+                    head_execute_s * 1000.0);
         }
         fprintf(stderr,
                 "ds4: gpu layer-major prefill total tokens=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms\n",
                 n_tokens,
                 encode_s * 1000.0,
                 execute_s * 1000.0,
-                (t_read - t_before_read) * 1000.0,
-                (t_read - t0) * 1000.0);
+                read_s * 1000.0,
+                (now_sec() - t0) * 1000.0);
     }
     return ok;
 }
+
+/* Staged prefill over a group of chunks, layer by layer: every chunk passes
+ * layer il before any reaches il+1, so a layer's uncached experts are staged
+ * once per group instead of once per chunk, and a short final chunk no longer
+ * costs a full expert pass. Chunk boundaries and the per-layer KV and
+ * compressor update order are those of the chunk-by-chunk path, so the result
+ * is identical. Each chunk keeps its hidden state in its own buffer and the
+ * encode's cur/next swap rotates one spare through them. Checkpoints and
+ * cancellation move to group boundaries: mid-group, layers disagree on how
+ * many tokens they hold. DS4_METAL_PREFILL_GROUP_TOKENS (default 8192, 0
+ * disables) bounds the group. */
+#define DS4_PREFILL_GROUP_MAX_CHUNKS 16u
+
+static uint32_t metal_graph_prefill_group_chunks(
+        const ds4_gpu_graph         *g,
+        const ds4_weights           *weights,
+        const ds4_imatrix_collector *imatrix,
+        uint32_t                     chunk_cap) {
+    uint32_t group_tokens = 8192u;
+    const char *env = getenv("DS4_METAL_PREFILL_GROUP_TOKENS");
+    if (env && env[0]) group_tokens = (uint32_t)strtoul(env, NULL, 10);
+    uint32_t chunks = chunk_cap ? group_tokens / chunk_cap : 0;
+    if (chunks > DS4_PREFILL_GROUP_MAX_CHUNKS) chunks = DS4_PREFILL_GROUP_MAX_CHUNKS;
+#ifdef __APPLE__
+    const bool eligible =
+        metal_graph_prefill_stage_enabled(g, weights, chunk_cap) &&
+        imatrix == NULL && !g->placement && !g->dspark_capture_enabled &&
+        !graph_power_throttle_enabled(g) &&
+        !metal_graph_stream_prefill_selected_profile_enabled(g) &&
+        !metal_graph_streaming_prefill_cache_seed_enabled(g) &&
+        !glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE", "DS4_METAL_GRAPH_PREFILL_PROFILE") &&
+        !glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_SPLIT_PROFILE",
+                               "DS4_METAL_GRAPH_PREFILL_SPLIT_PROFILE");
+#else
+    const bool eligible = false;
+    (void)g;
+    (void)weights;
+    (void)imatrix;
+#endif
+    return eligible && chunks >= 2u ? chunks : 1u;
+}
+
+/* A grouped chunk must take the staged MoE (>= 32 tokens) and be text only. */
+static bool metal_graph_prefill_chunk_groupable(
+        const ds4_gpu_graph *g,
+        const token_vec     *prompt,
+        uint32_t             pos0,
+        uint32_t             n_tokens) {
+    bool groupable = n_tokens >= 32u;
+    for (uint32_t i = 0; groupable && g->deepseek4_vision_weights && i < n_tokens; i++) {
+        groupable = prompt->v[pos0 + i] < (int)DS4_N_VOCAB;
+    }
+    return groupable;
+}
+
+#ifdef __APPLE__
+static bool metal_graph_prefill_staged_group(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_weights      *weights,
+        const token_vec        *prompt,
+        const uint32_t         *chunk_pos,
+        const uint32_t         *chunk_len,
+        uint32_t                n_chunks,
+        float                  *logits,
+        ds4_session_progress_fn display_progress,
+        void                   *display_progress_ud) {
+    const uint64_t hc_bytes = (uint64_t)g->prefill_cap * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint32_t start = chunk_pos[0];
+    const uint32_t total = chunk_pos[n_chunks - 1u] + chunk_len[n_chunks - 1u] - start;
+    const int tier = g->active_tier;
+    ds4_gpu_tensor *const saved_tokens = g->prefill_tokens_by_tier[g->emb_tier];
+    ds4_gpu_tensor *const saved_cur = g->batch_cur_hc_by_tier[tier];
+    ds4_gpu_tensor *const saved_next = g->batch_next_hc_by_tier[tier];
+    ds4_gpu_tensor *hc[DS4_PREFILL_GROUP_MAX_CHUNKS + 1u] = { NULL };
+    ds4_gpu_tensor *owned[DS4_PREFILL_GROUP_MAX_CHUNKS] = { NULL };
+    uint32_t n_owned = 0;
+    ds4_gpu_tensor *tokens = ds4_gpu_tensor_alloc((uint64_t)total * sizeof(int32_t));
+    bool ok = tokens != NULL && n_chunks >= 2u && n_chunks <= DS4_PREFILL_GROUP_MAX_CHUNKS;
+    hc[0] = saved_cur;
+    hc[n_chunks] = saved_next;
+    for (uint32_t c = 1; ok && c < n_chunks; c++) {
+        owned[n_owned] = ds4_gpu_tensor_alloc(hc_bytes);
+        hc[c] = owned[n_owned++];
+        ok = hc[c] != NULL;
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: staged prefill group of %u chunks could not allocate %.2f GiB\n",
+                n_chunks, (double)(n_chunks - 1u) * (double)hc_bytes / 1073741824.0);
+    }
+    if (ok) ok = metal_graph_upload_prompt_tokens(tokens, prompt, start, total);
+    if (ok) {
+        g->prefill_tokens_by_tier[g->emb_tier] = tokens;
+        g->prefill_has_visual = false;
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_token(model, weights);
+    }
+    for (uint32_t c = 0; ok && c < n_chunks; c++) {
+        ds4_gpu_tensor *view = ds4_gpu_tensor_view(tokens,
+                                                   (uint64_t)(chunk_pos[c] - start) * sizeof(int32_t),
+                                                   (uint64_t)chunk_len[c] * sizeof(int32_t));
+        ok = view != NULL &&
+             metal_graph_upload_prompt_embeddings_hc(hc[c], view, model, weights, prompt,
+                                                     chunk_pos[c], chunk_len[c]);
+        ds4_gpu_tensor_free(view);
+    }
+    if (ok) ok = metal_graph_prefill_stage_layer(model, weights, 0);
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_gpu_prefill_stage_wait(il) && metal_graph_prefill_stage_layer(model, weights, il + 1u);
+        if (ok) {
+            g->streaming_static_decode_map_current = false;
+            ok = metal_graph_stream_map_layer_decode(model, weights, il);
+        }
+        if (ok && !ds4_gpu_commands_active()) ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t c = 0; ok && c < n_chunks; c++) {
+            g->batch_token_offset = chunk_pos[c] - start;
+            g->prefill_host_tokens = (const int32_t *)(prompt->v + chunk_pos[c]);
+            g->prefill_host_pos0 = chunk_pos[c];
+            g->prefill_host_count = chunk_len[c];
+            g->batch_cur_hc_by_tier[tier] = hc[c];
+            g->batch_next_hc_by_tier[tier] = hc[n_chunks];
+            ok = metal_graph_encode_layer_batch(g, model, &weights->layer[il], il,
+                                                chunk_pos[c], chunk_len[c]);
+            if (!ok) {
+                fprintf(stderr, "ds4: staged prefill group layer %u chunk at %u encode failed\n",
+                        il, chunk_pos[c]);
+            }
+            /* The encode swapped cur and next: the output is in the spare. */
+            hc[n_chunks] = g->batch_next_hc_by_tier[tier];
+            hc[c] = g->batch_cur_hc_by_tier[tier];
+        }
+        if (ok) ok = ds4_gpu_flush_commands() != 0;
+        gpu_graph_report_prefill_display_progress(display_progress, display_progress_ud,
+                                                  start, total, il + 1u, prompt->len);
+    }
+    if (ok) {
+        ok = ds4_gpu_end_commands() != 0;
+    } else if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: Metal synchronize after staged prefill group failure also failed\n");
+    }
+    ds4_gpu_prefill_stage_end();
+    ds4_gpu_release_zero_prefix_prefill_mask_cache();
+    g->batch_token_offset = 0;
+    g->prefill_tokens_by_tier[g->emb_tier] = saved_tokens;
+    if (ok) {
+        ok = metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights) &&
+             metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights);
+    }
+    if (ok && logits) {
+        double encode_s = 0.0, execute_s = 0.0, read_s = 0.0;
+        g->batch_cur_hc_by_tier[tier] = hc[n_chunks - 1u];
+        ok = metal_graph_prefill_output_head(g, model, weights, chunk_len[n_chunks - 1u], logits,
+                                             &encode_s, &execute_s, &read_s);
+    }
+    g->batch_cur_hc_by_tier[tier] = saved_cur;
+    g->batch_next_hc_by_tier[tier] = saved_next;
+    for (uint32_t i = 0; i < n_owned; i++) ds4_gpu_tensor_free(owned[i]);
+    ds4_gpu_tensor_free(tokens);
+    return ok;
+}
+#endif
 
 static bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,
@@ -38651,40 +38831,68 @@ static bool metal_graph_prefill_chunked_range(
         display_progress(display_progress_ud, "prefill_display", (int)start, prompt->len);
     }
 
+    const uint32_t group_chunks = metal_graph_prefill_group_chunks(g, weights, imatrix, chunk_cap);
     for (uint32_t pos0 = start; pos0 < end; ) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
             return true;
         }
-        const uint32_t remaining = end - pos0;
-        uint32_t local_cap = chunk_cap;
-        if (start != 0 && g->prefill_cap != 0) {
-            const uint32_t mod = pos0 % g->prefill_cap;
-            if (mod != 0) {
-                const uint32_t to_boundary = g->prefill_cap - mod;
-                if (to_boundary < local_cap) local_cap = to_boundary;
+        uint32_t group_pos[DS4_PREFILL_GROUP_MAX_CHUNKS];
+        uint32_t group_len[DS4_PREFILL_GROUP_MAX_CHUNKS];
+        uint32_t n_group = 0;
+        uint32_t chunk_end = pos0;
+        bool more = true;
+        while (more) {
+            uint32_t local_cap = chunk_cap;
+            if (start != 0 && g->prefill_cap != 0) {
+                const uint32_t mod = chunk_end % g->prefill_cap;
+                if (mod != 0) {
+                    const uint32_t to_boundary = g->prefill_cap - mod;
+                    if (to_boundary < local_cap) local_cap = to_boundary;
+                }
+            }
+            if (g->deepseek4_vision_weights &&
+                prompt->v[chunk_end] >= (int)DS4_N_VOCAB) {
+                local_cap = chunk_cap;
+            }
+            const uint32_t chunk = metal_graph_visual_prefill_chunk(g, prompt, chunk_end, end, local_cap);
+            if (chunk == 0) return false;
+            const bool groupable = group_chunks > 1u &&
+                                   metal_graph_prefill_chunk_groupable(g, prompt, chunk_end, chunk);
+            if (n_group != 0 && !groupable) {
+                more = false;
+            } else {
+                group_pos[n_group] = chunk_end;
+                group_len[n_group] = chunk;
+                n_group++;
+                chunk_end += chunk;
+                /* The prompt's last chunk joins a full group rather than pay a
+                 * whole expert pass for itself. */
+                more = groupable && chunk_end < end &&
+                       (n_group < group_chunks ||
+                        (n_group < DS4_PREFILL_GROUP_MAX_CHUNKS && end - chunk_end <= chunk_cap));
             }
         }
-        if (g->deepseek4_vision_weights &&
-            prompt->v[pos0] >= (int)DS4_N_VOCAB) {
-            local_cap = chunk_cap;
-        }
-        uint32_t chunk = remaining < local_cap ? remaining : local_cap;
-        chunk = metal_graph_visual_prefill_chunk(g, prompt, pos0, end, local_cap);
-        if (chunk == 0) return false;
-        const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
-        bool ok = metal_graph_prefill_layer_major(g,
-                                                  model,
-                                                  weights,
-                                                  prompt,
-                                                  pos0,
-                                                  chunk,
-                                                  chunk_logits,
-                                                  show_progress,
-                                                  imatrix,
-                                                  display_progress,
-                                                  display_progress_ud);
+        bool ok = false;
+#ifdef __APPLE__
+        if (n_group > 1u)
+            ok = metal_graph_prefill_staged_group(g, model, weights, prompt, group_pos, group_len,
+                                                  n_group, chunk_logits,
+                                                  display_progress, display_progress_ud);
+#endif
+        if (n_group == 1u)
+            ok = metal_graph_prefill_layer_major(g,
+                                                 model,
+                                                 weights,
+                                                 prompt,
+                                                 group_pos[0],
+                                                 group_len[0],
+                                                 chunk_logits,
+                                                 show_progress,
+                                                 imatrix,
+                                                 display_progress,
+                                                 display_progress_ud);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
