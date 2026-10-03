@@ -1389,6 +1389,10 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     return 1;
 }
 
+/* Engine command-buffer activity, read by the clock keepalive to run only
+ * while the engine is actually submitting work. */
+static volatile uint64_t g_clock_keepalive_last_work_ns;
+
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     static int initialized;
     static int use_unretained;
@@ -1396,6 +1400,7 @@ static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
         use_unretained = getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") != NULL;
         initialized = 1;
     }
+    g_clock_keepalive_last_work_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (use_unretained) {
         return [g_queue commandBufferWithUnretainedReferences];
     }
@@ -11414,7 +11419,71 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
     return NULL;
 }
 
+/* Single-device clock keepalive, the TP keep-alive applied to one GPU.
+ * Measured on M1 Max (macOS 15): decode submits many small command buffers
+ * and waits on each, and after 10-30 s of that the governor drops the GPU
+ * from 1296 to ~450-650 MHz although it is still 60-95% busy and cool;
+ * High Power Mode does not prevent it. A deep queue of the same kernels
+ * holds 1296 MHz. One FMA threadgroup back to back on a side queue holds the
+ * clock (synthetic submit-and-wait load: 1296 MHz sustained, 2x throughput).
+ * It runs only while engine command buffers were created in the last
+ * DS4_METAL_CLOCK_KEEPALIVE_IDLE_MS, so an idle server does not burn power.
+ * Off by default (DS4_METAL_CLOCK_KEEPALIVE=1 enables): any work on a second
+ * queue costs the engine ~10% regardless of dispatch length, duty cycle or
+ * threadgroup size, and SSD-bound streaming at a ~89% hit rate and resident
+ * Qwen3.8 both keep the clock without it. It pays off only when streaming is
+ * GPU-bound, e.g. ~97% hits: 13.4 instead of ~8.5 t/s sustained. */
+static pthread_t g_clock_keepalive_thread;
+static volatile int g_clock_keepalive_running;
+static volatile int g_clock_keepalive_stop;
+
+static void *ds4_gpu_clock_keepalive_thread(void *arg) {
+    (void)arg;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLCommandQueue> queue = [g_device newCommandQueue];
+    id<MTLBuffer> scratch = [g_device newBufferWithLength:256u * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    if (!pipeline || !queue || !scratch) {
+        fprintf(stderr, "ds4: clock keepalive setup failed (continuing without)\n");
+        return NULL;
+    }
+    memset(scratch.contents, 0, 256u * sizeof(float));
+    const uint32_t iters = (uint32_t)ds4_gpu_env_u64("DS4_METAL_CLOCK_KEEPALIVE_ITERS",
+                                                     1200000u, 1000u, 100000000u);
+    const uint64_t idle_ns = ds4_gpu_env_u64("DS4_METAL_CLOCK_KEEPALIVE_IDLE_MS",
+                                             500u, 10u, 60000u) * 1000000ull;
+    while (!g_clock_keepalive_stop) {
+        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (g_tp_keepalive_running || now - g_clock_keepalive_last_work_ns > idle_ns) {
+            usleep(20000);
+            continue;
+        }
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:scratch offset:0 atIndex:0];
+            [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
+    return NULL;
+}
+
+static int ds4_gpu_clock_keepalive_enabled(void) {
+    const char *env = getenv("DS4_METAL_CLOCK_KEEPALIVE");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 static void ds4_gpu_queue_keepalive_start(void) {
+    if (!g_clock_keepalive_running && ds4_gpu_clock_keepalive_enabled()) {
+        g_clock_keepalive_stop = 0;
+        if (pthread_create(&g_clock_keepalive_thread, NULL, ds4_gpu_clock_keepalive_thread, NULL) == 0)
+            g_clock_keepalive_running = 1;
+    }
     if (g_queue_keepalive_running) return;
     if (getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE")) return;
     g_queue_keepalive_stop = 0;
@@ -11423,6 +11492,11 @@ static void ds4_gpu_queue_keepalive_start(void) {
 }
 
 static void ds4_gpu_queue_keepalive_stop_thread(void) {
+    if (g_clock_keepalive_running) {
+        g_clock_keepalive_stop = 1;
+        pthread_join(g_clock_keepalive_thread, NULL);
+        g_clock_keepalive_running = 0;
+    }
     if (!g_queue_keepalive_running) return;
     g_queue_keepalive_stop = 1;
     pthread_join(g_queue_keepalive_thread, NULL);
