@@ -3109,9 +3109,10 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
             float sum = 0;
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
-                const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
+                const uint k = (aux32 >> 7*l) & 127u;
+                const uint signs = k | ((popcount(k) & 1u) << 7);
                 for (short j = 0; j < 8; ++j) {
-                    sum += yl[8*l + j] * grid[j] * (signs & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sum += yl[8*l + j] * grid[j] * ((signs >> j) & 1u ? -1.f : 1.f);
                 }
             }
             sumf[row] += d * sum;
@@ -3172,14 +3173,10 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     const int nb32 = nb * (QK_K / 32);
 
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
-    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
         int nval = 4;
         int pos  = (32*sgitg + tiisg)*nval;
         for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3214,12 +3211,16 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
+                // ksigns_iq2xs[k] is k with its parity in bit 7; computing it
+                // saves the threadgroup lookups and gives identical signs.
+                const uint kg = (aux32g >> 7*l) & 127u;
+                const uint ku = (aux32u >> 7*l) & 127u;
+                const uint signg = kg | ((popcount(kg) & 1u) << 7);
+                const uint signu = ku | ((popcount(ku) & 1u) << 7);
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8*l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * gridg[j] * ((signg >> j) & 1u ? -1.f : 1.f);
+                    su += v * gridu[j] * ((signu >> j) & 1u ? -1.f : 1.f);
                 }
             }
             sumg[row] += dg * sg;
@@ -3665,12 +3666,14 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                const uint kg = (aux32g >> 7 * l) & 127u;
+                const uint ku = (aux32u >> 7 * l) & 127u;
+                const uint signg = kg | ((popcount(kg) & 1u) << 7);
+                const uint signu = ku | ((popcount(ku) & 1u) << 7);
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * gridg[j] * ((signg >> j) & 1u ? -1.f : 1.f);
+                    su += v * gridu[j] * ((signu >> j) & 1u ? -1.f : 1.f);
                 }
             }
             sumg[row] += dg * sg;
@@ -3817,12 +3820,14 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
             for (short l = 0; l < 4; ++l) {
                 const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
                 const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
-                const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
-                const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                const uint kg = (aux32g >> 7 * l) & 127u;
+                const uint ku = (aux32u >> 7 * l) & 127u;
+                const uint signg = kg | ((popcount(kg) & 1u) << 7);
+                const uint signu = ku | ((popcount(ku) & 1u) << 7);
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * gridg[j] * ((signg >> j) & 1u ? -1.f : 1.f);
+                    su += v * gridu[j] * ((signu >> j) & 1u ? -1.f : 1.f);
                 }
             }
             sumg[row] += dg * sg;
@@ -5923,10 +5928,11 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
                     float s = 0;
                     for (short l = 0; l < 4; ++l) {
                         const threadgroup uint8_t *grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
-                        const uint8_t sign = ssigns[(aux32 >> 7 * l) & 127];
+                        const uint k = (aux32 >> 7 * l) & 127u;
+                        const uint sign = k | ((popcount(k) & 1u) << 7);
                         for (short j = 0; j < 8; ++j) {
                             s += yl[8 * l + j] * grid[j] *
-                                 (sign & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                                 ((sign >> j) & 1u ? -1.f : 1.f);
                         }
                     }
                     sumf[row] += d * s;
