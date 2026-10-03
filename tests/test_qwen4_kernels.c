@@ -3463,7 +3463,10 @@ static uint64_t arena_q8_repeated(arena_t *a, uint64_t rows, uint64_t cols, uint
  * enough copies that the rows come from DRAM.  With DS4_METAL_CB_TIMES=1 the
  * "ds4: cb" line after each bench-q8 marker carries that pass's GPU time. */
 static void bench_q8_rows(arena_t *a) {
-    const uint32_t shapes[4][3] = { {10240, 2560, 8}, {6144, 2560, 8}, {2560, 6144, 8}, {248320, 2560, 1} };
+    /* QWEN4_BENCH_Q8_DS4 swaps in DeepSeek V4's attention q_b, q_a and kv rows. */
+    const uint32_t qwen_shapes[4][3] = { {10240, 2560, 8}, {6144, 2560, 8}, {2560, 6144, 8}, {248320, 2560, 1} };
+    const uint32_t ds4_shapes[4][3] = { {32768, 1024, 8}, {1024, 4096, 8}, {512, 4096, 8}, {129280, 4096, 1} };
+    const uint32_t (*shapes)[3] = getenv("QWEN4_BENCH_Q8_DS4") ? ds4_shapes : qwen_shapes;
     uint64_t offs[4][8];
     for (uint32_t s = 0; s < 4; s++)
         for (uint32_t c = 0; c < shapes[s][2]; c++) offs[s][c] = arena_q8_repeated(a, shapes[s][0], shapes[s][1], 1024);
