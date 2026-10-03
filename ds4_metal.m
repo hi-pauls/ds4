@@ -3904,7 +3904,10 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
     if (g_rope_tail_inplace_pair_affine_pipeline == nil) return 0;
     if (getenv("DS4_METAL_DISABLE_INPLACE_ROPE_PAIR") != NULL) return 0;
     if (getenv("DS4_METAL_DISABLE_AFFINE_ROPE_PAIR") != NULL) return 0;
-    if (!ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
+    /* M1 Max: byte-identical output, ~2 ms less GPU time per decode token
+     * (the gathered-heads layers take the packed attention+reduce kernel). */
+    if (!ds4_gpu_device_name_contains("M1") &&
+        !ds4_gpu_device_name_contains("M3") && !ds4_gpu_device_name_contains("M5")) return 0;
     return 1;
 }
 
