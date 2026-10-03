@@ -197,6 +197,25 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// More rows per threadgroup for short rows: each row's K walk and reduction
+// are unchanged, so outputs match kernel_mul_mv_q8_0_f32 at the same NSG.
+template<short NR0>
+kernel void kernel_mul_mv_q8_0_f32_rows(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<NR0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+typedef decltype(kernel_mul_mv_q8_0_f32_rows<4>) kernel_mul_mv_q8_0_f32_rows_t;
+template [[host_name("kernel_mul_mv_q8_0_f32_nr4")]] kernel kernel_mul_mv_q8_0_f32_rows_t kernel_mul_mv_q8_0_f32_rows<4>;
+template [[host_name("kernel_mul_mv_q8_0_f32_nr8")]] kernel kernel_mul_mv_q8_0_f32_rows_t kernel_mul_mv_q8_0_f32_rows<8>;
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see

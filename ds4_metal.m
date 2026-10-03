@@ -19812,6 +19812,17 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 mv_dispatch.nsg = (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_WIDE_NSG",
                     ds4_gpu_device_name_contains("M1 Max") ? 2u : 8u, 1u, 8u);
             }
+            /* Short rows leave a two-row threadgroup with too little work: on
+             * M1 Max four rows cut the 1024-wide attention q_b matvec ~20%,
+             * while the 4096-wide output head is fastest at two. */
+            const uint64_t rows = ds4_gpu_env_u64("DS4_METAL_Q8_MV_NR0",
+                in_dim <= 1024u && ds4_gpu_device_name_contains("M1") ? 4u : 2u, 2u, 8u);
+            if (rows == 4u || rows == 8u) {
+                mv_dispatch.function_name = rows == 4u ? "kernel_mul_mv_q8_0_f32_nr4"
+                                                       : "kernel_mul_mv_q8_0_f32_nr8";
+                mv_dispatch.nr0 = (int16_t)rows;
+                mv_dispatch.smem = 32u * (uint32_t)rows * sizeof(float);
+            }
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
