@@ -9645,6 +9645,18 @@ int ds4_gpu_flush_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
+    /* Hand the batch-scoped buffers to this command buffer's completion, so a
+     * long run of flushed batches does not hold them all until the next wait.
+     * Buffers parked here by later batches outlive earlier ones, since one
+     * queue completes in order. */
+    if ([g_transient_buffers count] != 0) {
+        NSArray<id<MTLBuffer>> *keep = [g_transient_buffers copy];
+        [g_transient_buffers removeAllObjects];
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            (void)done;
+            (void)keep;
+        }];
+    }
     [cb commit];
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
