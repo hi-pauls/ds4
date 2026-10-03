@@ -23587,9 +23587,11 @@ static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
  * expert within the top-M scores ("sub") or dropped with its slot pointed at a
  * resident expert at weight zero ("drop"). Weights are renormalized over the
  * resulting set exactly as kernel_dsv4_router_weights_one does. Lossy, off by
- * default. A layer's misses load in parallel, so one remaining miss costs about
- * as much as several: unless partial rerouting is asked for, a layer is only
- * rerouted when every miss in it can be resolved. */
+ * default. Unless partial rerouting is asked for, a layer is only rerouted when
+ * every miss in it can be resolved, so the layer skips its load wait entirely.
+ * On M1 Max a layer's first miss costs ~1.8 ms and each further one ~1 ms (the
+ * SSD saturates at ~6 GB/s by three concurrent reads); a ~25% miss cut there was
+ * within the run-to-run noise of single decode runs. */
 enum {
     METAL_CACHE_ROUTE_OFF = 0,
     METAL_CACHE_ROUTE_DROP = 1,
