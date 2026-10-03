@@ -46786,7 +46786,8 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
         l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
         l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+        (l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
+         l->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
         DS4_N_EXPERT_USED == 8 && n_tokens < 256 &&
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
         getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
