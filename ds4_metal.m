@@ -44082,7 +44082,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool use_prefill_stage =
             g_ssd_streaming_mode && !force_resident && g_tp_split_world == 1 &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K &&
-            n_expert == 6 && n_tokens >= 32u &&
+            (n_expert == 6 || n_expert == 8) && n_tokens >= 32u &&
             ds4_gpu_prefill_stage_lookup(layer_index, model_map, g_batch_cb,
                                          &stream_gate_addr_buf, &stream_up_addr_buf,
                                          &stream_down_addr_buf, &stage_buf,

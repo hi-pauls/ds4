@@ -54018,6 +54018,29 @@ static uint32_t glm_graph_prefill_chunk_tokens(uint32_t full_attention_cap) {
     return full_attention_cap ? full_attention_cap : DS4_GLM_METAL_FULL_ATTN_DEFAULT_CONTEXT;
 }
 
+#ifdef __APPLE__
+/* GLM streamed prefill through the same expert staging as DeepSeek V4: every
+ * routed layer must be IQ2_XXS gate/up + Q2_K down, which the generic routed
+ * MoE then serves from the staged address tables. */
+static bool glm_graph_prefill_stage_enabled(const ds4_glm_gpu_graph *g,
+                                            const ds4_weights       *weights,
+                                            uint32_t                 n_tokens) {
+    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_STAGE");
+    bool enabled = g->ssd_streaming && g->tp_world < 2 && !g->quality && n_tokens >= 32u &&
+                   (DS4_N_EXPERT_USED == 6 || DS4_N_EXPERT_USED == 8) &&
+                   !(env && strcmp(env, "0") == 0);
+    for (uint32_t il = g->layer_start; enabled && il <= g->layer_end; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        enabled = il < DS4_N_LEADING_DENSE ||
+                  (l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+                   l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+                   l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+                   l->ffn_down_exps->type == DS4_TENSOR_Q2_K);
+    }
+    return enabled;
+}
+#endif
+
 static bool glm_graph_forward_indexed_tokens(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -54229,9 +54252,16 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t drain_interval =
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const bool glm_stage = use_batch_ffn && g->layer_start == 0 &&
+                           g->layer_count == glm_graph_normal_layer_count() &&
+                           glm_graph_prefill_stage_enabled(g, weights, n_tokens);
+#else
+    const bool glm_stage = false;
+#endif
     /* Generic IQ2 GLM benefits from sequential layer reads on large continued
      * chunks too. Keep the typed Flash path's selected-expert cache reuse. */
-    const bool full_layer_prefill =
+    const bool full_layer_prefill = !glm_stage &&
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         (pos0 == 0 || (!g->glm53 && glm_graph_layer_uses_generic_routed_moe(
                                       &weights->layer[DS4_N_LEADING_DENSE]))) &&
@@ -54380,6 +54410,12 @@ static bool glm_graph_forward_indexed_tokens(
                                      (uint64_t)n_tokens * g->heads_dim) != 0;
     }
     ds4_gpu_tp_set_attn_head_split(tp_attn_head_split ? 1 : 0);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const uint32_t first_routed = DS4_N_LEADING_DENSE > g->layer_start ? DS4_N_LEADING_DENSE : g->layer_start;
+    if (ok && glm_stage && first_routed <= g->layer_end) {
+        ok = metal_graph_prefill_stage_layer(model, weights, first_routed);
+    }
+#endif
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
         if (layer_prepare &&
@@ -54389,13 +54425,26 @@ static bool glm_graph_forward_indexed_tokens(
             ok = false;
             break;
         }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Layer il's experts were read during layer il-1; start il+1's. */
+        if (glm_stage && il >= first_routed) {
+            ok = ds4_gpu_prefill_stage_wait(il) &&
+                 (il + 1u > g->layer_end || metal_graph_prefill_stage_layer(model, weights, il + 1u));
+            if (!ok) break;
+        }
+#endif
         if (g->ssd_streaming) {
-            ok = glm_graph_stream_map_prefill_layer(g,
-                                                    model,
-                                                    weights,
-                                                    il,
-                                                    n_tokens,
-                                                    full_layer_prefill);
+            if (glm_stage) {
+                g->streaming_static_decode_map_current = false;
+                ok = metal_graph_stream_map_layer_decode(model, weights, il);
+            } else {
+                ok = glm_graph_stream_map_prefill_layer(g,
+                                                        model,
+                                                        weights,
+                                                        il,
+                                                        n_tokens,
+                                                        full_layer_prefill);
+            }
             if (ok && layer_prepare && il < g->layer_end) {
                 ok = metal_graph_stream_prepare_start_if_needed(
                         NULL, model, weights, il + 1u, n_tokens,
@@ -55597,6 +55646,9 @@ glm53_indexed_attention_done:
     }
     ds4_gpu_tp_set_attn_head_split(0);
 #undef DS4_GLM_PROFILE_INDEXED_STAGE
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (glm_stage) ds4_gpu_prefill_stage_end();
+#endif
     if (!metal_graph_stream_prepare_join_all(&layer_prepare_slot, 1)) ok = false;
     if (ok && !g->ssd_streaming) {
         const double trace_end_t0 = trace ? now_sec() : 0.0;
