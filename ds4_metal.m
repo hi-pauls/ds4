@@ -1003,6 +1003,30 @@ static ds4_gpu_stream_expert_cache_entry
     g_stream_expert_cache[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+/* Dense list of valid cache entries (layer << 16 | expert), maintained where
+ * an entry becomes valid or invalid. Victim selection scans these few
+ * thousand residents instead of all 30k table slots: the full scan cost
+ * ~0.9 ms of CPU per missed layer, on the critical path of every load. */
+static uint32_t g_stream_expert_resident_list[DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES];
+static uint32_t g_stream_expert_resident_pos[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER]
+                                            [DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint32_t g_stream_expert_resident_count;
+
+static void ds4_gpu_stream_expert_resident_add(uint32_t layer, uint32_t expert) {
+    if (g_stream_expert_resident_pos[layer][expert] != 0) return;
+    g_stream_expert_resident_list[g_stream_expert_resident_count] = layer << 16 | expert;
+    g_stream_expert_resident_pos[layer][expert] = ++g_stream_expert_resident_count;
+}
+
+static void ds4_gpu_stream_expert_resident_remove(uint32_t layer, uint32_t expert) {
+    const uint32_t pos = g_stream_expert_resident_pos[layer][expert];
+    if (pos == 0) return;
+    const uint32_t last = g_stream_expert_resident_list[--g_stream_expert_resident_count];
+    g_stream_expert_resident_list[pos - 1] = last;
+    g_stream_expert_resident_pos[last >> 16][last & 0xffffu] = pos;
+    g_stream_expert_resident_pos[layer][expert] = 0;
+}
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -15420,6 +15444,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     e->slab_slot = 0;
     e->valid = 0;
     e->slab_backed = 0;
+    ds4_gpu_stream_expert_resident_remove(layer, expert);
 
     if (g_stream_expert_cache_layer_count[layer] > 0) {
         g_stream_expert_cache_layer_count[layer]--;
@@ -15691,40 +15716,36 @@ retry:
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
-    for (uint32_t layer = 0;
-         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
-         layer++) {
-        for (uint32_t expert = 0;
-             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-             expert++) {
-            scan_entries++;
-            ds4_gpu_stream_expert_cache_entry *e =
-                &g_stream_expert_cache[layer][expert];
-            if (!ds4_gpu_stream_expert_cache_entry_reusable(e,
-                                                            gate_expert_bytes,
-                                                            down_expert_bytes)) {
-                continue;
-            }
-            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
-                skipped_inflight = 1;
-                continue;
-            }
-            if (ds4_gpu_stream_expert_cache_entry_protected(layer,
-                                                            expert,
-                                                            protect_layer,
-                                                            protect_ids,
-                                                            n_protect)) {
-                continue;
-            }
-            const uint32_t hotness =
-                g_stream_expert_cache_route_hotness[layer][expert];
-            if (hotness < lowest_hotness ||
-                (hotness == lowest_hotness && e->last_used < oldest)) {
-                lowest_hotness = hotness;
-                oldest = e->last_used;
-                victim_layer = layer;
-                victim_expert = expert;
-            }
+    for (uint32_t r = 0; r < g_stream_expert_resident_count; r++) {
+        const uint32_t layer = g_stream_expert_resident_list[r] >> 16;
+        const uint32_t expert = g_stream_expert_resident_list[r] & 0xffffu;
+        scan_entries++;
+        ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[layer][expert];
+        if (!ds4_gpu_stream_expert_cache_entry_reusable(e,
+                                                        gate_expert_bytes,
+                                                        down_expert_bytes)) {
+            continue;
+        }
+        if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
+            skipped_inflight = 1;
+            continue;
+        }
+        if (ds4_gpu_stream_expert_cache_entry_protected(layer,
+                                                        expert,
+                                                        protect_layer,
+                                                        protect_ids,
+                                                        n_protect)) {
+            continue;
+        }
+        const uint32_t hotness =
+            g_stream_expert_cache_route_hotness[layer][expert];
+        if (hotness < lowest_hotness ||
+            (hotness == lowest_hotness && e->last_used < oldest)) {
+            lowest_hotness = hotness;
+            oldest = e->last_used;
+            victim_layer = layer;
+            victim_expert = expert;
         }
     }
     if (timing) {
@@ -15815,60 +15836,56 @@ retry:
         victim_last_used[i] = UINT64_MAX;
     }
 
-    for (uint32_t layer = 0;
-         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
-         layer++) {
-        for (uint32_t expert = 0;
-             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-             expert++) {
-            scan_entries++;
-            ds4_gpu_stream_expert_cache_entry *e =
-                &g_stream_expert_cache[layer][expert];
-            if (!ds4_gpu_stream_expert_cache_entry_reusable(e,
-                                                            gate_expert_bytes,
-                                                            down_expert_bytes)) {
-                continue;
-            }
-            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
-                skipped_inflight = 1;
-                continue;
-            }
-            if (ds4_gpu_stream_expert_cache_entry_protected(layer,
-                                                            expert,
-                                                            protect_layer,
-                                                            protect_ids,
-                                                            n_protect)) {
-                continue;
-            }
+    for (uint32_t r = 0; r < g_stream_expert_resident_count; r++) {
+        const uint32_t layer = g_stream_expert_resident_list[r] >> 16;
+        const uint32_t expert = g_stream_expert_resident_list[r] & 0xffffu;
+        scan_entries++;
+        ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[layer][expert];
+        if (!ds4_gpu_stream_expert_cache_entry_reusable(e,
+                                                        gate_expert_bytes,
+                                                        down_expert_bytes)) {
+            continue;
+        }
+        if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
+            skipped_inflight = 1;
+            continue;
+        }
+        if (ds4_gpu_stream_expert_cache_entry_protected(layer,
+                                                        expert,
+                                                        protect_layer,
+                                                        protect_ids,
+                                                        n_protect)) {
+            continue;
+        }
 
-            const uint32_t hotness =
-                g_stream_expert_cache_route_hotness[layer][expert];
-            const uint64_t last_used = e->last_used;
-            if (victim_count < n_needed) {
-                victim_layers[victim_count] = layer;
-                victim_experts[victim_count] = expert;
-                victim_hotness[victim_count] = hotness;
-                victim_last_used[victim_count] = last_used;
-                victim_count++;
-                continue;
-            }
+        const uint32_t hotness =
+            g_stream_expert_cache_route_hotness[layer][expert];
+        const uint64_t last_used = e->last_used;
+        if (victim_count < n_needed) {
+            victim_layers[victim_count] = layer;
+            victim_experts[victim_count] = expert;
+            victim_hotness[victim_count] = hotness;
+            victim_last_used[victim_count] = last_used;
+            victim_count++;
+            continue;
+        }
 
-            uint32_t worst = 0;
-            for (uint32_t i = 1; i < victim_count; i++) {
-                if (victim_hotness[i] > victim_hotness[worst] ||
-                    (victim_hotness[i] == victim_hotness[worst] &&
-                     victim_last_used[i] > victim_last_used[worst])) {
-                    worst = i;
-                }
+        uint32_t worst = 0;
+        for (uint32_t i = 1; i < victim_count; i++) {
+            if (victim_hotness[i] > victim_hotness[worst] ||
+                (victim_hotness[i] == victim_hotness[worst] &&
+                 victim_last_used[i] > victim_last_used[worst])) {
+                worst = i;
             }
-            if (hotness < victim_hotness[worst] ||
-                (hotness == victim_hotness[worst] &&
-                 last_used < victim_last_used[worst])) {
-                victim_layers[worst] = layer;
-                victim_experts[worst] = expert;
-                victim_hotness[worst] = hotness;
-                victim_last_used[worst] = last_used;
-            }
+        }
+        if (hotness < victim_hotness[worst] ||
+            (hotness == victim_hotness[worst] &&
+             last_used < victim_last_used[worst])) {
+            victim_layers[worst] = layer;
+            victim_experts[worst] = expert;
+            victim_hotness[worst] = hotness;
+            victim_last_used[worst] = last_used;
         }
     }
     if (timing) {
@@ -16433,6 +16450,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
     }
     e->fresh = 1;
     e->valid = 1;
+    ds4_gpu_stream_expert_resident_add(layer, expert);
     g_stream_expert_cache_layer_count[layer]++;
     if (g_stream_expert_cache_entry_count < UINT32_MAX) {
         g_stream_expert_cache_entry_count++;
