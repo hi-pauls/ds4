@@ -49321,11 +49321,7 @@ static bool glm_graph_use_streaming_selected_async_load(
                               "DS4_METAL_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD")) {
         return false;
     }
-#ifdef DS4_ROCM_BUILD
     return true;
-#else
-    return getenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD") != NULL;
-#endif
 }
 
 typedef struct glm_graph_streaming_async_profile {
