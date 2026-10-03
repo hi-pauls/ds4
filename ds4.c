@@ -38771,7 +38771,7 @@ static uint32_t metal_graph_visual_prefill_chunk(
  * compression windows and row finalization follow the same schedule after the
  * cached prefix.
  */
-static bool metal_graph_prefill_chunked_range(
+static bool metal_graph_prefill_chunked_range_impl(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -38922,6 +38922,37 @@ static bool metal_graph_prefill_chunked_range(
                 (t_read - t0) * 1000.0);
     }
     return true;
+}
+
+/* One staging ring serves every chunk and group of the range. */
+static bool metal_graph_prefill_chunked_range(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_session_progress_fn progress,
+        void                  *progress_ud,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
+#ifdef __APPLE__
+    ds4_gpu_prefill_stage_hold(1);
+#endif
+    const bool ok = metal_graph_prefill_chunked_range_impl(g, model, weights, prompt, start, n_tokens,
+                                                           logits, show_progress, progress, progress_ud,
+                                                           display_progress, display_progress_ud,
+                                                           imatrix, cancel, cancel_ud, cancelled);
+#ifdef __APPLE__
+    ds4_gpu_prefill_stage_hold(0);
+#endif
+    return ok;
 }
 
 /* Long prompts are prefetched in fixed-size chunks.  Chunks bound transient

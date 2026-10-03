@@ -18335,6 +18335,7 @@ typedef struct {
     uint64_t    bytes[DS4_PREFILL_STAGE_SLOTS];
     double      read_ms;
     uint64_t    read_bytes;
+    int         hold;
 } ds4_gpu_prefill_stage;
 
 static ds4_gpu_prefill_stage g_prefill_stage = { .layer = { -1, -1, -1 } };
@@ -18457,14 +18458,10 @@ int ds4_gpu_prefill_stage_wait(uint32_t layer) {
     return ok;
 }
 
-void ds4_gpu_prefill_stage_end(void) {
+/* The ring is ~5 GiB; decode must not keep it resident. */
+static void ds4_gpu_prefill_stage_release(void) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
-    /* The ring is ~5 GiB; decode must not keep it resident. */
     for (uint32_t r = 0; r < DS4_PREFILL_STAGE_SLOTS; r++) {
-        if (s->pending[r]) {
-            (void)ds4_gpu_stream_expert_pread_pool_wait();
-            s->pending[r] = 0;
-        }
         /* After a failed encode the last batch may never be committed, and
          * waiting on it would hang; keep its staging buffer alive then. */
         if (!s->last_cb[r] || s->last_cb[r].status >= MTLCommandBufferStatusCommitted)
@@ -18473,8 +18470,27 @@ void ds4_gpu_prefill_stage_end(void) {
             s->last_cb[r] = nil;
             s->buf[r] = nil;
         }
+    }
+}
+
+/* While held, the ring survives ds4_gpu_prefill_stage_end, so the chunks and
+ * groups of one prefill do not reallocate it and take fresh-page faults on
+ * every read (4.6% of a 25.6k-token prefill). Unholding releases it. */
+void ds4_gpu_prefill_stage_hold(int hold) {
+    g_prefill_stage.hold = hold;
+    if (!hold) ds4_gpu_prefill_stage_release();
+}
+
+void ds4_gpu_prefill_stage_end(void) {
+    ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    for (uint32_t r = 0; r < DS4_PREFILL_STAGE_SLOTS; r++) {
+        if (s->pending[r]) {
+            (void)ds4_gpu_stream_expert_pread_pool_wait();
+            s->pending[r] = 0;
+        }
         s->layer[r] = -1;
     }
+    if (!s->hold) ds4_gpu_prefill_stage_release();
     if (getenv("DS4_METAL_PREFILL_STAGE_STATS") != NULL) {
         fprintf(stderr, "ds4: prefill staging staged=%llu cached=%llu read-wait=%.1f ms "
                 "waited-reads %.2f GiB at %.2f GB/s\n",

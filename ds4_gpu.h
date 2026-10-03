@@ -385,6 +385,7 @@ typedef struct ds4_gpu_stream_expert_table {
 int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *table);
 int ds4_gpu_prefill_stage_wait(uint32_t layer);
 void ds4_gpu_prefill_stage_end(void);
+void ds4_gpu_prefill_stage_hold(int hold);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* Optional CUDA look-ahead between completed layers, inside the existing
  * expert cache. The foreground owns slots; the reader cannot publish them
