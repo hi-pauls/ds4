@@ -12917,6 +12917,34 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+/* Experts are pread from the file behind their own mapping: a support model
+ * (DSpark/MTP stages carry routed experts too) shares the streamed expert
+ * cache with the main model but not its file. Unregistered maps fall back to
+ * the main model's descriptor. */
+static struct {
+    const void *model_map;
+    int         fd;
+} g_model_fds[4];
+
+int ds4_gpu_register_model_fd(const void *model_map, int fd) {
+    for (uint32_t i = 0; i < sizeof(g_model_fds) / sizeof(g_model_fds[0]); i++) {
+        if (g_model_fds[i].model_map == NULL || g_model_fds[i].model_map == model_map) {
+            g_model_fds[i].model_map = model_map;
+            g_model_fds[i].fd = fd;
+            return 1;
+        }
+    }
+    fprintf(stderr, "ds4: no room to register the file of model map %p\n", model_map);
+    return 0;
+}
+
+static int ds4_gpu_model_fd_for_map(const void *model_map) {
+    for (uint32_t i = 0; i < sizeof(g_model_fds) / sizeof(g_model_fds[0]); i++) {
+        if (model_map != NULL && g_model_fds[i].model_map == model_map) return g_model_fds[i].fd;
+    }
+    return g_model_fd;
+}
+
 static int ds4_gpu_model_views_cover_range(
         const void *model_map,
         uint64_t    model_size,
@@ -13449,6 +13477,7 @@ typedef struct {
     uint64_t read_bytes;
     double ms;
     int ok;
+    int fd;     /* set by ds4_gpu_stream_expert_pread_tasks from the model map */
 } ds4_gpu_stream_expert_pread_task;
 
 typedef struct {
@@ -13549,6 +13578,7 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
 }
 
 static int ds4_gpu_stream_expert_pread_into(
+        int       fd,
         uint64_t  offset,
         uint64_t  len,
         uint8_t  *dst,
@@ -13556,7 +13586,7 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    if (g_model_fd < 0 ||
+    if (fd < 0 ||
         !dst ||
         len == 0 ||
         offset > (uint64_t)LLONG_MAX ||
@@ -13572,7 +13602,7 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = 0;
@@ -13585,10 +13615,12 @@ static int ds4_gpu_stream_expert_pread_into(
     if (ms_out) *ms_out = dt;
     if (!ok || pos != len) {
         fprintf(stderr,
-                "ds4: Metal streaming expert explicit pread failed offset=%.2f GiB len=%.2f MiB read=%.2f MiB\n",
+                "ds4: Metal streaming expert explicit pread failed fd=%d offset=%.2f GiB len=%.2f MiB read=%.2f MiB: %s\n",
+                fd,
                 ds4_gpu_gib(offset),
                 ds4_gpu_mib(len),
-                ds4_gpu_mib(pos));
+                ds4_gpu_mib(pos),
+                strerror(errno));
         return 0;
     }
     return 1;
@@ -13599,7 +13631,8 @@ static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
+        task->ok = ds4_gpu_stream_expert_pread_into(task->fd,
+                                                    task->offset,
                                                     task->len,
                                                     task->dst,
                                                     &task->read_bytes,
@@ -13658,7 +13691,8 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
+            task->ok = ds4_gpu_stream_expert_pread_into(task->fd,
+                                                        task->offset,
                                                         task->len,
                                                         task->dst,
                                                         &task->read_bytes,
@@ -13818,11 +13852,15 @@ static void ds4_gpu_stream_expert_pread_pool_shutdown(void) {
 static int ds4_gpu_stream_expert_pread_tasks(
         ds4_gpu_stream_expert_pread_task *tasks,
         uint32_t n_tasks,
+        const void *model_map,
         uint64_t *total_bytes,
         double *wall_ms) {
     if (total_bytes) *total_bytes = 0;
     if (wall_ms) *wall_ms = 0.0;
     if (!tasks || n_tasks == 0) return 1;
+
+    const int fd = ds4_gpu_model_fd_for_map(model_map);
+    for (uint32_t i = 0; i < n_tasks; i++) tasks[i].fd = fd;
 
     const uint32_t n_workers =
         ds4_gpu_stream_expert_pread_thread_count(n_tasks);
@@ -16514,7 +16552,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     };
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
-    if (!ds4_gpu_stream_expert_pread_tasks(tasks, 3, &read_bytes, &read_ms)) {
+    if (!ds4_gpu_stream_expert_pread_tasks(tasks, 3, model_map, &read_bytes, &read_ms)) {
         return NULL;
     }
     ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
@@ -16983,6 +17021,8 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
 
     const uint32_t n_workers =
         ds4_gpu_stream_expert_pread_thread_count(p->n_tasks);
+    const int pread_fd = ds4_gpu_model_fd_for_map(p->model_map);
+    for (uint32_t i = 0; i < p->n_tasks; i++) p->tasks[i].fd = pread_fd;
     p->start_ms = ds4_gpu_now_ms();
     if (load_timing) {
         p->prepare_ms = p->start_ms - load_prepare_t0;
@@ -17006,6 +17046,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     double read_ms = 0.0;
     if (!ds4_gpu_stream_expert_pread_tasks(p->tasks,
                                            p->n_tasks,
+                                           p->model_map,
                                            &read_bytes,
                                            &read_ms)) {
         ds4_gpu_stream_expert_pending_load_release_buffers(p);
@@ -17366,6 +17407,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
     } else {
         ok = ds4_gpu_stream_expert_pread_tasks(tasks,
                                                n_tasks,
+                                               model_map,
                                                &read_bytes,
                                                &read_ms);
     }
@@ -17880,6 +17922,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         double read_ms = 0.0;
         ok = ds4_gpu_stream_expert_pread_tasks(tasks,
                                                n_tasks,
+                                               model_map,
                                                &read_bytes,
                                                &read_ms);
         if (ok) {
