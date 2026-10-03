@@ -18286,6 +18286,177 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     return 1;
 }
 
+/* Streamed prefill expert staging. A large prefill chunk routes to nearly
+ * every expert of a layer, and the mapped-model path pages whole layers in
+ * through the file cache, ignoring what the expert cache already holds. Here
+ * each layer's uncached experts are read straight into one half of a
+ * two-layer staging buffer while the previous layer runs on the GPU, and the
+ * batched MoE reads cached experts from the cache and the rest from staging
+ * through per-expert address tables. The expert cache is not modified. */
+typedef struct {
+    __strong id<MTLBuffer> buf[2];
+    __strong id<MTLBuffer> addr[2][3];
+    __strong id<MTLCommandBuffer> last_cb[2];
+    int32_t     layer[2];
+    const void *model_map[2];
+    int         pending[2];
+    ds4_gpu_stream_expert_cache_entry *res[2][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t    n_res[2];
+    ds4_gpu_stream_expert_pread_task tasks[2][3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t    n_tasks[2];
+    uint64_t    staged_experts;
+    uint64_t    cached_experts;
+    double      wait_ms;
+} ds4_gpu_prefill_stage;
+
+static ds4_gpu_prefill_stage g_prefill_stage = { .layer = { -1, -1 } };
+
+int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
+    ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    if (!t || !t->model_map || t->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        t->n_total_expert == 0 || t->n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        t->gate_expert_bytes == 0 || t->down_expert_bytes == 0) {
+        return 0;
+    }
+    const uint32_t half = t->layer & 1u;
+    if (s->pending[half ^ 1u]) {
+        fprintf(stderr, "ds4: prefill staging for layer %u began before layer %d was waited\n",
+                t->layer, s->layer[half ^ 1u]);
+        return 0;
+    }
+    const uint64_t slot_bytes = 2u * t->gate_expert_bytes + t->down_expert_bytes;
+    const uint64_t buf_bytes = slot_bytes * t->n_total_expert;
+    if (!s->buf[half] || [s->buf[half] length] < buf_bytes) {
+        s->buf[half] = [g_device newBufferWithLength:(NSUInteger)buf_bytes
+                                             options:MTLResourceStorageModeShared];
+        for (uint32_t k = 0; k < 3; k++) {
+            s->addr[half][k] = [g_device newBufferWithLength:DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t)
+                                                     options:MTLResourceStorageModeShared];
+        }
+        if (!s->buf[half] || !s->addr[half][0] || !s->addr[half][1] || !s->addr[half][2]) {
+            fprintf(stderr, "ds4: prefill staging could not allocate %.2f GiB\n", ds4_gpu_gib(buf_bytes));
+            s->buf[half] = nil;
+            return 0;
+        }
+    }
+    /* This half was last read by the layer two before; its GPU work must be done. */
+    if (s->last_cb[half]) {
+        [s->last_cb[half] waitUntilCompleted];
+        s->last_cb[half] = nil;
+    }
+
+    uint64_t *gate_addr = (uint64_t *)[s->addr[half][0] contents];
+    uint64_t *up_addr = (uint64_t *)[s->addr[half][1] contents];
+    uint64_t *down_addr = (uint64_t *)[s->addr[half][2] contents];
+    uint8_t *base = (uint8_t *)[s->buf[half] contents];
+    const uint64_t base_gpu = ds4_gpu_buffer_address(s->buf[half], 0);
+    const int fd = ds4_gpu_model_fd_for_map(t->model_map);
+    s->n_res[half] = 0;
+    s->n_tasks[half] = 0;
+    for (uint32_t e = 0; e < t->n_total_expert; e++) {
+        const uint64_t g_off = t->gate_offset + (uint64_t)e * t->gate_expert_bytes;
+        const uint64_t u_off = t->up_offset + (uint64_t)e * t->gate_expert_bytes;
+        const uint64_t d_off = t->down_offset + (uint64_t)e * t->down_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *entry = &g_stream_expert_cache[t->layer][e];
+        if (ds4_gpu_stream_expert_cache_entry_matches(entry, t->model_map, t->model_size,
+                                                      g_off, u_off, d_off,
+                                                      t->gate_expert_bytes, t->down_expert_bytes)) {
+            gate_addr[e] = ds4_gpu_buffer_address(entry->gate_buffer, entry->gate_inner);
+            up_addr[e] = ds4_gpu_buffer_address(entry->up_buffer, entry->up_inner);
+            down_addr[e] = ds4_gpu_buffer_address(entry->down_buffer, entry->down_inner);
+            s->res[half][s->n_res[half]++] = entry;
+            s->cached_experts++;
+        } else {
+            const uint64_t slot = (uint64_t)e * slot_bytes;
+            const uint64_t lens[3] = { t->gate_expert_bytes, t->gate_expert_bytes, t->down_expert_bytes };
+            const uint64_t offs[3] = { g_off, u_off, d_off };
+            const uint64_t inner[3] = { 0, t->gate_expert_bytes, 2u * t->gate_expert_bytes };
+            for (uint32_t k = 0; k < 3; k++) {
+                s->tasks[half][s->n_tasks[half]++] = (ds4_gpu_stream_expert_pread_task) {
+                    .offset = offs[k], .len = lens[k], .dst = base + slot + inner[k], .fd = fd,
+                };
+            }
+            gate_addr[e] = base_gpu + slot;
+            up_addr[e] = base_gpu + slot + t->gate_expert_bytes;
+            down_addr[e] = base_gpu + slot + 2u * t->gate_expert_bytes;
+            s->staged_experts++;
+        }
+    }
+    s->layer[half] = (int32_t)t->layer;
+    s->model_map[half] = t->model_map;
+    s->pending[half] = 0;
+    if (s->n_tasks[half] != 0) {
+        const uint32_t workers = ds4_gpu_stream_expert_pread_thread_count(s->n_tasks[half]);
+        if (ds4_gpu_stream_expert_pread_pool_begin(s->tasks[half], s->n_tasks[half], workers)) {
+            s->pending[half] = 1;
+        } else if (!ds4_gpu_stream_expert_pread_tasks(s->tasks[half], s->n_tasks[half],
+                                                      t->model_map, NULL, NULL)) {
+            s->layer[half] = -1;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int ds4_gpu_prefill_stage_wait(uint32_t layer) {
+    ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    const uint32_t half = layer & 1u;
+    if (s->layer[half] != (int32_t)layer) return 0;
+    if (!s->pending[half]) return 1;
+    const double t0 = ds4_gpu_now_ms();
+    int ok = ds4_gpu_stream_expert_pread_pool_wait();
+    s->pending[half] = 0;
+    for (uint32_t i = 0; ok && i < s->n_tasks[half]; i++) ok = s->tasks[half][i].ok;
+    s->wait_ms += ds4_gpu_now_ms() - t0;
+    if (!ok) {
+        fprintf(stderr, "ds4: prefill staging reads failed for layer %u\n", layer);
+        s->layer[half] = -1;
+    }
+    return ok;
+}
+
+void ds4_gpu_prefill_stage_end(void) {
+    ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    for (uint32_t h = 0; h < 2; h++) {
+        if (s->pending[h]) {
+            (void)ds4_gpu_stream_expert_pread_pool_wait();
+            s->pending[h] = 0;
+        }
+        s->layer[h] = -1;
+    }
+    if (getenv("DS4_METAL_PREFILL_STAGE_STATS") != NULL) {
+        fprintf(stderr, "ds4: prefill staging staged=%llu cached=%llu read-wait=%.1f ms\n",
+                (unsigned long long)s->staged_experts, (unsigned long long)s->cached_experts,
+                s->wait_ms);
+    }
+}
+
+/* The batched MoE asks whether this layer is staged and complete. */
+static bool ds4_gpu_prefill_stage_lookup(
+        uint32_t layer,
+        const void *model_map,
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer> *gate_addrs,
+        id<MTLBuffer> *up_addrs,
+        id<MTLBuffer> *down_addrs,
+        id<MTLBuffer> *staging,
+        ds4_gpu_stream_expert_cache_entry **resources,
+        uint32_t *n_resources) {
+    ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    const uint32_t half = layer & 1u;
+    if (s->layer[half] != (int32_t)layer || s->pending[half] || s->model_map[half] != model_map) {
+        return false;
+    }
+    *gate_addrs = s->addr[half][0];
+    *up_addrs = s->addr[half][1];
+    *down_addrs = s->addr[half][2];
+    *staging = s->buf[half];
+    memcpy(resources, s->res[half], (size_t)s->n_res[half] * sizeof(resources[0]));
+    *n_resources = s->n_res[half];
+    s->last_cb[half] = cb;
+    return true;
+}
+
 int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -33868,7 +34039,10 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         id<MTLBuffer>               mid,
         NSUInteger                  mid_off,
         id<MTLBuffer>               weights,
-        NSUInteger                  weights_off) {
+        NSUInteger                  weights_off,
+        ds4_gpu_stream_expert_cache_entry * const *resources,
+        uint32_t                    resource_count,
+        id<MTLBuffer>               overflow_resource) {
     if (!cb || !pipeline || !mm_args || !act_args ||
         !gate_src0 || !up_src0 || !src1 || !mid || !weights ||
         !g_moe_id_map_buffer ||
@@ -33909,6 +34083,12 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     [enc setBuffer:mid offset:mid_off atIndex:7];
     [enc setBuffer:weights offset:weights_off atIndex:8];
     [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:9];
+    /* Address-table weights live in buffers the encoder cannot see. */
+    for (uint32_t i = 0; resources && i < resource_count; i++) {
+        [enc useResource:resources[i]->gate_buffer usage:MTLResourceUsageRead];
+        [enc useResource:resources[i]->up_buffer usage:MTLResourceUsageRead];
+    }
+    if (overflow_resource) [enc useResource:overflow_resource usage:MTLResourceUsageRead];
     const NSUInteger tile_m = compact_tile ? 32u : 64u;
     [enc setThreadgroupMemoryLength:compact_tile ? 8192u : 16384u atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
@@ -43771,7 +43951,23 @@ int ds4_gpu_routed_moe_batch_tensor(
                     gate_type, down_type);
             return 0;
         }
+        id<MTLBuffer> stage_buf = nil;
+        const bool use_prefill_stage =
+            g_ssd_streaming_mode && !force_resident && g_tp_split_world == 1 &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K &&
+            n_expert == 6 && n_tokens >= 32u &&
+            ds4_gpu_prefill_stage_lookup(layer_index, model_map, g_batch_cb,
+                                         &stream_gate_addr_buf, &stream_up_addr_buf,
+                                         &stream_down_addr_buf, &stage_buf,
+                                         stream_resources, &stream_resource_count);
+        if (use_prefill_stage) {
+            stream_overflow_gate = stage_buf;
+            stream_overflow_up = stage_buf;
+            stream_overflow_down = stage_buf;
+            stream_unique = n_total_expert;
+        }
         const bool use_iq2_batch_selected_addr =
+            !use_prefill_stage &&
             !force_resident &&
             ds4_gpu_stream_prefill_batch_selected_addr_enabled(n_tokens,
                                                                n_total_expert,
@@ -43787,7 +43983,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
         /* Small full-GLM appends reuse cached bytes with the same MV/MM
          * arithmetic. Large prefills retain sequential whole-layer reads. */
-        const bool use_iq2_cached_batch =
+        const bool use_iq2_cached_batch = use_prefill_stage || (
             g_ssd_streaming_mode && !force_resident && g_tp_split_world == 1 &&
             !ds4_gpu_glm_streaming_prefill_full_layer_active() &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
@@ -43803,8 +43999,10 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
             getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
-            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL;
-        const bool use_cached_batch = use_iq2_batch_selected_addr || use_iq2_cached_batch;
+            getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL);
+        /* Staged layers already have their address tables and resources. */
+        const bool use_cached_batch =
+            !use_prefill_stage && (use_iq2_batch_selected_addr || use_iq2_cached_batch);
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
@@ -44204,6 +44402,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                                 (use_mxfp4_mm_id_pair_half_scale ?
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
+                        use_prefill_stage ?
+                            "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_addr" :
                             "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
@@ -44217,10 +44417,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             gate_mm_pipeline = up_mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
                 mpp ? "kernel_mul_mm_id_iq2_xxs_cached_f32_mpp" :
                       "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
-            down_mm_pipeline = ds4_gpu_get_mul_mm_id_pipeline(
-                request_mid_f16 ? (mpp ? "kernel_mul_mm_id_iq2_xxs_cached_f16_mpp" :
-                                        "kernel_mul_mm_id_iq2_xxs_cached_f16") :
-                                  "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
+            down_mm_pipeline = use_prefill_stage
+                ? ds4_gpu_get_mul_mm_id_pipeline(request_mid_f16 ? "kernel_mul_mm_id_q2_K_cached_f16"
+                                                                 : "kernel_mul_mm_id_q2_K_cached_f32", false)
+                : ds4_gpu_get_mul_mm_id_pipeline(
+                    request_mid_f16 ? (mpp ? "kernel_mul_mm_id_iq2_xxs_cached_f16_mpp" :
+                                            "kernel_mul_mm_id_iq2_xxs_cached_f16") :
+                                      "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
             if (!gate_mm_pipeline || !down_mm_pipeline) return 0;
         }
         if (use_cached_batch) {
@@ -44324,7 +44527,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 fprintf(stderr, "ds4: Metal Q4 batch expert table residency set is not available\n");
                 return 0;
             }
-        } else if (use_cached_batch) {
+        } else if (use_cached_batch || use_prefill_stage) {
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(&g_moe_down_scratch_buffer,
@@ -44592,16 +44795,19 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                                    use_mxfp4_mm_id_pair_swiglu_compact_tile,
                                                                    &gate_mm_args,
                                                                    &act_args,
-                                                                   gate_buf,
-                                                                   (NSUInteger)gate_inner,
-                                                                   up_buf,
-                                                                   (NSUInteger)up_inner,
+                                                                   use_prefill_stage ? stream_gate_addr_buf : gate_buf,
+                                                                   use_prefill_stage ? 0u : (NSUInteger)gate_inner,
+                                                                   use_prefill_stage ? stream_up_addr_buf : up_buf,
+                                                                   use_prefill_stage ? 0u : (NSUInteger)up_inner,
                                                                    xbuf,
                                                                    ds4_gpu_tensor_offset(x),
                                                                    midbuf,
                                                                    ds4_gpu_tensor_offset(mid),
                                                                    weightsbuf,
-                                                                   ds4_gpu_tensor_offset(weights));
+                                                                   ds4_gpu_tensor_offset(weights),
+                                                                   use_prefill_stage ? stream_resources : NULL,
+                                                                   use_prefill_stage ? stream_resource_count : 0u,
+                                                                   use_prefill_stage ? stage_buf : nil);
                 DS4_METAL_PROFILE_MOE_STAGE("gate_up_fused");
             } else if (ok) {
                 ok = ds4_gpu_encode_mul_mm_id_mapped_tile_resources(cb,

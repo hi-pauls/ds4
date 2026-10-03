@@ -37715,6 +37715,30 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
+#ifdef __APPLE__
+/* Streamed prefill expert staging (ds4_gpu_prefill_stage_begin): uncached
+ * experts of the next layer are read into staging while the current layer
+ * runs, instead of paging whole layers in through the mapped model. */
+static bool metal_graph_prefill_stage_enabled(const ds4_gpu_graph *g, uint32_t n_tokens) {
+    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_STAGE");
+    return g->ssd_streaming && g->tp_world < 2 && n_tokens >= 32u &&
+           env && env[0] && strcmp(env, "0") != 0;
+}
+
+static bool metal_graph_prefill_stage_layer(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    if (il >= DS4_N_LAYER) return true;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    uint64_t gate_bytes = 0, down_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(layer, &gate_bytes, &down_bytes)) return false;
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model, layer, il, gate_bytes, down_bytes);
+    return ds4_gpu_prefill_stage_begin(&table) != 0;
+}
+#endif
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -37916,8 +37940,13 @@ static bool metal_graph_prefill_layer_major(
     const bool layer_madvise =
         !layer_pagein && !layer_pread && !layer_readahead &&
         metal_graph_stream_prefill_layer_madvise_enabled(g);
+#ifdef __APPLE__
+    const bool prefill_stage = metal_graph_prefill_stage_enabled(g, n_tokens);
+#else
+    const bool prefill_stage = false;
+#endif
     const bool layer_prepare =
-        layer_pagein || layer_pread || layer_readahead || layer_madvise;
+        !prefill_stage && (layer_pagein || layer_pread || layer_readahead || layer_madvise);
     const bool layer_prepare_overlap =
         layer_prepare && metal_graph_stream_prefill_layer_pagein_overlap_enabled();
     const uint32_t layer_prepare_ahead =
@@ -37948,6 +37977,10 @@ static bool metal_graph_prefill_layer_major(
                                                             layer_prepare_ahead)) {
                 return false;
             }
+        } else if (prefill_stage) {
+#ifdef __APPLE__
+            if (!metal_graph_prefill_stage_layer(model, weights, 0)) return false;
+#endif
         } else {
             if (layer_selected_addr) {
                 metal_graph_stream_readahead_layer_decode(model, weights, 0);
@@ -37997,6 +38030,9 @@ static bool metal_graph_prefill_layer_major(
             (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
                                                       layer_prepare_ahead);
         }
+#ifdef __APPLE__
+        if (prefill_stage) ds4_gpu_prefill_stage_end();
+#endif
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill embed failure also failed\n");
         }
@@ -38023,6 +38059,15 @@ static bool metal_graph_prefill_layer_major(
             ok = false;
             break;
         }
+#ifdef __APPLE__
+        /* Layer il's reads overlapped layer il-1's GPU work; il+1's start now. */
+        if (prefill_stage &&
+            (!ds4_gpu_prefill_stage_wait(il) ||
+             !metal_graph_prefill_stage_layer(model, weights, il + 1u))) {
+            ok = false;
+            break;
+        }
+#endif
 #ifdef DS4_ROCM_BUILD
         const bool rocm_full_layer_stream_prefill =
             rocm_graph_stream_prefill_full_layer_enabled(g,
@@ -38052,7 +38097,7 @@ static bool metal_graph_prefill_layer_major(
 #endif
         if (g->ssd_streaming) {
             g->streaming_static_decode_map_current = false;
-            bool decode_only_map = layer_selected_addr;
+            bool decode_only_map = layer_selected_addr || prefill_stage;
 #ifdef DS4_ROCM_BUILD
             decode_only_map = decode_only_map || rocm_full_layer_stream_prefill;
 #endif
@@ -38095,7 +38140,7 @@ static bool metal_graph_prefill_layer_major(
                 if (!started_future && logits) {
                     metal_graph_stream_readahead_output(model, weights);
                 }
-            } else if (!layer_prepare && il + 1 < DS4_N_LAYER) {
+            } else if (!layer_prepare && !prefill_stage && il + 1 < DS4_N_LAYER) {
                 const bool next_selected_addr =
                     batch_selected_addr &&
                     metal_graph_stream_prefill_batch_selected_addr_layer_supported(
@@ -38164,7 +38209,7 @@ static bool metal_graph_prefill_layer_major(
                                                                           il,
                                                                           n_tokens);
 #ifdef __APPLE__
-            if (ok && !layer_selected_addr) {
+            if (ok && !layer_selected_addr && !prefill_stage) {
                 ok = metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
                         g,
                         model,
@@ -38223,7 +38268,7 @@ static bool metal_graph_prefill_layer_major(
                                                                           il,
                                                                           n_tokens);
 #ifdef __APPLE__
-            if (ok && !layer_selected_addr) {
+            if (ok && !layer_selected_addr && !prefill_stage) {
                 ok = metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
                         g,
                         model,
@@ -38298,6 +38343,9 @@ static bool metal_graph_prefill_layer_major(
                 (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
                                                           layer_prepare_ahead);
             }
+#ifdef __APPLE__
+            if (prefill_stage) ds4_gpu_prefill_stage_end();
+#endif
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
             }
@@ -38324,12 +38372,16 @@ static bool metal_graph_prefill_layer_major(
             (void)metal_graph_stream_prepare_join_all(layer_prepare_slots,
                                                       layer_prepare_ahead);
         }
+#ifdef __APPLE__
+        if (prefill_stage) ds4_gpu_prefill_stage_end();
+#endif
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after layer-major prefill failure also failed\n");
         }
         return false;
     }
 #ifdef __APPLE__
+    if (prefill_stage) ds4_gpu_prefill_stage_end();
     /* Zero-prefix masks are shared across the 43 per-layer command batches,
      * then become dead weight. Release them before the output head and later
      * replay/decode chunks so the prefill win does not add residency pressure. */
