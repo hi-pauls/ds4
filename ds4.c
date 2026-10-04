@@ -23641,6 +23641,50 @@ static bool metal_graph_predict_readahead_enabled(void) {
     return enabled != 0;
 }
 
+/* Predicted experts of the next layer loaded fully into the cache per layer
+ * (DS4_METAL_PREDICT_PREFETCH=N, 0 falls back to page-cache read-ahead).
+ * M1 Max, 2026-10-05, scores byte-identical: GLM-5.3 decode 4.85 -> 5.24 t/s
+ * with 1, 2 is smaller, 4+ is slower than none (the next layer's own loads
+ * wait for the whole prefetch); ds4 is unchanged at 1. */
+static uint32_t metal_graph_predict_prefetch_max(void) {
+    static int max = -1;
+    if (max < 0) {
+        const char *env = getenv("DS4_METAL_PREDICT_PREFETCH");
+        max = env && env[0] ? atoi(env) : 1;
+        if (max < 0) max = 0;
+    }
+    return (uint32_t)max;
+}
+
+/* Called once layer il's own expert loads have completed: the SSD is idle
+ * while the GPU runs the layer, so load layer il+1's predicted experts into
+ * the cache now. The next layer's selected load installs them on arrival. */
+static void metal_graph_predict_prefetch_next_layer(const ds4_model *model,
+                                                    const ds4_layer_weights *layer,
+                                                    uint32_t il,
+                                                    uint64_t gate_expert_bytes,
+                                                    uint64_t down_expert_bytes) {
+    const uint32_t nl = il + 1;
+    const uint32_t max = metal_graph_predict_prefetch_max();
+    if (max == 0 || !metal_graph_predict_readahead_enabled() || nl >= DS4_N_LAYER ||
+        nl >= DS4_MAX_LAYER || !g_predict_made[nl]) return;
+    int32_t predicted[DS4_MAX_EXPERT_USED];
+    int32_t missing[DS4_MAX_EXPERT_USED];
+    uint32_t n_missing = 0;
+    if (ds4_gpu_tensor_read(g_predict_selected[nl], 0, predicted,
+                            (uint64_t)DS4_N_EXPERT_USED * sizeof(predicted[0])) == 0) return;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED && n_missing < max; i++) {
+        if (predicted[i] >= 0 && (uint32_t)predicted[i] < DS4_N_EXPERT &&
+            !ds4_gpu_stream_expert_cache_resident(nl, (uint32_t)predicted[i])) {
+            missing[n_missing++] = predicted[i];
+        }
+    }
+    if (n_missing == 0) return;
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model, layer + 1, nl, gate_expert_bytes, down_expert_bytes);
+    (void)ds4_gpu_stream_expert_cache_begin_selected_load(&table, missing, n_missing);
+}
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -23922,8 +23966,8 @@ static void metal_graph_selected_async_load_run(
     /* The prediction was encoded before this layer's selected-id event, so
      * it is complete once the ids above could be read. */
     const uint32_t next_il = job->il + 1;
-    if (metal_graph_predict_readahead_enabled() && next_il < DS4_N_LAYER &&
-        next_il < DS4_MAX_LAYER && g_predict_made[next_il]) {
+    if (metal_graph_predict_readahead_enabled() && metal_graph_predict_prefetch_max() == 0 &&
+        next_il < DS4_N_LAYER && next_il < DS4_MAX_LAYER && g_predict_made[next_il]) {
         int32_t predicted[DS4_MAX_EXPERT_USED];
         if (ds4_gpu_tensor_read(g_predict_selected[next_il], 0, predicted,
                                 (uint64_t)DS4_N_EXPERT_USED * sizeof(predicted[0])) != 0) {
@@ -27414,6 +27458,10 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      il,
                                                      false) != 0;
         if (ok && async_load_started) ok = ds4_gpu_flush_commands() != 0;
+        if (ok && g->ssd_streaming) {
+            metal_graph_predict_prefetch_next_layer(model, layer, il, gate_expert_bytes,
+                                                    down_expert_bytes);
+        }
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -49658,6 +49706,43 @@ static bool glm_graph_encode_shared_swiglu_one(
     return ok;
 }
 
+/* GLM side of the next-layer read-ahead (see metal_graph_predict_next_layer):
+ * layer L+1's router over layer L's FFN input, so the async loader can read
+ * the predicted experts ahead while layer L runs. */
+static bool glm_graph_predict_next_layer(const ds4_glm_gpu_graph *g,
+                                         const ds4_model         *model,
+                                         const ds4_layer_weights *l,
+                                         uint32_t                 il,
+                                         const ds4_gpu_tensor    *ffn_norm) {
+    const uint32_t nl = il + 1;
+    bool ok = true;
+    if (metal_graph_predict_readahead_enabled() && g->ssd_streaming &&
+        nl < DS4_N_LAYER && nl < DS4_MAX_LAYER) {
+        const ds4_layer_weights *next = l + 1;
+        if (next->ffn_gate_inp && next->ffn_exp_probs_b && next->ffn_gate_exps) {
+            if (!g_predict_logits[nl]) {
+                g_predict_logits[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+                g_predict_probs[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+                g_predict_selected[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+                g_predict_weights[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+            }
+            ok = g_predict_logits[nl] && g_predict_probs[nl] &&
+                 g_predict_selected[nl] && g_predict_weights[nl] &&
+                 ds4_gpu_matmul_f32_tensor(g_predict_logits[nl], model->map, model->size,
+                                           next->ffn_gate_inp->abs_offset, DS4_N_EMBD,
+                                           DS4_N_EXPERT, ffn_norm, 1) != 0 &&
+                 ds4_gpu_glm_router_select_tensor(g_predict_selected[nl], g_predict_weights[nl],
+                                                  g_predict_probs[nl], model->map, model->size,
+                                                  next->ffn_exp_probs_b->abs_offset,
+                                                  g_predict_logits[nl], DS4_N_EXPERT,
+                                                  DS4_N_EXPERT_USED,
+                                                  DS4_EXPERT_WEIGHT_SCALE) != 0;
+            g_predict_made[nl] = ok;
+        }
+    }
+    return ok;
+}
+
 static bool glm_graph_encode_sparse_ffn_one(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -49711,6 +49796,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          pos,
                                          1,
                                          stage_t0);
+    if (ok) ok = glm_graph_predict_next_layer(g, model, l, il, ffn_norm);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
     const bool resident_decode_layer =
         g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
@@ -49901,6 +49987,13 @@ static bool glm_graph_encode_sparse_ffn_one(
             g->router_weights,
             ffn_norm,
             g->ssd_streaming && !streaming_selected_cache) != 0;
+    }
+    if (ok && streaming_selected_cache && metal_graph_predict_prefetch_max() != 0) {
+        ok = ds4_gpu_flush_commands() != 0;
+        if (ok) {
+            metal_graph_predict_prefetch_next_layer(model, l, il, gate_out * gate_row_bytes,
+                                                    down_out * down_row_bytes);
+        }
     }
     if (ok && g->imatrix &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
