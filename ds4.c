@@ -71900,7 +71900,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
         if (e->ssd_streaming) (void)ds4_gpu_register_model_fd(e->mtp_model.map, e->mtp_model.fd);
 #endif
         ds4_dspark_summary dspark = {0};
