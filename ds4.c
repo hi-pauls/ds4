@@ -23669,15 +23669,27 @@ static void metal_graph_predict_prefetch_next_layer(const ds4_model *model,
     if (max == 0 || !metal_graph_predict_readahead_enabled() || nl >= DS4_N_LAYER ||
         nl >= DS4_MAX_LAYER || !g_predict_made[nl]) return;
     int32_t predicted[DS4_MAX_EXPERT_USED];
+    float weight[DS4_MAX_EXPERT_USED];
     int32_t missing[DS4_MAX_EXPERT_USED];
     uint32_t n_missing = 0;
     if (ds4_gpu_tensor_read(g_predict_selected[nl], 0, predicted,
-                            (uint64_t)DS4_N_EXPERT_USED * sizeof(predicted[0])) == 0) return;
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED && n_missing < max; i++) {
-        if (predicted[i] >= 0 && (uint32_t)predicted[i] < DS4_N_EXPERT &&
-            !ds4_gpu_stream_expert_cache_resident(nl, (uint32_t)predicted[i])) {
-            missing[n_missing++] = predicted[i];
+                            (uint64_t)DS4_N_EXPERT_USED * sizeof(predicted[0])) == 0 ||
+        ds4_gpu_tensor_read(g_predict_weights[nl], 0, weight,
+                            (uint64_t)DS4_N_EXPERT_USED * sizeof(weight[0])) == 0) return;
+    /* Heaviest predicted experts first: the router's output order is not by
+     * weight, and picking by weight measured ~2% more GLM decode. */
+    while (n_missing < max) {
+        int best = -1;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            if (predicted[i] >= 0 && (uint32_t)predicted[i] < DS4_N_EXPERT &&
+                !ds4_gpu_stream_expert_cache_resident(nl, (uint32_t)predicted[i]) &&
+                (best < 0 || weight[i] > weight[best])) {
+                best = (int)i;
+            }
         }
+        if (best < 0) break;
+        missing[n_missing++] = predicted[best];
+        predicted[best] = -1;
     }
     if (n_missing == 0) return;
     const ds4_gpu_stream_expert_table table =
