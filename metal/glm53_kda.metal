@@ -1,5 +1,8 @@
 // Kimi Delta Attention kernels, adapted from the kimi-k3 branch.
 
+// Must match the recurrence grid in ds4_gpu_glm53_kda_prefill.
+#define GLM53_KDA_RECURRENCE_ROWS 8u
+
 struct glm53_kda_args {
     uint n_heads;
     uint n_rows;
@@ -246,6 +249,11 @@ kernel void kernel_glm53_kda_prefill_prepare(
     }
 }
 
+/*
+ * Each simdgroup carries ROWS value rows of one head, so the head's q, k and
+ * decay vectors are loaded once per token for all of them instead of once per
+ * row; per row the arithmetic is unchanged.
+ */
 kernel void kernel_glm53_kda_prefill_recurrence(
         constant glm53_kda_args &args,
         device const float   *q,
@@ -259,14 +267,16 @@ kernel void kernel_glm53_kda_prefill_recurrence(
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint D = 128u;
+    constexpr uint ROWS = GLM53_KDA_RECURRENCE_ROWS;
     const uint head = tgpig.x;
-    const uint value = tgpig.y * 4u + sg;
-    if (head >= args.n_heads || value >= D) return;
+    const uint value0 = (tgpig.y * 4u + sg) * ROWS;
+    if (head >= args.n_heads || value0 >= D) return;
     const uint projection = args.n_heads * D;
     const uint k0 = lane * 4u;
     device float4 *state_ptr = (device float4 *)(
-        state + ((ulong)head * D + value) * D + k0);
-    float4 h = *state_ptr;
+        state + ((ulong)head * D + value0) * D + k0);
+    float4 h[ROWS];
+    for (uint r = 0; r < ROWS; r++) h[r] = state_ptr[r * (D / 4u)];
 
     for (uint token = 0; token < args.n_rows; token++) {
         const ulong base = (ulong)token * projection + head * D;
@@ -274,16 +284,20 @@ kernel void kernel_glm53_kda_prefill_recurrence(
         const float4 k4 = *((device const float4 *)(k + base + k0));
         const float4 decay4 =
             *((device const float4 *)(decay + base + k0));
-        h *= decay4;
-        const float hk = simd_sum(dot(h, k4));
         const float beta = 1.0f /
             (1.0f + exp(-raw_beta[(ulong)token * args.n_heads + head]));
-        const float delta_v = (v[base + value] - hk) * beta;
-        h = fma(k4, float4(delta_v), h);
-        const float result = simd_sum(dot(h, q4));
-        if (lane == 0u) out[base + value] = result;
+        float result[ROWS];
+        for (uint r = 0; r < ROWS; r++) {
+            h[r] *= decay4;
+            const float hk = simd_sum(dot(h[r], k4));
+            const float delta_v = (v[base + value0 + r] - hk) * beta;
+            h[r] = fma(k4, float4(delta_v), h[r]);
+            result[r] = simd_sum(dot(h[r], q4));
+        }
+        for (uint r = 0; r < ROWS; r++)
+            if (lane == r) out[base + value0 + r] = result[r];
     }
-    *state_ptr = h;
+    for (uint r = 0; r < ROWS; r++) state_ptr[r * (D / 4u)] = h[r];
 }
 
 kernel void kernel_glm53_kda_prefill_output(

@@ -48481,7 +48481,7 @@ int ds4_gpu_glm53_kda_prefill(
         uint32_t              n_tokens,
         float                 gate_lower_bound,
         float                 norm_eps) {
-    enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3 };
+    enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3, GLM53_KDA_RECURRENCE_ROWS = 8 };
     if (!g_initialized && !ds4_gpu_init()) return 0;
     uint64_t projection = 0, activation_elements = 0;
     uint64_t conv_elements = 0, state_elements = 0;
@@ -48593,7 +48593,8 @@ int ds4_gpu_glm53_kda_prefill(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(n_heads,
+                                              GLM53_KDA_DIM / (4 * GLM53_KDA_RECURRENCE_ROWS), 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
         [enc setComputePipelineState:output_pipeline];
