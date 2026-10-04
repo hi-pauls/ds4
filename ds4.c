@@ -22821,7 +22821,8 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         !g->quality &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+        (layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
+         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
         DS4_N_EXPERT_USED != 0 &&
         DS4_N_EXPERT_USED <= 8 &&
         DS4_N_EXPERT >= 128 &&
