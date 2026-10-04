@@ -44049,7 +44049,13 @@ int ds4_gpu_routed_moe_batch_tensor(
         (!g_ssd_streaming_mode ||
          (g_moe_mul_mv_slots6_mxfp4_pair_swiglu_pipeline != nil &&
           g_moe_mul_mv_slots6_mxfp4_sum6_pipeline != nil));
-    if (use_single_token_q4_one_tensor || use_single_token_mxfp4_one_tensor) {
+    /* A one-row batch (a speculative verify with no accepted draft) has no
+     * streamed batch path; the decode path loads its selected experts. */
+    const bool use_single_token_stream_one_tensor =
+        g_ssd_streaming_mode && !force_resident && n_tokens == 1 && n_expert == 6 &&
+        gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K;
+    if (use_single_token_q4_one_tensor || use_single_token_mxfp4_one_tensor ||
+        use_single_token_stream_one_tensor) {
         if (mid_is_f16) *mid_is_f16 = false;
         return ds4_gpu_routed_moe_one_tensor(out,
                                              gate,
