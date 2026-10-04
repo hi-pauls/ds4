@@ -11502,35 +11502,48 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
  * clock (synthetic submit-and-wait load: 1296 MHz sustained, 2x throughput).
  * It runs only while engine command buffers were created in the last
  * DS4_METAL_CLOCK_KEEPALIVE_IDLE_MS, so an idle server does not burn power.
- * Off by default (DS4_METAL_CLOCK_KEEPALIVE=1 enables): any work on a second
- * queue costs the engine ~10% regardless of dispatch length, duty cycle or
- * threadgroup size, and SSD-bound streaming at a ~89% hit rate and resident
- * Qwen3.8 both keep the clock without it. It pays off only when streaming is
- * GPU-bound, e.g. ~97% hits: 13.4 instead of ~8.5 t/s sustained. */
+ * On by default in SSD streaming mode only (DS4_METAL_CLOCK_KEEPALIVE=0
+ * disables, =1 also enables it for resident models). Streamed decode waits on
+ * the CPU between layers for router readbacks and expert loads; in those gaps
+ * the clock drops, and the same expert matvec then runs 0.59 instead of 0.20 ms
+ * (isolated, 1.5 ms gaps). With the keepalive, M1 Max streamed decode measured
+ * 2026-10-04: ds4 6.2 -> 7.8-8.6 t/s, GLM-5.3 3.5 -> 4.8-4.9 t/s, at ~3% ds4
+ * prefill cost. Resident Qwen3.8 submits back to back and keeps the clock on
+ * its own; there the second queue costs 30% (24.9 -> 17 t/s). */
 static pthread_t g_clock_keepalive_thread;
 static volatile int g_clock_keepalive_running;
 static volatile int g_clock_keepalive_stop;
 
 static void *ds4_gpu_clock_keepalive_thread(void *arg) {
     (void)arg;
-    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
-    id<MTLCommandQueue> queue = [g_device newCommandQueue];
-    id<MTLBuffer> scratch = [g_device newBufferWithLength:256u * sizeof(float)
-                                                  options:MTLResourceStorageModeShared];
-    if (!pipeline || !queue || !scratch) {
-        fprintf(stderr, "ds4: clock keepalive setup failed (continuing without)\n");
-        return NULL;
-    }
-    memset(scratch.contents, 0, 256u * sizeof(float));
     const uint32_t iters = (uint32_t)ds4_gpu_env_u64("DS4_METAL_CLOCK_KEEPALIVE_ITERS",
                                                      1200000u, 1000u, 100000000u);
     const uint64_t idle_ns = ds4_gpu_env_u64("DS4_METAL_CLOCK_KEEPALIVE_IDLE_MS",
                                              500u, 10u, 60000u) * 1000000ull;
+    const char *env = getenv("DS4_METAL_CLOCK_KEEPALIVE");
+    const bool forced = env && env[0] && strcmp(env, "0") != 0;
+    /* Created on first use: a resident model never streams, and then no second
+     * queue should exist at all. */
+    id<MTLComputePipelineState> pipeline = nil;
+    id<MTLCommandQueue> queue = nil;
+    id<MTLBuffer> scratch = nil;
     while (!g_clock_keepalive_stop) {
         const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-        if (g_tp_keepalive_running || now - g_clock_keepalive_last_work_ns > idle_ns) {
+        if (g_tp_keepalive_running || (!forced && !g_ssd_streaming_mode) ||
+            now - g_clock_keepalive_last_work_ns > idle_ns) {
             usleep(20000);
             continue;
+        }
+        if (!queue) {
+            pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+            queue = [g_device newCommandQueue];
+            scratch = [g_device newBufferWithLength:256u * sizeof(float)
+                                            options:MTLResourceStorageModeShared];
+            if (!pipeline || !queue || !scratch) {
+                fprintf(stderr, "ds4: clock keepalive setup failed (continuing without)\n");
+                return NULL;
+            }
+            memset(scratch.contents, 0, 256u * sizeof(float));
         }
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [queue commandBuffer];
@@ -11549,7 +11562,7 @@ static void *ds4_gpu_clock_keepalive_thread(void *arg) {
 
 static int ds4_gpu_clock_keepalive_enabled(void) {
     const char *env = getenv("DS4_METAL_CLOCK_KEEPALIVE");
-    return env && env[0] && strcmp(env, "0") != 0;
+    return !(env && strcmp(env, "0") == 0);
 }
 
 static void ds4_gpu_queue_keepalive_start(void) {
