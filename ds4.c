@@ -33892,21 +33892,11 @@ static bool metal_graph_eval_token_raw_swa(
     return ok;
 }
 
-static bool metal_graph_streaming_decode_prefill_wide_default(
-        const ds4_weights *weights) {
-    if (DS4_MODEL_VARIANT != DS4_VARIANT_FLASH || !weights || DS4_N_LAYER == 0) {
-        return false;
-    }
-    const uint32_t type = weights->layer[0].ffn_gate_exps->type;
-    return (type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_MXFP4) &&
-           weights->layer[0].ffn_up_exps->type == type &&
-           weights->layer[0].ffn_down_exps->type == type;
-}
-
 static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights) {
     (void)g;
+    (void)weights;
     if (glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_DECODE_PREFILL",
                               "DS4_METAL_DISABLE_STREAMING_DECODE_PREFILL")) {
         return 0;
@@ -33929,7 +33919,11 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
         return 0u;
     }
-    return metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
+    /* A streamed batch of more than a few dozen tokens selects nearly every
+     * expert, so batched prefill reads the whole uncached model (~7 s on M1
+     * Max) while decode-style costs ~90 ms per token: Flash crosses over near
+     * 90 tokens. */
+    return DS4_MODEL_VARIANT == DS4_VARIANT_FLASH ? 64u : 18u;
 }
 
 static bool metal_graph_use_streaming_decode_prefill(
