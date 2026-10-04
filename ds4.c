@@ -34198,6 +34198,12 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     const bool profile =
         glm_graph_env_present("DS4_ROCM_STREAMING_EXPERT_HOTLIST_PROFILE",
                               "DS4_METAL_STREAMING_EXPERT_HOTLIST_PROFILE");
+    /* A file hotlist seeds once. Re-seeding after every batched prefill
+     * re-read each hot expert the conversation had evicted, synchronously
+     * before the first token, and reset the cache to generic priorities.
+     * An emptied cache still re-seeds. */
+    static bool seeded_from_file;
+    if (from_file && seeded_from_file && current_count >= preload_count) return true;
     if (!from_file && !refresh_builtin_glm && current_count >= preload_count) {
         if (profile) {
             fprintf(stderr,
@@ -34291,6 +34297,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         seeded_layers++;
         seeded_experts += n;
     }
+    seeded_from_file = from_file;
     if (profile) {
         const char *source_name = NULL;
         if (from_file) {
