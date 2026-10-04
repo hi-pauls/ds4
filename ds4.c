@@ -71158,6 +71158,55 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+/* Read a file range into the page cache from several threads. Making a
+ * resident model GPU-resident otherwise pages it in through one sequential
+ * stream: ~3.3 GB/s from the M1 Max SSD, about half what parallel reads get.
+ * DS4_DISABLE_MODEL_PREFETCH=1 skips it. */
+typedef struct {
+    int      fd;
+    uint64_t offset;
+    uint64_t len;
+    uint32_t thread;
+    uint32_t n_threads;
+} ds4_model_prefetch_part;
+
+enum { DS4_MODEL_PREFETCH_BLOCK = 16u << 20, DS4_MODEL_PREFETCH_THREADS = 8u };
+
+static void *ds4_model_prefetch_thread(void *arg) {
+    const ds4_model_prefetch_part *p = arg;
+    uint8_t *buf = malloc(DS4_MODEL_PREFETCH_BLOCK);
+    const uint64_t n_blocks = (p->len + DS4_MODEL_PREFETCH_BLOCK - 1) / DS4_MODEL_PREFETCH_BLOCK;
+    for (uint64_t b = p->thread; buf && b < n_blocks; b += p->n_threads) {
+        const uint64_t off = b * DS4_MODEL_PREFETCH_BLOCK;
+        const uint64_t want = p->len - off < DS4_MODEL_PREFETCH_BLOCK ? p->len - off : DS4_MODEL_PREFETCH_BLOCK;
+        uint64_t done = 0;
+        bool ok = true;
+        while (ok && done < want) {
+            const ssize_t n = pread(p->fd, buf + done, (size_t)(want - done), (off_t)(p->offset + off + done));
+            ok = n > 0 || (n < 0 && errno == EINTR);
+            if (n > 0) done += (uint64_t)n;
+        }
+    }
+    free(buf);
+    return NULL;
+}
+
+static void ds4_model_prefetch_parallel(int fd, uint64_t offset, uint64_t len) {
+    if (fd >= 0 && len != 0 && getenv("DS4_DISABLE_MODEL_PREFETCH") == NULL) {
+        pthread_t threads[DS4_MODEL_PREFETCH_THREADS];
+        ds4_model_prefetch_part parts[DS4_MODEL_PREFETCH_THREADS];
+        uint32_t started = 0;
+        const double t0 = now_sec();
+        for (uint32_t t = 0; t < DS4_MODEL_PREFETCH_THREADS; t++) {
+            parts[t] = (ds4_model_prefetch_part){ fd, offset, len, t, DS4_MODEL_PREFETCH_THREADS };
+            if (pthread_create(&threads[started], NULL, ds4_model_prefetch_thread, &parts[t]) == 0) started++;
+        }
+        for (uint32_t t = 0; t < started; t++) pthread_join(threads[t], NULL);
+        fprintf(stderr, "ds4: prefetched %.2f GiB of model weights in %.2f s\n",
+                (double)len / 1073741824.0, now_sec() - t0);
+    }
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     return ds4_engine_open_internal(out, opt, NULL);
 }
@@ -72325,6 +72374,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
+            ds4_model_prefetch_parallel(e->model.fd, e->model.tensor_data_pos,
+                                        e->startup_model_span_bytes);
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
