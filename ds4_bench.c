@@ -60,6 +60,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *score_out_path;
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
@@ -374,6 +375,9 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--show-output")) {
             c.show_output = true;
         } else if (!strcmp(arg, "--teacher-forced-decode")) {
+            c.teacher_forced_decode = true;
+        } else if (!strcmp(arg, "--score-out")) {
+            c.score_out_path = need_arg(&i, argc, argv, arg);
             c.teacher_forced_decode = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
@@ -779,6 +783,18 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    FILE *score_out = NULL;
+    if (cfg.score_out_path) {
+        score_out = fopen(cfg.score_out_path, "w");
+        if (!score_out) {
+            fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.score_out_path, strerror(errno));
+            if (out != stdout) fclose(out);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            close_engine(engine, tp_leader);
+            return 1;
+        }
+    }
     fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
     fflush(out);
 
@@ -909,6 +925,19 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            /* --score-out: the forced token's log-probability under the
+             * current logits and the greedy choice, to compare builds whose
+             * kernels change rounding. */
+            if (score_out) {
+                ds4_token_score score = {0};
+                if (!ds4_session_token_logprob(session, token, &score)) {
+                    fprintf(stderr, "ds4-bench: scoring token at %d failed\n", frontier + gen_done);
+                    rc = 1;
+                    break;
+                }
+                fprintf(score_out, "%d %d %.6f %d\n", frontier + gen_done, token, score.logprob,
+                        ds4_session_argmax(session));
+            }
             const double token_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
             if (gen_done == cuda_profile_start && cudaProfilerStart) {
@@ -1035,6 +1064,7 @@ int main(int argc, char **argv) {
     }
 
     if (out != stdout) fclose(out);
+    if (score_out) fclose(score_out);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
