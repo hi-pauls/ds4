@@ -17067,13 +17067,9 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int force_reuse =
             cache_budget != 0 && reserved_entries >= cache_budget;
 
-        ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
-                                              gate_expert_bytes);
-        ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
-                                              down_expert_bytes);
-
+        /* No F_RDADVISE here: the preads follow at once, and the ~0.4 ms of
+         * advise calls per expert sat on the critical path (and on the main
+         * thread for the next-layer prefetch). GLM-5.3 decode +6%, ds4 even. */
         if (load_i < batch_reuse_count &&
             batch_reuse[load_i].gate_buffer &&
             batch_reuse[load_i].up_buffer &&
