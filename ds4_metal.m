@@ -13312,6 +13312,43 @@ int ds4_gpu_stream_expert_cache_resident(uint32_t layer, uint32_t expert) {
            g_stream_expert_cache[layer][expert].valid;
 }
 
+static void ds4_gpu_stream_expert_readahead_range(uint64_t offset, uint64_t len);
+
+/* Page-cache read-ahead for experts a later layer is predicted to need, on a
+ * serial queue: each F_RDADVISE costs ~0.2 ms of CPU, which must stay off the
+ * decode path. Only experts not already resident are touched. */
+void ds4_gpu_stream_expert_cache_readahead_async(const ds4_gpu_stream_expert_table *table,
+                                                 const int32_t *expert_ids,
+                                                 uint32_t n_experts) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("ds4.expert-readahead", DISPATCH_QUEUE_SERIAL);
+    });
+    if (!table || !expert_ids || n_experts == 0 || n_experts > 16) return;
+    const ds4_gpu_stream_expert_table t = *table;
+    struct { int32_t v[16]; uint32_t n; } ids = { .n = 0 };
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const int32_t e = expert_ids[i];
+        if (e >= 0 && (uint32_t)e < t.n_total_expert &&
+            !ds4_gpu_stream_expert_cache_resident(t.layer, (uint32_t)e)) {
+            ids.v[ids.n++] = e;
+        }
+    }
+    if (ids.n == 0) return;
+    dispatch_async(queue, ^{
+        for (uint32_t i = 0; i < ids.n; i++) {
+            const uint64_t e = (uint64_t)(uint32_t)ids.v[i];
+            ds4_gpu_stream_expert_readahead_range(t.gate_offset + e * t.gate_expert_bytes,
+                                                  t.gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(t.up_offset + e * t.gate_expert_bytes,
+                                                  t.gate_expert_bytes);
+            ds4_gpu_stream_expert_readahead_range(t.down_offset + e * t.down_expert_bytes,
+                                                  t.down_expert_bytes);
+        }
+    });
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {

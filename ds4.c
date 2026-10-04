@@ -23619,6 +23619,28 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 #endif
 }
 
+/* Next-layer expert read-ahead for SSD-streamed decode (on by default,
+ * DS4_METAL_PREDICT_READAHEAD=0 disables): layer L+1's router applied to layer
+ * L's MoE input names ~60% of layer L+1's experts. Those not resident are read
+ * ahead into the page cache while layer L runs, so layer L+1's load copies
+ * from memory instead of waiting on the SSD. Only page-cache contents change;
+ * scores stay byte-identical. M1 Max ds4 decode, 2026-10-04: 9.3 -> 10.4 t/s
+ * on prose, 8.4 -> 8.8 t/s on code. */
+static ds4_gpu_tensor *g_predict_logits[DS4_MAX_LAYER];
+static ds4_gpu_tensor *g_predict_probs[DS4_MAX_LAYER];
+static ds4_gpu_tensor *g_predict_selected[DS4_MAX_LAYER];
+static ds4_gpu_tensor *g_predict_weights[DS4_MAX_LAYER];
+static bool g_predict_made[DS4_MAX_LAYER];
+
+static bool metal_graph_predict_readahead_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_METAL_PREDICT_READAHEAD");
+        enabled = !(env && strcmp(env, "0") == 0);
+    }
+    return enabled != 0;
+}
+
 typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
@@ -23896,6 +23918,22 @@ static void metal_graph_selected_async_load_run(
                 job->selected_ids,
                 DS4_N_EXPERT_USED) == 0) {
         return;
+    }
+    /* The prediction was encoded before this layer's selected-id event, so
+     * it is complete once the ids above could be read. */
+    const uint32_t next_il = job->il + 1;
+    if (metal_graph_predict_readahead_enabled() && next_il < DS4_N_LAYER &&
+        next_il < DS4_MAX_LAYER && g_predict_made[next_il]) {
+        int32_t predicted[DS4_MAX_EXPERT_USED];
+        if (ds4_gpu_tensor_read(g_predict_selected[next_il], 0, predicted,
+                                (uint64_t)DS4_N_EXPERT_USED * sizeof(predicted[0])) != 0) {
+            const ds4_gpu_stream_expert_table next_table =
+                graph_stream_expert_table_make(job->model, job->layer + 1, next_il,
+                                               job->gate_expert_bytes,
+                                               job->down_expert_bytes);
+            ds4_gpu_stream_expert_cache_readahead_async(&next_table, predicted,
+                                                        DS4_N_EXPERT_USED);
+        }
     }
 
     job->ok = true;
@@ -24414,6 +24452,37 @@ static bool metal_graph_hc_expand_fusion_eligible(const ds4_gpu_graph *g,
     (void)g; (void)decode_stage_profile;
     return false;
 #endif
+}
+
+static bool metal_graph_predict_next_layer(ds4_gpu_graph *g,
+                                           const ds4_model *model,
+                                           const ds4_layer_weights *layer,
+                                           uint32_t il,
+                                           int token) {
+    if (!metal_graph_predict_readahead_enabled() || !g->ssd_streaming ||
+        il + 1 >= DS4_N_LAYER || il + 1 >= DS4_MAX_LAYER) return true;
+    const ds4_layer_weights *next = layer + 1;
+    if (next->ffn_gate_tid2eid != NULL || next->ffn_gate_inp == NULL) return true;
+    const uint32_t nl = il + 1;
+    if (!g_predict_logits[nl]) {
+        g_predict_logits[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_predict_probs[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_predict_selected[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_predict_weights[nl] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (!g_predict_logits[nl] || !g_predict_probs[nl] ||
+            !g_predict_selected[nl] || !g_predict_weights[nl]) return false;
+    }
+    bool ok = metal_graph_matmul_plain_tensor(g_predict_logits[nl], model, next->ffn_gate_inp,
+                                              DS4_N_EMBD, DS4_N_EXPERT, metal_graph_ffn_norm(g), 1);
+    if (ok) ok = ds4_gpu_router_select_tensor(g_predict_selected[nl], g_predict_weights[nl],
+                                              g_predict_probs[nl], model->map, model->size,
+                                              next->ffn_exp_probs_b ? next->ffn_exp_probs_b->abs_offset : 0,
+                                              0, 0, (uint32_t)token, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                              DS4_EXPERT_WEIGHT_SCALE, 0, 0,
+                                              next->ffn_exp_probs_b != NULL, false,
+                                              g_predict_logits[nl]) != 0;
+    g_predict_made[nl] = ok;
+    return ok;
 }
 
 static bool metal_graph_encode_decode_layer_phase(
@@ -26573,6 +26642,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    g);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
+    if (ok) ok = metal_graph_predict_next_layer(g, model, layer, il, token);
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);

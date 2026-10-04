@@ -382,6 +382,9 @@ typedef struct ds4_gpu_stream_expert_table {
     uint64_t    gate_expert_bytes;
     uint64_t    down_expert_bytes;
 } ds4_gpu_stream_expert_table;
+void ds4_gpu_stream_expert_cache_readahead_async(const ds4_gpu_stream_expert_table *table,
+                                                 const int32_t *expert_ids,
+                                                 uint32_t n_experts);
 int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *table);
 int ds4_gpu_prefill_stage_wait(uint32_t layer);
 void ds4_gpu_prefill_stage_end(void);
