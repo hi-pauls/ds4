@@ -77853,6 +77853,8 @@ int ds4_session_qwen4_cut(ds4_session *s, int start, int end, char *err, size_t 
             s->checkpoint.len -= (int)cut;
             g->pos -= cut;
             g->mrope_delta += (int32_t)cut;
+            /* verify snapshots name rows from before the cut */
+            g->snap_valid = g->snap2_valid = g->snap0_valid = false;
             rc = 0;
         } else {
             snprintf(err, errlen, "cut [%d, %d) failed on the GPU", start, end);

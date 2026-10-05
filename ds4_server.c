@@ -11772,6 +11772,99 @@ static int conv_cache_resume(server *s, server_slot *slot, const request *req,
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common);
 
+/* Qwen3.8 span markers: reasoning and tool results are the spans whose
+ * content a client drops or prunes while the rest of the history stays. */
+typedef struct {
+    int think_open, think_close, tool_open, tool_close;
+} qwen_span_ids;
+
+typedef struct {
+    int start, end;
+} qwen_span_cut;
+
+enum { QWEN_SPAN_NONE, QWEN_SPAN_THINK, QWEN_SPAN_TOOL };
+#define QWEN_SPAN_MAX_CUTS 256
+
+/* the marker tokens, or NULL when one of them is not a single token */
+static const qwen_span_ids *qwen_span_ids_get(ds4_engine *engine) {
+    static qwen_span_ids ids = { -1, -1, -1, -1 };
+    static bool looked_up = false, valid = false;
+    if (!looked_up) {
+        const char *markers[4] = { "<think>", "</think>", "<tool_response>", "</tool_response>" };
+        int *dst[4] = { &ids.think_open, &ids.think_close, &ids.tool_open, &ids.tool_close };
+        valid = true;
+        for (int k = 0; k < 4; k++) {
+            ds4_tokens t = {0};
+            ds4_tokenize_rendered_chat(engine, markers[k], &t);
+            *dst[k] = t.len == 1 ? t.v[0] : -1;
+            valid = valid && t.len == 1;
+            ds4_tokens_free(&t);
+        }
+        looked_up = true;
+    }
+    return valid ? &ids : NULL;
+}
+
+static int qwen_span_kind(const qwen_span_ids *ids, int tok, int open) {
+    int kind = open;
+    if (tok == ids->think_open) kind = QWEN_SPAN_THINK;
+    else if (tok == ids->tool_open) kind = QWEN_SPAN_TOOL;
+    else if (tok == ids->think_close || tok == ids->tool_close) kind = QWEN_SPAN_NONE;
+    return kind;
+}
+
+static int qwen_span_find(const ds4_tokens *t, int from, int tok) {
+    int at = -1;
+    for (int k = from; k < t->len && at < 0; k++) if (t->v[k] == tok) at = k;
+    return at;
+}
+
+/* Lines a Qwen3.8 prompt up against the live session tokens with the content
+ * of reasoning and tool-result spans free to differ.  Live reasoning the
+ * client dropped stays in the session; live tool output the client pruned or
+ * replaced is cut (block aligned, see ds4_session_qwen4_cut), the client's
+ * version standing in for it.  Everything else must match token for token.
+ * On a match, cuts holds the live ranges to drop in ascending order and *tail
+ * the first prompt token the session has not seen; at least one is needed for
+ * fresh logits. */
+static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, const qwen_span_ids *ids,
+                            qwen_span_cut *cuts, int max_cuts, int *n_cuts, int *tail) {
+    int i = 0, j = 0, open_l = QWEN_SPAN_NONE, open_p = QWEN_SPAN_NONE, n = 0;
+    bool ok = true;
+    while (ok && i < live->len && j < prompt->len) {
+        if (live->v[i] == prompt->v[j]) {
+            open_l = qwen_span_kind(ids, live->v[i++], open_l);
+            open_p = qwen_span_kind(ids, prompt->v[j++], open_p);
+        } else if (open_l != QWEN_SPAN_NONE && open_l == open_p) {
+            const int close = open_l == QWEN_SPAN_THINK ? ids->think_close : ids->tool_close;
+            const int close_l = qwen_span_find(live, i, close), close_p = qwen_span_find(prompt, j, close);
+            ok = close_l >= 0 && close_p >= 0;
+            if (ok && open_l == QWEN_SPAN_TOOL) {
+                const int start = (i + 3) / 4 * 4, end = close_l / 4 * 4;
+                if (end > start) {
+                    ok = n < max_cuts;
+                    if (ok) cuts[n++] = (qwen_span_cut){ start, end };
+                }
+            }
+            i = close_l;
+            j = close_p;
+        } else if (open_l == QWEN_SPAN_NONE && live->v[i] == ids->think_open) {
+            /* the client left out a whole reasoning block the session holds,
+             * and with it the blank line after </think> */
+            const int close_l = qwen_span_find(live, i, ids->think_close);
+            ok = close_l >= 0;
+            i = close_l + 1;
+            for (int skip = 0; ok && skip < 2 && i < live->len && live->v[i] != prompt->v[j]; skip++) i++;
+        } else {
+            ok = false;
+        }
+    }
+    ok = ok && i == live->len && j < prompt->len;
+    *n_cuts = n;
+    *tail = j;
+    return ok;
+}
+
 typedef enum {
     REUSE_NONE = 0,
     REUSE_RESPONSES_VISIBLE,
@@ -11781,6 +11874,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_MEMORY_SPAN,
 } slot_reuse_kind;
 
 typedef struct {
@@ -11921,6 +12015,20 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
         return pr;
+    }
+
+    /* executed by qwen_span_reuse once the other tiers have passed */
+    const qwen_span_ids *span_ids = ds4_engine_is_qwen4(s->engine) && req->image_count == 0 &&
+        s->cache_mode == DS4_CACHE_PREFIX ? qwen_span_ids_get(s->engine) : NULL;
+    if (span_ids) {
+        qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
+        int n_cuts = 0, tail = 0;
+        if (qwen_span_match(live, &req->prompt, span_ids, cuts, QWEN_SPAN_MAX_CUTS, &n_cuts, &tail)) {
+            int kept = live_pos;
+            for (int k = 0; k < n_cuts; k++) kept -= cuts[k].end - cuts[k].start;
+            pr.kind = REUSE_MEMORY_SPAN;
+            pr.reuse_tokens = kept;
+        }
     }
 
     return pr;
@@ -12153,6 +12261,43 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
     if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
     if (common != prompt_len) return -1;
     return prompt_len - 1;
+}
+
+/* Reuses the live Qwen3.8 session for a prompt that differs from it only in
+ * reasoning or tool-result content: cuts the pruned tool output and builds the
+ * prompt to sync from the session's tokens and the prompt's unseen tail.
+ * Returns the tokens kept, 0 when the prompt does not line up.  Caller holds
+ * inference_mu. */
+static int qwen_span_reuse(server *s, server_slot *slot, const ds4_tokens *prompt, ds4_tokens *out) {
+    const qwen_span_ids *ids = qwen_span_ids_get(s->engine);
+    int kept = 0;
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
+    int n_cuts = 0, tail = 0;
+    if (ids && live && ds4_session_checkpoint_valid(slot->session) &&
+        qwen_span_match(live, prompt, ids, cuts, QWEN_SPAN_MAX_CUTS, &n_cuts, &tail)) {
+        char err[160] = {0};
+        int cut_tokens = 0;
+        bool ok = true;
+        for (int k = n_cuts - 1; ok && k >= 0; k--) {
+            ok = ds4_session_qwen4_cut(slot->session, cuts[k].start, cuts[k].end, err, sizeof(err)) == 0;
+            cut_tokens += cuts[k].end - cuts[k].start;
+        }
+        if (ok) {
+            live = ds4_session_tokens(slot->session);
+            ds4_tokens_free(out);
+            ds4_tokens_copy(out, live);
+            for (int k = tail; k < prompt->len; k++) ds4_tokens_push(out, prompt->v[k]);
+            kept = live->len;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: live kv cache span match kept=%d cut=%d in %d spans prompt tail=%d",
+                       kept, cut_tokens, n_cuts, prompt->len - tail);
+        } else {
+            server_log(DS4_LOG_WARNING, "ds4-server: live kv cache span cut failed: %s", err);
+            ds4_session_invalidate(slot->session);
+        }
+    }
+    return kept;
 }
 
 static void trace_time(FILE *fp) {
@@ -13804,6 +13949,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = "memory-text";
         prompt_for_sync = &effective_prompt;
         break;
+    case REUSE_MEMORY_SPAN:
+        /* cut and materialized below, by qwen_span_reuse */
+        cached = 0;
+        break;
     case REUSE_NONE:
     default:
         cached = 0;
@@ -13843,6 +13992,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = common;
             cache_source = "memory-token-rewind";
             prompt_for_sync = &j->req.prompt;
+        }
+    }
+    /* Qwen3.8 cannot rewind: a prompt that differs from the session only in
+     * reasoning or tool-result content is lined up span by span instead. */
+    if (cached == 0 && ds4_engine_is_qwen4(s->engine) && !multimodal && old_pos > 0 &&
+        s->cache_mode == DS4_CACHE_PREFIX)
+    {
+        pthread_mutex_lock(&s->inference_mu);
+        cached = qwen_span_reuse(s, slot, &j->req.prompt, &effective_prompt);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (cached > 0) {
+            cache_source = "memory-span";
+            prompt_for_sync = &effective_prompt;
         }
     }
     /* Conversation-cache mode: if live state didn't cover the request, treat it
@@ -21886,6 +22048,31 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
 }
 
+static void test_qwen_span_match(void) {
+    /* markers 900-903; other ids are text */
+    const qwen_span_ids ids = { 900, 901, 902, 903 };
+    qwen_span_cut cuts[4];
+    int n = 0, tail = 0;
+    /* live: sys, reasoning, tool result of 12, answer; the prompt drops the
+     * reasoning, prunes the tool result to a placeholder and asks on */
+    int live_v[] = { 1, 2, 3, 4, 900, 5, 6, 901, 7, 8, 902, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                     903, 30, 31 };
+    int prompt_v[] = { 1, 2, 3, 4, 8, 902, 99, 903, 30, 31, 40, 41 };
+    ds4_tokens live = { live_v, (int)(sizeof(live_v) / sizeof(live_v[0])), 0 };
+    ds4_tokens prompt = { prompt_v, (int)(sizeof(prompt_v) / sizeof(prompt_v[0])), 0 };
+    TEST_ASSERT(qwen_span_match(&live, &prompt, &ids, cuts, 4, &n, &tail));
+    /* tool content sits at 11..22: the cut is its whole blocks, 12..20 */
+    TEST_ASSERT(n == 1 && cuts[0].start == 12 && cuts[0].end == 20);
+    TEST_ASSERT(tail == 10);
+    /* a text difference outside the spans does not line up */
+    prompt_v[1] = 77;
+    TEST_ASSERT(!qwen_span_match(&live, &prompt, &ids, cuts, 4, &n, &tail));
+    prompt_v[1] = 2;
+    /* nothing new after the live tokens: no fresh logits, no match */
+    prompt.len = 10;
+    TEST_ASSERT(!qwen_span_match(&live, &prompt, &ids, cuts, 4, &n, &tail));
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -23819,6 +24006,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
+    test_qwen_span_match();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
