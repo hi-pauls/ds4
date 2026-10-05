@@ -11258,6 +11258,45 @@ static void kv_cache_close(kv_disk_cache *kc) {
     ds4_kvstore_close(kc);
 }
 
+/* The context pool's temporary eviction cache, when no --kv-disk-dir is given:
+ * one directory per server, named for its pid, removed on exit; a later server
+ * sweeps the directories of processes that were killed. */
+static char pool_kv_tmp[PATH_MAX];
+
+static void pool_kv_remove_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        char path[PATH_MAX];
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) {
+                snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+                unlink(path);
+            }
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+
+static void pool_kv_sweep(const char *tmp) {
+    DIR *d = opendir(tmp);
+    if (d) {
+        struct dirent *e;
+        char path[PATH_MAX];
+        long pid = 0;
+        while ((e = readdir(d)) != NULL) {
+            if (sscanf(e->d_name, "ds4-kv-pool-%ld-", &pid) == 1 && pid > 0 &&
+                kill((pid_t)pid, 0) != 0 && errno == ESRCH) {
+                snprintf(path, sizeof(path), "%s/%s", tmp, e->d_name);
+                pool_kv_remove_dir(path);
+                server_log(DS4_LOG_DEFAULT, "ds4-server: removed stale context pool cache %s", path);
+            }
+        }
+        closedir(d);
+    }
+}
+
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
 }
@@ -16066,6 +16105,10 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    if (pool_kv_tmp[0]) {
+        pool_kv_remove_dir(pool_kv_tmp);
+        pool_kv_tmp[0] = '\0';
+    }
     tool_memory_free(&s->tool_mem);
     server_image_cache_clear(&s->image_cache);
     for (int i = 0; i < s->slot_count; i++) {
@@ -16581,24 +16624,32 @@ int main(int argc, char **argv) {
     s.cache_mode = cfg.cache_mode;
     if (s.cache_mode == DS4_CACHE_PREFIX) {
         /* A context pool writes the sessions it takes context from to disk,
-         * so it needs a disk cache: a temporary one when none was given. */
-        static char pool_kv_dir[PATH_MAX];
+         * so it needs a disk cache: a temporary one when none was given.
+         * That one holds evictions only; prefix checkpoints of a 500k session
+         * are 7 GB each and would be thrown away with the directory anyway. */
         const char *kv_dir = cfg.kv_disk_dir;
         uint64_t kv_space_mb = cfg.kv_disk_space_mb;
+        kv_cache_options kv_opt = cfg.kv_cache;
         if (!kv_dir && cfg.engine.ctx_pool_tokens) {
             const char *tmp = getenv("TMPDIR");
             if (!tmp || !tmp[0]) tmp = "/tmp";
             const size_t tmp_len = strlen(tmp);
-            snprintf(pool_kv_dir, sizeof(pool_kv_dir), "%.*s/ds4-kv-pool-XXXXXX",
-                     (int)(tmp_len > 1 && tmp[tmp_len - 1] == '/' ? tmp_len - 1 : tmp_len), tmp);
-            kv_dir = mkdtemp(pool_kv_dir);
+            const int dir_len = (int)(tmp_len > 1 && tmp[tmp_len - 1] == '/' ? tmp_len - 1 : tmp_len);
+            char tmp_dir[PATH_MAX];
+            snprintf(tmp_dir, sizeof(tmp_dir), "%.*s", dir_len, tmp);
+            pool_kv_sweep(tmp_dir);
+            snprintf(pool_kv_tmp, sizeof(pool_kv_tmp), "%s/ds4-kv-pool-%ld-XXXXXX", tmp_dir, (long)getpid());
+            kv_dir = mkdtemp(pool_kv_tmp);
+            if (!kv_dir) pool_kv_tmp[0] = '\0';
             if (kv_dir && kv_space_mb == 0) kv_space_mb = DS4_SERVER_POOL_KV_SPACE_MB;
+            kv_opt.cold_max_tokens = 0;
+            kv_opt.continued_interval_tokens = 0;
             server_log(DS4_LOG_DEFAULT, "ds4-server: context pool evicts to %s",
                        kv_dir ? kv_dir : "(no temporary directory; sessions keep their context)");
         }
         if (kv_dir) {
             kv_cache_open(&s.kv, kv_dir, kv_space_mb,
-                          cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+                          cfg.kv_cache_reject_different_quant, kv_opt);
         }
         if (cfg.engine.ctx_pool_tokens) ds4_engine_set_evict_hook(engine, kv_cache_pool_evict, &s);
     } else {
@@ -16783,7 +16834,7 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&s.mu);
 
     if (s.cache_mode == DS4_CACHE_PREFIX) {
-        for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
+        for (int i = 0; s.kv.enabled && !pool_kv_tmp[0] && i < s.slot_count; i++) {
             server_slot *slot = &s.slots[i];
             const ds4_tokens *tokens = ds4_session_tokens(slot->session);
             if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
