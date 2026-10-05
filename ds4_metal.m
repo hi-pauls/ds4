@@ -50089,6 +50089,11 @@ int ds4_gpu_qwen4_idx_block_key_tensor(
                           MTLSizeMake(n_blocks, 1, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+/* M1 Max: 20.9 -> 25.9 t/s decode at 130k tokens, output identical */
+static bool qwen4_idx_vec_default(void) {
+    return ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M1 Max");
+}
+
 int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
         uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
@@ -50107,11 +50112,11 @@ int ds4_gpu_qwen4_idx_score_tensor(
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
     /* staged queries and vector key loads, plus the tile maxima the
-     * prefiltered selector needs; measured on M5, other devices keep the
-     * scalar scorer */
+     * prefiltered selector needs; measured on M5 and M1 Max, other devices
+     * keep the scalar scorer */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
     const bool vec = tile_max && n_idx_head * idx_dim <= 512u && (idx_dim & 3u) == 0u &&
-        (vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (vec_override >= 0 ? vec_override != 0 : qwen4_idx_vec_default());
     if (vec) {
         if (!qwen4_bind_tensor(&b[3], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
@@ -50139,9 +50144,9 @@ int ds4_gpu_qwen4_idx_select_tensor(
     /* Scalar/MM scorers do not populate tile maxima. An independent
      * scorer override must also disable their consumer. */
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
-    const bool vec = vec_override >= 0 ? vec_override != 0 : ds4_gpu_device_is_m5_apple_silicon();
+    const bool vec = vec_override >= 0 ? vec_override != 0 : qwen4_idx_vec_default();
     const bool pre = tile_max && vec && n_tokens <= 2u && n_blocks > 8u * top_k &&
-        (pre_override >= 0 ? pre_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+        (pre_override >= 0 ? pre_override != 0 : qwen4_idx_vec_default());
     if (pre) {
         if (!qwen4_bind_tensor(&b[1], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),
                                "indexer tile maxima")) return 0;
