@@ -487,6 +487,9 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Experimental: drops tokens [start, end) from a Qwen3.8 session without
+ * recomputing the rest; both block aligned (multiples of 4).  0 on success. */
+int ds4_session_qwen4_cut(ds4_session *s, int start, int end, char *err, size_t errlen);
 bool ds4_session_checkpoint_valid(const ds4_session *s);
 /* Test helpers (ds4-test): allocate a session shell holding only the given
  * checkpoint tokens, for server-side routing/probe unit tests.  Not usable

@@ -77786,6 +77786,85 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+/* Experimental: drops tokens [start, end) from a Qwen3.8 session without
+ * recomputing what follows.  The attention caches lose those rows; the rows
+ * after them keep the positions they were encoded with, and new tokens
+ * continue past the gap.  The linear-attention state keeps the dropped span
+ * folded in, since a recurrent state has nothing to subtract.  start and end
+ * must sit on indexer block boundaries. */
+#ifdef DS4_HAS_QWEN4_GPU
+/* Rows move towards the front, so the overlapping copy goes through a scratch
+ * buffer, finished before it is read back. */
+static bool qwen4_move_bytes(ds4_gpu_tensor *buf, uint64_t to, uint64_t from, uint64_t bytes, ds4_gpu_tensor *tmp) {
+    bool ok = true;
+    if (bytes) {
+        (void)ds4_gpu_begin_commands();
+        ok = ds4_gpu_tensor_copy(tmp, 0, buf, from, bytes);
+        ok = ds4_gpu_synchronize() != 0 && ok;
+        (void)ds4_gpu_begin_commands();
+        ok = ok && ds4_gpu_tensor_copy(buf, to, tmp, 0, bytes);
+        ok = ds4_gpu_synchronize() != 0 && ok;
+    }
+    return ok;
+}
+#endif
+
+int ds4_session_qwen4_cut(ds4_session *s, int start, int end, char *err, size_t errlen) {
+    int rc = 1;
+#ifdef DS4_HAS_QWEN4_GPU
+    const uint32_t ratio = 4u;
+    ds4_qwen4_gpu_graph *g = s ? &s->qwen4_graph : NULL;
+    if (!s || !ds4_session_is_qwen4(s) || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len) {
+        snprintf(err, errlen, "cut needs a valid Qwen3.8 session");
+    } else if (start < 0 || end <= start || (uint32_t)end > g->pos ||
+               start % (int)ratio || end % (int)ratio) {
+        snprintf(err, errlen, "cut [%d, %d) must be block aligned inside %u tokens", start, end, g->pos);
+    } else {
+        const uint32_t cut = (uint32_t)(end - start), tail = g->pos - (uint32_t)end;
+        const uint64_t kv_row = qwen4_kv_pos_bytes(), bk_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
+        const uint64_t ik_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        const bool caller_batch = ds4_gpu_begin_commands() == 0;
+        bool ok = ds4_gpu_synchronize() != 0;
+        ds4_gpu_tensor *tmp = tail ? ds4_gpu_tensor_alloc((uint64_t)tail * kv_row) : NULL;
+        ok = ok && (tail == 0 || tmp != NULL);
+        const uint32_t tail_blocks = g->pos / ratio - (uint32_t)end / ratio;
+        for (uint32_t il = 0; ok && tail && il < DS4_N_LAYER; il++) {
+            if (g->layer_k_cache[il]) {
+                ok = qwen4_move_bytes(g->layer_k_cache[il], (uint64_t)start * kv_row, (uint64_t)end * kv_row,
+                                      (uint64_t)tail * kv_row, tmp) &&
+                     qwen4_move_bytes(g->layer_v_cache[il], (uint64_t)start * kv_row, (uint64_t)end * kv_row,
+                                      (uint64_t)tail * kv_row, tmp) &&
+                     qwen4_move_bytes(g->layer_block_key[il], (uint64_t)(start / ratio) * bk_row,
+                                      (uint64_t)(end / ratio) * bk_row, (uint64_t)tail_blocks * bk_row, tmp);
+                /* raw indexer keys still matter for the unfinished last block only */
+                for (uint32_t p = g->pos - g->pos % ratio; ok && p < g->pos; p++) {
+                    const uint32_t from = g->ik_ring ? p % g->ik_ring : p;
+                    const uint32_t to = g->ik_ring ? (p - cut) % g->ik_ring : p - cut;
+                    ok = qwen4_move_bytes(g->layer_ik_cache[il], (uint64_t)to * ik_row, (uint64_t)from * ik_row,
+                                          ik_row, tmp);
+                }
+            }
+        }
+        ok = ok && qwen4_move_bytes(g->pos3, (uint64_t)start * 16u, (uint64_t)end * 16u, (uint64_t)tail * 16u, tmp);
+        ds4_gpu_tensor_free(tmp);
+        if (caller_batch) (void)ds4_gpu_begin_commands();
+        if (ok) {
+            memmove(s->checkpoint.v + start, s->checkpoint.v + end, (size_t)tail * sizeof(s->checkpoint.v[0]));
+            s->checkpoint.len -= (int)cut;
+            g->pos -= cut;
+            g->mrope_delta += (int32_t)cut;
+            rc = 0;
+        } else {
+            snprintf(err, errlen, "cut [%d, %d) failed on the GPU", start, end);
+        }
+    }
+#else
+    (void)s; (void)start; (void)end;
+    snprintf(err, errlen, "cut needs the Qwen3.8 GPU backend");
+#endif
+    return rc;
+}
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);

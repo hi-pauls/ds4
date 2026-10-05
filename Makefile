@@ -131,6 +131,12 @@ tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_qwen4_cut: tests/test_qwen4_cut.c ds4.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+tests/test_qwen4_cut_session: tests/test_qwen4_cut_session.c ds4.h $(CORE_OBJS)
+	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
 tests/test_metal_tp_spec.o: tests/test_metal_tp_spec.c ds4.h ds4_tp.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
