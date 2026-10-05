@@ -59013,47 +59013,48 @@ static uint32_t qwen4_ctx_initial_rows(uint32_t ctx_max, uint32_t cap_tokens) {
 }
 
 /* Moves the context caches to new_cap rows, keeping the first keep rows.
- * Everything else a session holds is independent of its context. */
+ * Everything else a session holds is independent of its context.
+ * One layer at a time, so the peak is the new caches plus a single old layer
+ * rather than both sets in full; growing to 263k rows otherwise ran out of
+ * GPU memory.  On failure the layers already moved keep their larger buffers,
+ * which still hold the kept rows, and ctx_cap stays as it was. */
 static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_t keep) {
     const uint64_t kv_row = qwen4_kv_pos_bytes(), bk_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
     const uint32_t new_blocks = new_cap / 4u + 1u;
     const uint32_t keep_blocks = keep ? keep / 4u + 1u : 0u;
-    ds4_gpu_tensor *k[DS4_MAX_LAYER] = {0}, *v[DS4_MAX_LAYER] = {0}, *bk[DS4_MAX_LAYER] = {0};
     /* copies are blits in a command batch: ours, or the caller's, finished and reopened below */
-    const bool own_batch = ds4_gpu_begin_commands() != 0;
+    const bool caller_batch = ds4_gpu_begin_commands() == 0;
     ds4_gpu_tensor *pos3 = ds4_gpu_tensor_alloc((uint64_t)new_cap * 16u);
     bool ok = pos3 != NULL && (keep == 0 || ds4_gpu_tensor_copy(pos3, 0, g->pos3, 0, (uint64_t)keep * 16u));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!g->layer_k_cache[il]) continue;
-        k[il] = ds4_gpu_tensor_alloc((uint64_t)new_cap * kv_row);
-        v[il] = ds4_gpu_tensor_alloc((uint64_t)new_cap * kv_row);
-        bk[il] = ds4_gpu_tensor_alloc((uint64_t)new_blocks * bk_row);
-        ok = k[il] && v[il] && bk[il];
+        (void)ds4_gpu_begin_commands();
+        ds4_gpu_tensor *k = ds4_gpu_tensor_alloc((uint64_t)new_cap * kv_row);
+        ds4_gpu_tensor *v = ds4_gpu_tensor_alloc((uint64_t)new_cap * kv_row);
+        ds4_gpu_tensor *bk = ds4_gpu_tensor_alloc((uint64_t)new_blocks * bk_row);
+        ok = k && v && bk;
         if (ok && keep) {
-            ok = ds4_gpu_tensor_copy(k[il], 0, g->layer_k_cache[il], 0, (uint64_t)keep * kv_row) &&
-                 ds4_gpu_tensor_copy(v[il], 0, g->layer_v_cache[il], 0, (uint64_t)keep * kv_row) &&
-                 ds4_gpu_tensor_copy(bk[il], 0, g->layer_block_key[il], 0, (uint64_t)keep_blocks * bk_row);
+            ok = ds4_gpu_tensor_copy(k, 0, g->layer_k_cache[il], 0, (uint64_t)keep * kv_row) &&
+                 ds4_gpu_tensor_copy(v, 0, g->layer_v_cache[il], 0, (uint64_t)keep * kv_row) &&
+                 ds4_gpu_tensor_copy(bk, 0, g->layer_block_key[il], 0, (uint64_t)keep_blocks * bk_row);
         }
-    }
-    /* the copies read the old buffers: finish them before letting those go */
-    const bool synced = ds4_gpu_synchronize() != 0;
-    if (!own_batch) (void)ds4_gpu_begin_commands();
-    ok = ok && synced;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!g->layer_k_cache[il]) continue;
+        /* the copies read the old buffers: finish them before letting those go */
+        ok = ds4_gpu_synchronize() != 0 && ok;
         if (ok) {
             ds4_gpu_tensor_free(g->layer_k_cache[il]);
             ds4_gpu_tensor_free(g->layer_v_cache[il]);
             ds4_gpu_tensor_free(g->layer_block_key[il]);
-            g->layer_k_cache[il] = k[il];
-            g->layer_v_cache[il] = v[il];
-            g->layer_block_key[il] = bk[il];
+            g->layer_k_cache[il] = k;
+            g->layer_v_cache[il] = v;
+            g->layer_block_key[il] = bk;
         } else {
-            ds4_gpu_tensor_free(k[il]);
-            ds4_gpu_tensor_free(v[il]);
-            ds4_gpu_tensor_free(bk[il]);
+            ds4_gpu_tensor_free(k);
+            ds4_gpu_tensor_free(v);
+            ds4_gpu_tensor_free(bk);
         }
     }
+    if (caller_batch) (void)ds4_gpu_begin_commands();
+    else (void)ds4_gpu_end_commands();
     if (ok) {
         ds4_gpu_tensor_free(g->pos3);
         g->pos3 = pos3;
