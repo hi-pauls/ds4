@@ -48,6 +48,8 @@ static volatile sig_atomic_t g_listen_fd = -1;
 
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
+/* the temporary disk cache of a context pool: room for a few long sessions */
+#define DS4_SERVER_POOL_KV_SPACE_MB 32768
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
@@ -11345,25 +11347,23 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
-static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
-                                            const ds4_tokens *tokens,
-                                            int store_len, const char *reason,
-                                            const char *cache_text_override,
-                                            uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+/* For callers already inside the engine (holding inference_mu), such as the
+ * context pool's evict hook. */
+static bool kv_cache_store_live_prefix_text_held(server *s, server_slot *slot,
+                                                 const ds4_tokens *tokens,
+                                                 int store_len, const char *reason,
+                                                 const char *cache_text_override,
+                                                 uint8_t cache_text_ext,
+                                                 const char *cache_text_key) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
     /* The payload contains image-conditioned KV rows, but the disk key and
      * trailer do not contain image fingerprints. Never let generic image
      * placeholder tokens become a cache hit for a different image.
      * sync_image_count covers progress-callback writes during prefill;
      * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
-        pthread_mutex_unlock(&s->inference_mu);
-        return false;
-    }
+    if (ds4_session_has_vision_state(slot->session)) return false;
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
@@ -11373,6 +11373,19 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
+    return ok;
+}
+
+static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
+                                            const ds4_tokens *tokens,
+                                            int store_len, const char *reason,
+                                            const char *cache_text_override,
+                                            uint8_t cache_text_ext,
+                                            const char *cache_text_key) {
+    if (!s || !slot) return false;
+    pthread_mutex_lock(&s->inference_mu);
+    const bool ok = kv_cache_store_live_prefix_text_held(s, slot, tokens, store_len, reason,
+                                                         cache_text_override, cache_text_ext, cache_text_key);
     pthread_mutex_unlock(&s->inference_mu);
     return ok;
 }
@@ -11384,11 +11397,10 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
-    if (!s || !slot) return;
+static bool kv_cache_store_current_ex(server *s, server_slot *slot, const char *reason, bool inference_held) {
+    if (!s || !slot) return false;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
+    if (!tokens) return false;
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -11419,13 +11431,35 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
-    if (visible_text) {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
-        free(visible_text);
+    bool ok;
+    if (inference_held) {
+        ok = kv_cache_store_live_prefix_text_held(s, slot, tokens, tokens->len, reason,
+                                                  visible_text, visible_ext, visible_key);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        ok = kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                             visible_text, visible_ext, visible_key);
     }
+    free(visible_text);
+    return ok;
+}
+
+static void kv_cache_store_current(server *s, server_slot *slot,
+                                   const char *reason) {
+    (void)kv_cache_store_current_ex(s, slot, reason, false);
+}
+
+/* The context pool's evict hook, called inside the engine (inference_mu held):
+ * a session it takes context from is first written to the disk KV cache, so
+ * its next request restores it instead of prefilling from scratch. */
+static bool kv_cache_pool_evict(void *ud, ds4_session *session) {
+    server *s = ud;
+    bool ok = false;
+    if (s && s->kv.enabled) {
+        for (int i = 0; i < s->slot_count && !ok; i++) {
+            if (s->slots[i].session == session) ok = kv_cache_store_current_ex(s, &s->slots[i], "evict", true);
+        }
+    }
+    return ok;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -15402,6 +15436,7 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        ds4_session_set_idle(chosen_slot->session, false);
         if (chosen_evict_live > 0) {
             server_log(DS4_LOG_KVCACHE,
                        "slot %d: request reuses nothing; evicting checkpoint "
@@ -15492,6 +15527,7 @@ static void *slot_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
+        ds4_session_set_idle(slot->session, true);
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
     }
@@ -15740,6 +15776,7 @@ static void server_cancel_job(server *s, job *j) {
             if (slot->assigned != j) continue;
             slot->assigned = NULL;
             slot->busy = false;
+            ds4_session_set_idle(slot->session, true);
             detached = true;
             dispatch_jobs_locked(s);
             break;
@@ -16193,6 +16230,8 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--ctx-pool")) {
+            c.engine.ctx_pool_tokens = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -16474,6 +16513,13 @@ int main(int argc, char **argv) {
                        ds4_engine_prefill_chunk(engine),
                        cfg.engine.ssd_streaming,
                        slot_count);
+    if (cfg.engine.ctx_pool_tokens) {
+        /* the caches of every session together never exceed one context of the pool's size */
+        server_log(DS4_LOG_DEFAULT, "ds4-server: Qwen3.8 context pool of %u tokens shared by %d sessions; at most:",
+                   cfg.engine.ctx_pool_tokens, slot_count);
+        log_context_memory(cfg.engine.backend, (int)cfg.engine.ctx_pool_tokens, ds4_engine_prefill_chunk(engine),
+                           cfg.engine.ssd_streaming, 1);
+    }
 
     server s = {0};
     s.engine = engine;
@@ -16500,7 +16546,14 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
-    pthread_mutex_init(&s.kv_mu, NULL);
+    /* Recursive: restoring a session from disk may grow it, and a full context
+     * pool then writes another idle session to the same cache from inside the
+     * restore, on the same thread. */
+    pthread_mutexattr_t kv_mu_attr;
+    pthread_mutexattr_init(&kv_mu_attr);
+    pthread_mutexattr_settype(&kv_mu_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s.kv_mu, &kv_mu_attr);
+    pthread_mutexattr_destroy(&kv_mu_attr);
     pthread_mutexattr_t inference_attr;
     pthread_mutexattr_init(&inference_attr);
     pthread_mutexattr_settype(&inference_attr, PTHREAD_MUTEX_RECURSIVE);
@@ -16521,15 +16574,33 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        ds4_session_set_idle(slot->session, true);
     }
 
     /* Cache subsystem selection (mutually exclusive), after slots exist. */
     s.cache_mode = cfg.cache_mode;
     if (s.cache_mode == DS4_CACHE_PREFIX) {
-        if (cfg.kv_disk_dir) {
-            kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+        /* A context pool writes the sessions it takes context from to disk,
+         * so it needs a disk cache: a temporary one when none was given. */
+        static char pool_kv_dir[PATH_MAX];
+        const char *kv_dir = cfg.kv_disk_dir;
+        uint64_t kv_space_mb = cfg.kv_disk_space_mb;
+        if (!kv_dir && cfg.engine.ctx_pool_tokens) {
+            const char *tmp = getenv("TMPDIR");
+            if (!tmp || !tmp[0]) tmp = "/tmp";
+            const size_t tmp_len = strlen(tmp);
+            snprintf(pool_kv_dir, sizeof(pool_kv_dir), "%.*s/ds4-kv-pool-XXXXXX",
+                     (int)(tmp_len > 1 && tmp[tmp_len - 1] == '/' ? tmp_len - 1 : tmp_len), tmp);
+            kv_dir = mkdtemp(pool_kv_dir);
+            if (kv_dir && kv_space_mb == 0) kv_space_mb = DS4_SERVER_POOL_KV_SPACE_MB;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: context pool evicts to %s",
+                       kv_dir ? kv_dir : "(no temporary directory; sessions keep their context)");
+        }
+        if (kv_dir) {
+            kv_cache_open(&s.kv, kv_dir, kv_space_mb,
                           cfg.kv_cache_reject_different_quant, cfg.kv_cache);
         }
+        if (cfg.engine.ctx_pool_tokens) ds4_engine_set_evict_hook(engine, kv_cache_pool_evict, &s);
     } else {
         /* Conversation cache: RAM-first, optional disk backing. Mutually
          * exclusive with the prefix cache; --kv-* flags for the prefix cache

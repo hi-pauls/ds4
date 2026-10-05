@@ -168,6 +168,9 @@ typedef struct {
     int placement_session_count_hint;
     /* Server batch mode serializes execution and can share prefill scratch. */
     bool share_session_prefill_workspace;
+    /* Qwen3.8: context rows all sessions share, each growing up to its own
+     * context as it needs (0: every session reserves its full context). */
+    uint32_t ctx_pool_tokens;
     bool first_token_test;
     bool metal_graph_test;
     bool load_slice;
@@ -405,6 +408,15 @@ void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
+/* The session serves no request.  Under a shared context pool (ctx_pool_tokens)
+ * an idle session's context may be reclaimed for a busy one; it then loses its
+ * prompt cache and prefills from the start on its next request. */
+void ds4_session_set_idle(ds4_session *s, bool idle);
+/* Called for an idle session before the pool takes its context back; returns
+ * true once its state is safe elsewhere (the server's disk KV cache).  Without
+ * a hook, or when it returns false, the session keeps its context. */
+typedef bool (*ds4_session_evict_fn)(void *ud, ds4_session *s);
+void ds4_engine_set_evict_hook(ds4_engine *e, ds4_session_evict_fn fn, void *ud);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 float ds4_session_directional_steering_ffn(ds4_session *s);

@@ -43138,6 +43138,16 @@ struct ds4_engine {
     ds4_gpu_tensor *qwen4_lin_hist_pool[DS4_MAX_LAYER];
     uint32_t qwen4_pool_slots;
     uint64_t qwen4_pool_used;
+    /* Context rows all sessions share (0: each reserves its full context) and
+     * the rows their caches hold now; sessions grow and shrink within it. */
+    uint64_t qwen4_ctx_pool;
+    uint64_t qwen4_ctx_used;
+    /* the pooled sessions, so a short pool can reclaim idle ones */
+    struct ds4_session *qwen4_pooled[64];
+    uint64_t qwen4_idle_clock;
+    /* persists an idle session before the pool takes its context back */
+    ds4_session_evict_fn qwen4_evict;
+    void *qwen4_evict_ud;
 #endif
 
     /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
@@ -58503,7 +58513,20 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
     X(hc_u) X(hc_lo_act)
 
 typedef struct ds4_qwen4_gpu_graph {
+    /* Context rows: ctx_max is the session's limit, ctx_cap what its caches
+     * hold now.  With a shared pool (pool_used) a session starts at ctx_initial
+     * rows, grows when a forward needs more and shrinks back when reset;
+     * without one ctx_cap is ctx_max from the start. */
     uint32_t ctx_cap;
+    uint32_t ctx_max;
+    uint32_t ctx_initial;
+    uint64_t *pool_used;
+    uint64_t pool_limit;
+    bool pool_refused;    /* the last failure was the pool, not the model: say so to the client */
+    /* frees at least rows pooled rows from other, idle sessions where it can */
+    void (*pool_reclaim)(void *ud, uint64_t rows, const struct ds4_qwen4_gpu_graph *owner);
+    void *pool_ud;
+    uint32_t block_key_rows;
     uint32_t pos;
     uint32_t cap_tokens;
     /* rows of the raw indexer key ring (see qwen4_ik_row in qwen4.metal) */
@@ -58831,8 +58854,8 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
  * tensor per layer and this graph takes slot's view of it.  A batched decode
  * then advances all its rows with one dispatch; without a pool each session
  * keeps its own tensors and the batch falls back to a dispatch per row. */
-static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
-                              bool mtp, const ds4_qwen4_gpu_graph *shared,
+static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_max, uint32_t ctx_initial,
+                              uint32_t cap_tokens, bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
                               ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
     memset(g, 0, sizeof(*g));
@@ -58844,20 +58867,25 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
-    g->ctx_cap = ctx_cap;
+    g->ctx_max = ctx_max;
+    g->ctx_initial = ctx_initial != 0 && ctx_initial < ctx_max ? ctx_initial : ctx_max;
+    g->ctx_cap = g->ctx_initial;
+    const uint32_t ctx_cap = g->ctx_cap;
     g->cap_tokens = cap_tokens;
     /* a chunk's first pooled block reaches up to 3 tokens before the chunk;
      * a session only ever continues from its end or restarts at 0, and MTP
      * rollbacks stay within one verify block, so older rows are never read */
-    g->ik_ring = getenv("DS4_QWEN4_IK_FULL") ? 0u : cap_tokens + 4u < ctx_cap ? cap_tokens + 4u : 0u;
+    g->ik_ring = getenv("DS4_QWEN4_IK_FULL") ? 0u : cap_tokens + 4u < ctx_max ? cap_tokens + 4u : 0u;
     g->k_blocks = DS4_N_INDEXER_TOP_K / 4u;
     g->n_logit_rows = mtp ? 3u : 1u;
-    g->n_block_cap = ctx_cap / 4u + 1u;
+    /* sizes the scratch (and the arena a borrowing session must fit), so the limit */
+    g->n_block_cap = ctx_max / 4u + 1u;
+    g->block_key_rows = ctx_cap / 4u + 1u;
     static bool warned_ctx = false;
-    if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
+    if (!warned_ctx && g_qwen4_native_ctx && ctx_max > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
         warned_ctx = true;
         fprintf(stderr, "ds4: context %u exceeds the native %u tokens; prompts past that need "
-                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_cap, g_qwen4_native_ctx);
+                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_max, g_qwen4_native_ctx);
     }
     g->sel_stride = g->k_blocks * 4u + 4u;
 
@@ -58956,9 +58984,9 @@ private_state:
         } else {
             g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_pos_bytes());
             g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_pos_bytes());
-            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)(g->ik_ring ? g->ik_ring : ctx_cap) *
+            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)(g->ik_ring ? g->ik_ring : ctx_max) *
                                                           DS4_N_INDEXER_HEAD_DIM);
-            g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
+            g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->block_key_rows * DS4_N_INDEXER_HEAD_DIM * 2u);
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
         }
     }
@@ -58972,6 +59000,97 @@ private_state:
         return false;
     }
     return true;
+}
+
+/* A pooled session's starting rows: DS4_QWEN4_CTX_INITIAL, else 8192, and at
+ * least one prefill chunk, in whole 1024-row steps. */
+static uint32_t qwen4_ctx_initial_rows(uint32_t ctx_max, uint32_t cap_tokens) {
+    const char *env = getenv("DS4_QWEN4_CTX_INITIAL");
+    uint64_t rows = env && atoi(env) > 0 ? (uint64_t)atoi(env) : 8192u;
+    if (rows < (uint64_t)cap_tokens + 4u) rows = (uint64_t)cap_tokens + 4u;
+    rows = (rows + 1023u) & ~(uint64_t)1023u;
+    return rows < ctx_max ? (uint32_t)rows : ctx_max;
+}
+
+/* Moves the context caches to new_cap rows, keeping the first keep rows.
+ * Everything else a session holds is independent of its context. */
+static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_t keep) {
+    const uint64_t kv_row = qwen4_kv_pos_bytes(), bk_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
+    const uint32_t new_blocks = new_cap / 4u + 1u;
+    const uint32_t keep_blocks = keep ? keep / 4u + 1u : 0u;
+    ds4_gpu_tensor *k[DS4_MAX_LAYER] = {0}, *v[DS4_MAX_LAYER] = {0}, *bk[DS4_MAX_LAYER] = {0};
+    /* copies are blits in a command batch: ours, or the caller's, finished and reopened below */
+    const bool own_batch = ds4_gpu_begin_commands() != 0;
+    ds4_gpu_tensor *pos3 = ds4_gpu_tensor_alloc((uint64_t)new_cap * 16u);
+    bool ok = pos3 != NULL && (keep == 0 || ds4_gpu_tensor_copy(pos3, 0, g->pos3, 0, (uint64_t)keep * 16u));
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!g->layer_k_cache[il]) continue;
+        k[il] = ds4_gpu_tensor_alloc((uint64_t)new_cap * kv_row);
+        v[il] = ds4_gpu_tensor_alloc((uint64_t)new_cap * kv_row);
+        bk[il] = ds4_gpu_tensor_alloc((uint64_t)new_blocks * bk_row);
+        ok = k[il] && v[il] && bk[il];
+        if (ok && keep) {
+            ok = ds4_gpu_tensor_copy(k[il], 0, g->layer_k_cache[il], 0, (uint64_t)keep * kv_row) &&
+                 ds4_gpu_tensor_copy(v[il], 0, g->layer_v_cache[il], 0, (uint64_t)keep * kv_row) &&
+                 ds4_gpu_tensor_copy(bk[il], 0, g->layer_block_key[il], 0, (uint64_t)keep_blocks * bk_row);
+        }
+    }
+    /* the copies read the old buffers: finish them before letting those go */
+    const bool synced = ds4_gpu_synchronize() != 0;
+    if (!own_batch) (void)ds4_gpu_begin_commands();
+    ok = ok && synced;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->layer_k_cache[il]) continue;
+        if (ok) {
+            ds4_gpu_tensor_free(g->layer_k_cache[il]);
+            ds4_gpu_tensor_free(g->layer_v_cache[il]);
+            ds4_gpu_tensor_free(g->layer_block_key[il]);
+            g->layer_k_cache[il] = k[il];
+            g->layer_v_cache[il] = v[il];
+            g->layer_block_key[il] = bk[il];
+        } else {
+            ds4_gpu_tensor_free(k[il]);
+            ds4_gpu_tensor_free(v[il]);
+            ds4_gpu_tensor_free(bk[il]);
+        }
+    }
+    if (ok) {
+        ds4_gpu_tensor_free(g->pos3);
+        g->pos3 = pos3;
+        if (g->pool_used) *g->pool_used = *g->pool_used - g->ctx_cap + new_cap;
+        fprintf(stderr, "ds4: Qwen3.8 session context %u -> %u rows (pool %llu of %llu in use)\n", g->ctx_cap, new_cap,
+                (unsigned long long)(g->pool_used ? *g->pool_used : 0u), (unsigned long long)g->pool_limit);
+        g->ctx_cap = new_cap;
+        g->block_key_rows = new_blocks;
+    } else {
+        ds4_gpu_tensor_free(pos3);
+    }
+    return ok;
+}
+
+/* Makes room for need rows: doubling up to the session's limit, within what
+ * the shared pool has left.  Without a pool the caches are already full size. */
+static bool qwen4_graph_reserve(ds4_qwen4_gpu_graph *g, uint32_t need) {
+    bool ok = need <= g->ctx_cap;
+    if (!ok && need <= g->ctx_max && g->pool_used) {
+        uint64_t free_rows = g->pool_limit > *g->pool_used ? g->pool_limit - *g->pool_used : 0u;
+        if ((uint64_t)need > (uint64_t)g->ctx_cap + free_rows && g->pool_reclaim) {
+            g->pool_reclaim(g->pool_ud, need - g->ctx_cap - free_rows, g);
+            free_rows = g->pool_limit > *g->pool_used ? g->pool_limit - *g->pool_used : 0u;
+        }
+        uint64_t want = (uint64_t)g->ctx_cap * 2u > need ? (uint64_t)g->ctx_cap * 2u : need;
+        want = (want + 1023u) & ~(uint64_t)1023u;
+        if (want > g->ctx_max) want = g->ctx_max;
+        if (want - g->ctx_cap > free_rows) want = (uint64_t)g->ctx_cap + free_rows;
+        if (want >= need) ok = qwen4_graph_resize(g, (uint32_t)want, g->ctx_cap);
+        g->pool_refused = !ok;
+        if (!ok) {
+            fprintf(stderr, "ds4: Qwen3.8 context pool exhausted: a session needs %u rows, "
+                    "%llu of %llu pooled rows are in use\n", need,
+                    (unsigned long long)*g->pool_used, (unsigned long long)g->pool_limit);
+        }
+    }
+    return ok;
 }
 
 static bool qwen4_graph_load_steering(ds4_qwen4_gpu_graph *g,
@@ -59081,6 +59200,8 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap0_valid = false;
     g->snap_after_first = false;
     g->snap_after_second = false;
+    /* a pooled session that grew hands its rows back; nothing in them is kept */
+    if (g->pool_used && g->ctx_cap > g->ctx_initial) (void)qwen4_graph_resize(g, g->ctx_initial, 0u);
 }
 
 /* rows > 0 limits the product to a contiguous leading prefix of w. */
@@ -59695,7 +59816,7 @@ static void qwen4_graph_prefetch_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model 
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
-    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    if (!g || T == 0 || T > g->cap_tokens || !qwen4_graph_reserve(g, g->pos + T)) return false;
     if (all_rows && T > g->n_logit_rows) return false;
     for (uint32_t t = 0; t < T; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
@@ -60028,8 +60149,8 @@ static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
 static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                  uint32_t row, const int *next_tokens, uint32_t T, uint32_t idx, bool want_logits,
                                  float *logits_out, int *draft_out) {
-    if (!g->mtp_R || T == 0u || T > 3u || idx > g->ctx_cap || T > g->ctx_cap - idx ||
-        row > g->cap_tokens || T > g->cap_tokens - row) return false;
+    if (!g->mtp_R || T == 0u || T > 3u || idx > g->ctx_max || T > g->ctx_max - idx ||
+        row > g->cap_tokens || T > g->cap_tokens - row || !qwen4_graph_reserve(g, idx + T)) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
@@ -60122,7 +60243,8 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
 static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        int next_token, uint32_t idx, int *draft_out) {
     if (!g->mtp_R || g->mtp_last_rows == 0u || g->mtp_last_rows > 3u || !draft_out ||
-        idx >= g->ctx_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB) return false;
+        idx >= g->ctx_max || next_token < 0 || next_token >= (int)DS4_N_VOCAB ||
+        !qwen4_graph_reserve(g, idx + 1u)) return false;
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC;
     const uint32_t il = DS4_N_LAYER - 1u;
     const ds4_layer_weights *l = &w->layer[il];
@@ -60214,7 +60336,7 @@ static int generate_qwen4_metal_argmax(
         return 1;
     }
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false, NULL, NULL, NULL, 0)) {
+    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, 0u, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false, NULL, NULL, NULL, 0)) {
         free(g);
         return 1;
     }
@@ -60250,12 +60372,12 @@ static int generate_qwen4_metal_argmax(
     }
     int n_generated = 0;
     const double t_decode0 = now_sec();
-    for (int i = 0; i < n_predict && g->pos < g->ctx_cap; i++) {
+    for (int i = 0; i < n_predict && g->pos < g->ctx_max; i++) {
         const int token = sample_argmax(logits, DS4_N_VOCAB);
         if (vocab_token_is_generation_stop(vocab, token)) break;
         if (emit) emit(emit_ud, token);
         n_generated++;
-        if (i == n_predict - 1 || g->pos + 1u >= g->ctx_cap) break;
+        if (i == n_predict - 1 || g->pos + 1u >= g->ctx_max) break;
         if (!qwen4_graph_forward_token(g, model, weights, token, logits)) {
             fprintf(stderr, "ds4: Qwen3.8 decode failed at position %u\n", g->pos);
             free(logits);
@@ -61224,6 +61346,9 @@ struct ds4_session {
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
+    /* set by the server between requests; written from its dispatcher thread */
+    bool qwen4_idle;
+    uint64_t qwen4_idle_since;   /* engine clock when it went idle, for least-recently-used reclaim */
     bool qwen4_rewound;
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
@@ -63755,7 +63880,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
         return 1;
     }
-    if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
+    if (rows > g->ctx_max || rows > (uint32_t)s->ctx_size || !qwen4_graph_reserve(g, rows)) {
         payload_set_err(err, errlen, "KV checkpoint is longer than this session's context");
         return 1;
     }
@@ -68728,7 +68853,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0)) {
+        if (!qwen4_graph_alloc(g, weights, 8192u, 0u, 128u, false, NULL, NULL, NULL, 0)) {
             free(g);
             fclose(lf);
             return 1;
@@ -68866,7 +68991,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0)) {
+        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, 0u, chunk, draft != NULL, NULL, NULL, NULL, 0)) {
             free(g);
             return 1;
         }
@@ -71553,6 +71678,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+#ifdef DS4_HAS_QWEN4_GPU
+    e->qwen4_ctx_pool = opt->ctx_pool_tokens;
+#endif
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -73890,6 +74018,83 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+#ifdef DS4_HAS_QWEN4_GPU
+/* A short pool takes back the grown context of idle sessions: the smallest
+ * first (quick queries and subagents, cheap to write out and to reload), the
+ * one idle longest among equals.  Each is persisted through the evict hook
+ * first and skipped if that fails, so no session's state is lost: its next
+ * request restores it from disk. */
+static void qwen4_pool_reclaim(void *ud, uint64_t rows, const ds4_qwen4_gpu_graph *owner) {
+    ds4_engine *e = ud;
+    uint64_t freed = 0;
+    bool tried[64] = {false};
+    bool searching = e->qwen4_evict != NULL;
+    /* the hook's save synchronizes the GPU, which ends a command batch the caller had open */
+    const bool caller_batch = searching && ds4_gpu_begin_commands() == 0;
+    if (searching && !caller_batch) (void)ds4_gpu_end_commands();
+    while (searching && freed < rows) {
+        int victim = -1;
+        for (uint32_t i = 0; i < 64u; i++) {
+            const ds4_session *c = e->qwen4_pooled[i];
+            if (c && !tried[i] && &c->qwen4_graph != owner && __atomic_load_n(&c->qwen4_idle, __ATOMIC_ACQUIRE) &&
+                c->qwen4_graph.ctx_cap > c->qwen4_graph.ctx_initial) {
+                const ds4_session *v = victim >= 0 ? e->qwen4_pooled[victim] : NULL;
+                if (!v || c->checkpoint.len < v->checkpoint.len ||
+                    (c->checkpoint.len == v->checkpoint.len && c->qwen4_idle_since < v->qwen4_idle_since)) {
+                    victim = (int)i;
+                }
+            }
+        }
+        searching = victim >= 0;
+        if (searching) {
+            tried[victim] = true;
+            ds4_session *v = e->qwen4_pooled[victim];
+            const int tokens = v->checkpoint.len;
+            if (e->qwen4_evict(e->qwen4_evict_ud, v)) {
+                const uint64_t before = e->qwen4_ctx_used;
+                qwen4_graph_reset(&v->qwen4_graph);
+                v->checkpoint.len = 0;
+                v->checkpoint_valid = false;
+                v->mtp_draft_valid = false;
+                v->glm_mtp_have = 0;
+                v->glm_mtp_have2 = false;
+                freed += before - e->qwen4_ctx_used;
+                fprintf(stderr, "ds4: Qwen3.8 context pool: wrote an idle session of %d tokens to disk, "
+                        "took %llu rows back\n", tokens, (unsigned long long)(before - e->qwen4_ctx_used));
+            } else {
+                fprintf(stderr, "ds4: Qwen3.8 context pool: could not write an idle session of %d tokens "
+                        "to disk; it keeps its context\n", tokens);
+            }
+        }
+    }
+    if (caller_batch) {
+        (void)ds4_gpu_synchronize();
+        (void)ds4_gpu_begin_commands();
+    }
+}
+#endif
+
+void ds4_engine_set_evict_hook(ds4_engine *e, ds4_session_evict_fn fn, void *ud) {
+    if (!e) return;
+#ifdef DS4_HAS_QWEN4_GPU
+    e->qwen4_evict = fn;
+    e->qwen4_evict_ud = ud;
+#else
+    (void)fn;
+    (void)ud;
+#endif
+}
+
+void ds4_session_set_idle(ds4_session *s, bool idle) {
+    if (!s) return;
+#ifdef DS4_HAS_QWEN4_GPU
+    if (idle && s->engine) s->qwen4_idle_since = __atomic_add_fetch(&s->engine->qwen4_idle_clock, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->qwen4_idle, idle, __ATOMIC_RELEASE);
+#else
+    (void)idle;
+#endif
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -74006,7 +74211,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                   ? e->placement_session_count_hint : 0))) {
             s->qwen4_slot = qwen4_state_pool_take(e);
         }
-        if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens,
+        /* a shared context pool: sessions start small and grow into it */
+        const bool pooled = e->qwen4_ctx_pool != 0;
+        const uint32_t initial = pooled ? qwen4_ctx_initial_rows((uint32_t)ctx_size, cap_tokens) : 0u;
+        if (pooled && e->qwen4_ctx_used + initial > e->qwen4_ctx_pool) {
+            fprintf(stderr, "ds4: Qwen3.8 context pool exhausted: a new session needs %u rows, "
+                    "%llu of %llu pooled rows are in use\n", initial,
+                    (unsigned long long)e->qwen4_ctx_used, (unsigned long long)e->qwen4_ctx_pool);
+            free(s);
+            return 1;
+        }
+        if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, initial, cap_tokens,
                                e->glm_mtp, shared,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_state_pool : NULL,
                                s->qwen4_slot >= 0 ? e->qwen4_lin_hist_pool : NULL,
@@ -74014,6 +74229,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             free(s);
             return 1;
+        }
+        if (pooled) {
+            s->qwen4_graph.pool_used = &e->qwen4_ctx_used;
+            s->qwen4_graph.pool_limit = e->qwen4_ctx_pool;
+            s->qwen4_graph.pool_reclaim = qwen4_pool_reclaim;
+            s->qwen4_graph.pool_ud = e;
+            e->qwen4_ctx_used += s->qwen4_graph.ctx_cap;
+            for (uint32_t i = 0; i < 64u; i++) {
+                if (!e->qwen4_pooled[i]) {
+                    e->qwen4_pooled[i] = s;
+                    break;
+                }
+            }
         }
         if (share && !e->qwen4_shared_workspace) {
             e->qwen4_shared_workspace = xcalloc(1, sizeof(*e->qwen4_shared_workspace));
@@ -74401,6 +74629,12 @@ void ds4_session_free(ds4_session *s) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             }
             if (s->qwen4_graph_ready && !s->qwen4_graph.owns_scratch && s->engine) s->engine->qwen4_arena_users--;
+            if (s->qwen4_graph.pool_used && s->engine) {
+                *s->qwen4_graph.pool_used -= s->qwen4_graph.ctx_cap;
+                for (uint32_t i = 0; i < 64u; i++) {
+                    if (s->engine->qwen4_pooled[i] == s) s->engine->qwen4_pooled[i] = NULL;
+                }
+            }
             qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
@@ -75186,13 +75420,13 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         ? 2 : qwen4_spec_depth(s);
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
-        accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u) {
+        accepted_cap >= 3 && pos + 3u <= g->ctx_max && g->cap_tokens >= 3u) {
         (void)qwen4_graph_ensure_snap2(g);
     }
     const bool deep = depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 &&
-        accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u &&
+        accepted_cap >= 3 && pos + 3u <= g->ctx_max && g->cap_tokens >= 3u &&
         g->mtp_R && g->snap2_ple_hist != NULL;
-    if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap ||
+    if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_max ||
         g->cap_tokens < 2u || !g->mtp_R || !qwen4_graph_fused(g, 2u)) {
         s->glm_spec_inside = 1;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
@@ -75205,7 +75439,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             s->glm_mtp_draft = draft;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && pos + 2u <= g->ctx_cap) {
+            if (depth == 3 && pos + 2u <= g->ctx_max) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(&s->qwen4_graph, m, w, draft, pos + 1u, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
@@ -75318,7 +75552,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             s->glm_mtp_draft = draft;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && g->pos + 1u < g->ctx_cap) {
+            if (depth == 3 && g->pos + 1u < g->ctx_max) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(g, m, w, draft, g->pos, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
@@ -75349,7 +75583,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             s->glm_mtp_draft = draft;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && g->pos + 1u < g->ctx_cap) {
+            if (depth == 3 && g->pos + 1u < g->ctx_max) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(g, m, w, draft, g->pos, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
@@ -75388,7 +75622,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             s->glm_mtp_draft = draft;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
-            if (depth == 3 && pos + 2u <= g->ctx_cap) {
+            if (depth == 3 && pos + 2u <= g->ctx_max) {
                 int draft2 = -1;
                 if (qwen4_graph_mtp_chain_step(g, m, w, draft, pos + 1u, &draft2)) {
                     s->glm_mtp_draft2 = draft2;
@@ -76419,7 +76653,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     (uint32_t)(prompt->len - next_i) : s->qwen4_graph.cap_tokens;
             if (!qwen4_graph_forward_tokens(&s->qwen4_graph, &e->model, &e->weights,
                                             prompt->v + i, chunk, s->logits, false)) {
-                snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
+                if (s->qwen4_graph.pool_refused) {
+                    snprintf(err, errlen, "context pool exhausted at token %d: other sessions hold the shared "
+                             "context; retry later or with a shorter prompt", i);
+                } else {
+                    snprintf(err, errlen, "Qwen3.8 prefill failed at token %d", i);
+                }
                 s->checkpoint_valid = false;
                 prefill_rc = 1;
                 break;
@@ -78445,13 +78684,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return 1;
         }
         if (qwen4_session_replay_if_stale(s, err, errlen) != 0) return 1;
-        if (s->qwen4_graph.pos >= s->qwen4_graph.ctx_cap) {
+        if (s->qwen4_graph.pos >= s->qwen4_graph.ctx_max) {
             if (errlen) snprintf(err, errlen, "context is full");
             return 1;
         }
         if (!s->glm_spec_inside) { s->glm_mtp_have = 0; s->glm_mtp_have2 = false; }
         if (!qwen4_graph_forward_token(&s->qwen4_graph, &e->model, &e->weights, token, s->logits)) {
-            if (errlen) snprintf(err, errlen, "Qwen3.8 decode failed");
+            if (errlen) {
+                snprintf(err, errlen, "%s", s->qwen4_graph.pool_refused
+                         ? "context pool exhausted: other sessions hold the shared context" : "Qwen3.8 decode failed");
+            }
             s->checkpoint_valid = false;
             return 1;
         }
@@ -79672,6 +79914,11 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
     qwen4_batch_row *views = xmalloc((size_t)count * sizeof(*views));
     ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
     bool ok = qwen4_batch_rows_build(views, count, g);
+    /* row graphs copy each session's cache pointers: grow before they do */
+    for (int i = 0; ok && i < count; i++) {
+        ds4_qwen4_gpu_graph *sg = &items[i].session->qwen4_graph;
+        ok = qwen4_graph_reserve(sg, sg->pos + 2u < sg->ctx_max ? sg->pos + 2u : sg->ctx_max);
+    }
     for (int i = 0; ok && i < count; i++) {
         qwen4_batch_row_graph(&rowg[i], items[i].session, &views[i]);
     }
@@ -79861,6 +80108,13 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
     ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
     uint32_t *ple_ids = xmalloc((size_t)N * DS4_MAX_PLE_HEADS * sizeof(uint32_t));
     bool ok = qwen4_batch_rows_build_ragged(views, mem, count, g);
+    /* row graphs copy each session's cache pointers: grow before they do, with
+     * a row to spare for the draft pass that follows */
+    for (int i = 0; ok && i < count; i++) {
+        ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
+        const uint32_t need = sg->pos + mem[i].n + 1u;
+        ok = qwen4_graph_reserve(sg, need < sg->ctx_max ? need : sg->ctx_max);
+    }
     for (int i = 0; ok && i < count; i++) qwen4_batch_row_graph(&rowg[i], mem[i].session, &views[i]);
     if (ok) ok = qwen4_batch_scratch_ensure(g, N > 32u ? N : 32u);
     if (ok) ok = qwen4_batch_stage_embeddings_ragged(mem, count, N, m, w, g, ple_ids);
@@ -81059,7 +81313,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             /* The logit rows below replace those paired with older snapshots. */
             g->snap_valid = g->snap2_valid = g->snap0_valid = false;
             if (s->glm_mtp_have && s->glm_mtp_parent == items[i].token &&
-                s->ctx_size - s->checkpoint.len >= 2 && g->pos + 2u <= g->ctx_cap &&
+                s->ctx_size - s->checkpoint.len >= 2 && g->pos + 2u <= g->ctx_max &&
                 g->snap_ple_hist && g->mtp_R) {
                 mem[i].tokens[1] = s->glm_mtp_draft;
                 mem[i].n = 2u;
