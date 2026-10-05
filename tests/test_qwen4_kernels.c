@@ -1160,6 +1160,9 @@ static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
 /* Decode n_pos tokens one at a time through prep / block keys / scoring /
  * expand / attention and compare against a reference that recomputes the
  * selection.  k_blocks is small so the sparse path is exercised early. */
+/* the attention tests run again with the K/V cache as q8_0 */
+static bool g_test_kv_q8 = false;
+
 static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t n_rot,
                            uint32_t Hi, uint32_t Di, uint32_t k_blocks, uint32_t n_pos) {
     /* a ring shorter than the sequence, so positions wrap around it */
@@ -1342,8 +1345,10 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         ds4_gpu_tensor_free(vv); ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vqg);
     }
     char name[96];
-    snprintf(name, sizeof(name), "attention H=%u/%u D=%u k=%u n=%u", H, Hkv, D, k_blocks, n_pos);
-    check_tensor(name, gout, ref_out, (uint64_t)n_pos * H * D, 5e-4);   /* half KV; block order differs */
+    snprintf(name, sizeof(name), "attention H=%u/%u D=%u k=%u n=%u%s", H, Hkv, D, k_blocks, n_pos,
+             g_test_kv_q8 ? " q8 kv" : "");
+    /* half KV and block order differ from the f32 reference; q8_0 rows round to 1/254 of a block's range */
+    check_tensor(name, gout, ref_out, (uint64_t)n_pos * H * D, g_test_kv_q8 ? 2e-2 : 5e-4);
 
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gnsel); ds4_gpu_tensor_free(gselt); ds4_gpu_tensor_free(gselb);
     ds4_gpu_tensor_free(gscore); ds4_gpu_tensor_free(gbk); ds4_gpu_tensor_free(gikc); ds4_gpu_tensor_free(giqo);
@@ -3849,6 +3854,13 @@ int main(void) {
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
     test_attention_rows(&arena);
+    ds4_gpu_qwen4_set_kv_q8(true);
+    g_test_kv_q8 = true;
+    test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
+    test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+    test_attention_rows(&arena);
+    ds4_gpu_qwen4_set_kv_q8(false);
+    g_test_kv_q8 = false;
 #endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);

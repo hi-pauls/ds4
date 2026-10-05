@@ -7114,6 +7114,7 @@ static float g_qwen4_rope_freq[32];
 static float g_qwen4_rope_mscale = 1.0f;
 static uint32_t g_qwen4_native_ctx = 0;
 static bool g_qwen4_rope_yarn = false;
+static bool g_qwen4_kv_q8 = false;
 
 /* Rotary inverse frequencies of the DS4_N_ROT/2 pairs.  DS4_QWEN4_YARN_FACTOR=f
  * (f > 1) applies static YaRN over the native context (HF
@@ -7150,6 +7151,19 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, half, g_qwen4_rope_mscale);
 #endif
+    /* DS4_QWEN4_KV_Q8=1: K/V rows as q8_0, about half the cache of half precision */
+    const char *q8 = getenv("DS4_QWEN4_KV_Q8");
+    g_qwen4_kv_q8 = q8 && q8[0] && strcmp(q8, "0") != 0 && DS4_N_HEAD_DIM % 32u == 0u;
+    if (g_qwen4_kv_q8) fprintf(stderr, "ds4: Qwen3.8 K/V cache as q8_0\n");
+#ifdef DS4_HAS_QWEN4_GPU
+    ds4_gpu_qwen4_set_kv_q8(g_qwen4_kv_q8);
+#endif
+}
+
+/* bytes of one position's K or V row over all kv heads, as the cache stores it */
+static uint64_t qwen4_kv_pos_bytes(void) {
+    const uint64_t D = DS4_N_HEAD_DIM;
+    return (uint64_t)DS4_N_HEAD_KV * (g_qwen4_kv_q8 ? D + D / 16u : D * 2u);
 }
 
 static void config_validate_qwen4_model(const ds4_model *m) {
@@ -40459,7 +40473,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
          * block keys, rope positions; transients scale with the prefill chunk */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
         const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
-        const uint64_t kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        const uint64_t kv_row = 2ull * qwen4_kv_pos_bytes();
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += !ds4_qwen4_layer_is_linear(il);
         m.prefill_cap = (uint32_t)T;
@@ -58940,8 +58954,8 @@ private_state:
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
         } else {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
+            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_pos_bytes());
+            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_pos_bytes());
             g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)(g->ik_ring ? g->ik_ring : ctx_cap) *
                                                           DS4_N_INDEXER_HEAD_DIM);
             g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
@@ -63600,8 +63614,9 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * pooled block keys (attention layers, incl. the MTP block), then the PLE
  * conv history and n-gram context.  The header's raw_live field carries the
  * family tag so a DeepSeek payload is never read as a Qwen one. */
-/* 03: raw indexer keys only for the incomplete last block */
-#define DS4_QWEN4_PAYLOAD_TAG 0x51573803u
+/* 03: raw indexer keys only for the incomplete last block; the q8_0 K/V
+ * cache writes its own tag, so neither format restores into the other */
+#define DS4_QWEN4_PAYLOAD_TAG (g_qwen4_kv_q8 ? 0x51573813u : 0x51573803u)
 
 static uint64_t qwen4_payload_lin_state_bytes(void) {
     return (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM * sizeof(float);
@@ -63611,7 +63626,7 @@ static uint64_t qwen4_payload_lin_hist_bytes(void) {
     return (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
 }
 static uint64_t qwen4_payload_kv_bytes(uint32_t rows) {
-    return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+    return (uint64_t)rows * qwen4_kv_pos_bytes();
 }
 /* Only the raw indexer keys of the incomplete last block are still needed:
  * every complete block lives on as its pooled key. */

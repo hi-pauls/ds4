@@ -1258,7 +1258,42 @@ struct ds4_metal_args_qwen4_attn_prep {
     uint32_t ik_ring;          /* raw indexer keys live at pos % ik_ring (0: at pos) */
     float    rope_mscale;      /* YaRN magnitude scale on cos/sin (1 without) */
     float    rope_freq[32];    /* per-pair inverse frequencies (YaRN-adjusted) */
+    uint32_t kv_q8;            /* K/V rows as q8_0 (see qwen4_kv_row_bytes), else half */
 };
+
+/* q8_0 K/V rows: the D int8 values of a (position, kv head) row, then its
+ * D/32 half scales, so a row is addressed without the cache capacity.  Lanes
+ * own D/32 consecutive values, so a 32-value block spans 32/(D/32) lanes. */
+static inline uint qwen4_kv_row_bytes(uint D, bool q8) {
+    return q8 ? D + D / 16u : D * 2u;
+}
+
+/* Quantizes the lane's npt values of one row into its q8_0 slot. */
+static inline void qwen4_kv_store_q8(device char *row, uint D, uint npt, thread const float *v, ushort tiisg) {
+    float amax = 0.0f;
+    for (uint i = 0; i < npt; i++) amax = max(amax, fabs(v[i]));
+    for (uint o = 1; o < 32u / npt; o <<= 1) amax = max(amax, simd_shuffle_xor(amax, (ushort)o));
+    /* quantize against the scale as stored, so dequantization inverts it */
+    const half dh = (half)(amax / 127.0f);
+    const float id = (float)dh > 0.0f ? 1.0f / (float)dh : 0.0f;
+    device char *q = row + tiisg * npt;
+    for (uint i = 0; i < npt; i++) q[i] = (char)clamp(round(v[i] * id), -127.0f, 127.0f);
+    if ((tiisg * npt) % 32u == 0u) *((device half *)(row + D) + tiisg * npt / 32u) = dh;
+}
+
+/* The lane's npt values of one row, from either cache format. */
+static inline void qwen4_kv_load(device const half *cache, uint64_t row_index, uint D, uint npt, bool q8,
+                                 thread float *v, ushort tiisg) {
+    if (q8) {
+        device const char *row = (device const char *)cache + row_index * qwen4_kv_row_bytes(D, true);
+        const float d = (float)*((device const half *)(row + D) + tiisg * npt / 32u);
+        device const char *q = row + tiisg * npt;
+        for (uint i = 0; i < npt; i++) v[i] = d * (float)q[i];
+    } else {
+        device const half *row = cache + row_index * D + tiisg * npt;
+        for (uint i = 0; i < npt; i++) v[i] = (float)row[i];
+    }
+}
 
 /* Raw indexer keys only feed the pooled key of their own block, built at most
  * one prefill chunk later, so the cache can be a ring of a chunk plus a block. */
@@ -1356,8 +1391,17 @@ static inline void qwen4_attn_prep_slot(
             for (uint i = 0; i < args.n_rot; i++) row[i] = tmp[i];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
-        device half *dk = k_cache + ((uint64_t)pos * Hkv + h) * D;
-        device half *dv = v_cache + ((uint64_t)pos * Hkv + h) * D;
+        const uint64_t ri = (uint64_t)pos * Hkv + h;
+        if (args.kv_q8) {
+            float kq[8], vq[8];
+            for (uint i = 0; i < npt; i++) { kq[i] = row[tiisg * npt + i]; vq[i] = vs[tiisg * npt + i]; }
+            const uint rb = qwen4_kv_row_bytes(D, true);
+            qwen4_kv_store_q8((device char *)k_cache + ri * rb, D, npt, kq, tiisg);
+            qwen4_kv_store_q8((device char *)v_cache + ri * rb, D, npt, vq, tiisg);
+            return;
+        }
+        device half *dk = k_cache + ri * D;
+        device half *dv = v_cache + ri * D;
         for (uint i = 0; i < npt; i++) {
             dk[tiisg * npt + i] = (half)row[tiisg * npt + i];
             dv[tiisg * npt + i] = (half)vs[tiisg * npt + i];
@@ -2105,7 +2149,7 @@ struct ds4_metal_args_qwen4_attn_decode {
     float    scale;
     uint32_t n_splits;    /* key ranges per (token, kv head); > 1 writes partials */
     uint32_t keys_per_split;
-    uint32_t pad0;
+    uint32_t kv_q8;       /* K/V rows as q8_0, see qwen4_kv_row_bytes */
     uint32_t pad1;
 };
 
@@ -2150,11 +2194,9 @@ static inline void qwen4_attn_decode_tile(
     }
     for (uint idx = k0; idx < k1; idx++) {
         const uint p = use_sel ? (uint)sel[idx] : idx;
-        device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
-        device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
         float kv[NPT], vv[NPT];
-#pragma unroll
-        for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+        qwen4_kv_load(k_cache, (uint64_t)p * Hkv + kvh, D, NPT, args.kv_q8 != 0, kv, tiisg);
+        qwen4_kv_load(v_cache, (uint64_t)p * Hkv + kvh, D, NPT, args.kv_q8 != 0, vv, tiisg);
 #pragma unroll
         for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
             if (g < ng) {
@@ -2461,7 +2503,19 @@ kernel void kernel_qwen4_attn_mm(
             kpos[tid] = p > (int)qpos ? -1 : p;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {   /* 16 rows of K and V, 64 bytes per thread each */
+        if (args.kv_q8) {   /* 16 rows of K and V: one 32-value q8_0 block per thread each */
+            const uint key = tid >> 3, seg = tid & 7u;
+            const int p = kpos[key];
+            const uint64_t ri = (uint64_t)max(p, 0) * Hkv + kvh;
+            const uint rb = qwen4_kv_row_bytes(D, true);
+            device const char *kr = (device const char *)k_cache + ri * rb;
+            device const char *vr = (device const char *)v_cache + ri * rb;
+            const float kd = p >= 0 ? (float)((device const half *)(kr + D))[seg] : 0.0f;
+            const float vd = p >= 0 ? (float)((device const half *)(vr + D))[seg] : 0.0f;
+            device const char *kq = kr + seg * 32u, *vq = vr + seg * 32u;
+            threadgroup half *ko = Ks + key * D + seg * 32u, *vo = Vs + key * D + seg * 32u;
+            for (uint i = 0; i < 32; i++) { ko[i] = (half)(kd * (float)kq[i]); vo[i] = (half)(vd * (float)vq[i]); }
+        } else {   /* 16 rows of K and V, 64 bytes per thread each */
             const uint key = tid >> 3, seg = tid & 7u;
             const int p = kpos[key];
             const uint64_t row = ((uint64_t)max(p, 0) * Hkv + kvh) * D;

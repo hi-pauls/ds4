@@ -49995,6 +49995,17 @@ void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale) {
     g_qwen4_rope_set = freq != NULL;
 }
 
+static bool g_qwen4_kv_q8 = false;
+
+void ds4_gpu_qwen4_set_kv_q8(bool on) {
+    g_qwen4_kv_q8 = on;
+}
+
+/* bytes of one (position, kv head) K or V row; q8_0 keeps D int8 and D/32 half scales */
+uint64_t ds4_gpu_qwen4_kv_row_bytes(uint32_t head_dim) {
+    return g_qwen4_kv_q8 ? (uint64_t)head_dim + head_dim / 16u : (uint64_t)head_dim * 2u;
+}
+
 static void qwen4_rope_fill(float *freq, float *mscale, uint32_t n_rot, float base) {
     for (uint32_t i = 0; i < 32u; i++) {
         freq[i] = g_qwen4_rope_set ? g_qwen4_rope_freq[i] :
@@ -50015,14 +50026,14 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         float rope_base, float eps) {
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t ik_ring; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t ik_ring; float rope_mscale; float rope_freq[32]; uint32_t kv_q8;
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap,
-               rope_base, eps, ik_ring, 1.0f, { 0 } };
+               rope_base, eps, ik_ring, 1.0f, { 0 }, g_qwen4_kv_q8 ? 1u : 0u };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_tokens * n_idx_head * idx_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * ds4_gpu_qwen4_kv_row_bytes(head_dim);
     const uint64_t ik_rows = ik_ring ? ik_ring : cache_cap;
     qwen4_bind b[15];
     if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
@@ -50185,11 +50196,11 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     }
     const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
     struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride; float scale;
-             uint32_t n_splits, keys_per_split, pad0, pad1; } args =
+             uint32_t n_splits, keys_per_split, kv_q8, pad1; } args =
         { n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel ? 1u : 0u, sel_stride, scale,
-          n_splits, keys_per_split, 0, 0 };
+          n_splits, keys_per_split, g_qwen4_kv_q8 ? 1u : 0u, 0 };
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * ds4_gpu_qwen4_kv_row_bytes(head_dim);
     const uint64_t part_bytes = (uint64_t)n_tokens * n_head * n_splits * (2u + head_dim) * sizeof(float);
     qwen4_bind b[8];
     if (n_tokens == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 || n_head / n_head_kv > 12 ||
@@ -50323,9 +50334,9 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
      * table entry. */
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t ik_ring; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t ik_ring; float rope_mscale; float rope_freq[32]; uint32_t kv_q8;
     } args = { n_rows, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, 0u, 0u,
-               rope_base, eps, 0u, 1.0f, { 0 } };
+               rope_base, eps, 0u, 1.0f, { 0 }, g_qwen4_kv_q8 ? 1u : 0u };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);
@@ -50441,9 +50452,9 @@ int ds4_gpu_qwen4_attn_decode_rows_tensor(
     /* Each row takes the splits the single-row dispatch gives its key count
      * (see the kernel); the partials use the split cap as their stride. */
     struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, use_sel, sel_stride; float scale;
-             uint32_t n_splits, keys_per_split, pad0, pad1; } args =
+             uint32_t n_splits, keys_per_split, kv_q8, pad1; } args =
         { n_rows, n_head, n_head_kv, head_dim, 0u, 0u, sel_stride, scale,
-          QWEN4_ATTN_MAX_SPLITS, qwen4_attn_split_keys(), 0, 0 };
+          QWEN4_ATTN_MAX_SPLITS, qwen4_attn_split_keys(), g_qwen4_kv_q8 ? 1u : 0u, 0 };
     const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
     const uint64_t part_bytes = ds4_gpu_qwen4_attn_part_floats(n_rows, n_head, head_dim) * sizeof(float);
     qwen4_bind b[7], res[QWEN4_ATTN_ROWS_MAX * 5u];
