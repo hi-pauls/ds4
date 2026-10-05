@@ -50011,22 +50011,24 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
-        uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap,
+        uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap, uint32_t ik_ring,
         float rope_base, float eps) {
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t ik_ring; float rope_mscale; float rope_freq[32];
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, ik_ring, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
     const uint64_t iq_bytes = (uint64_t)n_tokens * n_idx_head * idx_dim * sizeof(float);
     const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    const uint64_t ik_rows = ik_ring ? ik_ring : cache_cap;
     qwen4_bind b[15];
     if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 ||
         idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > 64 || (n_rot % 2) != 0 ||
         n_rot > idx_dim || (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        (ik_ring != 0 && n_tokens + 3u > ik_ring) ||
         !qwen4_bind_tensor(&b[0], qg, 2u * q_bytes, "attn q/gate projection") ||
         !qwen4_bind_tensor(&b[1], kproj, kv_bytes, "attn k projection") ||
         !qwen4_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
@@ -50043,7 +50045,7 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         !qwen4_bind_tensor(&b[10], k_cache, cache_bytes, "k cache") ||
         !qwen4_bind_tensor(&b[11], v_cache, cache_bytes, "v cache") ||
         !qwen4_bind_tensor(&b[12], iq_out, iq_bytes, "indexer q") ||
-        !qwen4_bind_tensor(&b[13], ik_cache, (uint64_t)cache_cap * idx_dim * sizeof(float), "indexer k cache") ||
+        !qwen4_bind_tensor(&b[13], ik_cache, ik_rows * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions")) {
         return 0;
     }
@@ -50054,16 +50056,18 @@ int ds4_gpu_qwen4_attn_prep_tensor(
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
         const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
-        uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot,
+        uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, uint32_t ik_ring,
         float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t ik_ring;
              float rope_mscale; float rope_freq[32]; } args =
-        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { block0, n_blocks, ratio, idx_dim, n_rot, rope_base, eps, ik_ring, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t n_keys = ((uint64_t)block0 + n_blocks) * ratio;
+    const uint64_t ik_rows = ik_ring ? ik_ring : n_keys;
     qwen4_bind b[4];
     if (n_blocks == 0 || ratio == 0 || idx_dim < 32 || idx_dim > 128 || (idx_dim % 32) != 0 || n_rot > idx_dim ||
-        !qwen4_bind_tensor(&b[0], ik_cache, n_keys * idx_dim * sizeof(float), "indexer k cache") ||
+        (ik_ring != 0 && (uint64_t)n_blocks * ratio > ik_ring) ||
+        !qwen4_bind_tensor(&b[0], ik_cache, ik_rows * idx_dim * sizeof(float), "indexer k cache") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, g_ik_offset, (uint64_t)idx_dim * sizeof(float),
                            "indexer k_norm") ||
         !qwen4_bind_tensor(&b[2], pos3, n_keys * 16u, "rope positions") ||
@@ -50253,7 +50257,7 @@ int ds4_gpu_qwen4_attn_decode_tensor(
 
 typedef struct {
     uint64_t k_cache, v_cache, ik_cache, block_key, pos3;
-    uint32_t pos, n_blocks, use_sel, pad0;
+    uint32_t pos, n_blocks, use_sel, ik_ring;
 } qwen4_attn_row_entry;
 
 static uint64_t qwen4_tensor_address(const ds4_gpu_tensor *t) {
@@ -50278,7 +50282,7 @@ int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
         e[i].pos = rows[i].pos;
         e[i].n_blocks = (rows[i].pos + 1u) / ratio;
         e[i].use_sel = rows[i].use_sel ? 1u : 0u;
-        e[i].pad0 = 0u;
+        e[i].ik_ring = rows[i].ik_ring;
     }
     return ds4_gpu_tensor_write(table, entry0 * sizeof(e[0]), e, (uint64_t)n_rows * sizeof(e[0]));
 }
@@ -50315,12 +50319,13 @@ int ds4_gpu_qwen4_attn_prep_rows_tensor(
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
         uint32_t n_idx_head, uint32_t idx_dim, float rope_base, float eps) {
     /* The caller checks each row's position against its own cache; the
-     * kernel does not read cache_cap. */
+     * kernel does not read cache_cap, and takes each row's ik ring from its
+     * table entry. */
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
-        float rope_base, eps; uint32_t pad0; float rope_mscale; float rope_freq[32];
+        float rope_base, eps; uint32_t ik_ring; float rope_mscale; float rope_freq[32];
     } args = { n_rows, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, 0u, 0u,
-               rope_base, eps, 0, 1.0f, { 0 } };
+               rope_base, eps, 0u, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_rows * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_rows * n_head_kv * head_dim * sizeof(float);
@@ -50354,9 +50359,9 @@ int ds4_gpu_qwen4_idx_block_key_rows_tensor(
         const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
         const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
         uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, float rope_base, float eps) {
-    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t pad0;
+    struct { uint32_t block0, n_blocks, ratio, idx_dim, n_rot; float rope_base, eps; uint32_t ik_ring;
              float rope_mscale; float rope_freq[32]; } args =
-        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, 0, 1.0f, { 0 } };
+        { 0u, n_rows, ratio, idx_dim, n_rot, rope_base, eps, 0u, 1.0f, { 0 } };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     qwen4_bind b[2], res[QWEN4_ATTN_ROWS_MAX * 5u];
     if (n_rows == 0 || n_rows > QWEN4_ATTN_ROWS_MAX || ratio == 0 || idx_dim < 32 || idx_dim > 128 ||

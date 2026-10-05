@@ -1162,7 +1162,8 @@ static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
  * selection.  k_blocks is small so the sparse path is exercised early. */
 static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t n_rot,
                            uint32_t Hi, uint32_t Di, uint32_t k_blocks, uint32_t n_pos) {
-    const uint32_t ratio = 4, cap = n_pos + 4, group = H / Hkv;
+    /* a ring shorter than the sequence, so positions wrap around it */
+    const uint32_t ratio = 4, cap = n_pos + 4, group = H / Hkv, ik_ring = 8;
     const double base = 1.0e7, eps = 1e-6;
     const float scale = 1.0f / sqrtf((float)D);
     double *gq_w, *gk_w, *giq_w, *gik_w;
@@ -1308,11 +1309,12 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         ds4_gpu_tensor *vout = ds4_gpu_tensor_view(gout, (uint64_t)pos * H * D * 4, (uint64_t)H * D * 4);
         require_ok(ds4_gpu_qwen4_attn_prep_tensor(gq, ggate, gkc, gvc, giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
                                                   a->base, a->size, gq_off, gk_off, giq_off,
-                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, (float)base, (float)eps), "attn prep");
+                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, ik_ring, (float)base, (float)eps),
+                   "attn prep");
         const uint32_t n_blocks = (pos + 1) / ratio;
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(gbk, gikc, gpos3, a->base, a->size, gik_off, n_blocks - 1, 1,
-                                                          ratio, Di, n_rot, (float)base, (float)eps), "block key");
+                                                          ratio, Di, n_rot, ik_ring, (float)base, (float)eps), "block key");
         }
         const bool sparse = n_blocks > k_blocks;
         if (sparse) {
@@ -1373,7 +1375,7 @@ static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta,
  * list and output.  Rows: dense, dense completing a block, sparse completing
  * a block on the plain selector's width, sparse on the prefiltered width. */
 static void test_attention_rows(arena_t *a) {
-    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
+    const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4, ik_ring = 8;
     const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
     const uint32_t pos_of[4] = { 5, 11, sparse_pos, 140 };
     const double base = 1.0e7, eps = 1e-6;
@@ -1449,10 +1451,10 @@ static void test_attention_rows(arena_t *a) {
         for (int i = 0; i < 14; i++) require_ok(v[i] != NULL, "rows views");
         require_ok(ds4_gpu_qwen4_attn_prep_tensor(v[5], v[6], kc[0][r], vc[0][r], v[7], ikc[0][r], v[0], v[1], v[2], v[3], v[4],
                                                   pos3[r], a->base, a->size, gq_off, gk_off, giq_off, 1, H, Hkv, D, n_rot, Hi, Di,
-                                                  pos, pos + 4, (float)base, (float)eps), "rows: prep");
+                                                  pos, pos + 4, ik_ring, (float)base, (float)eps), "rows: prep");
         if ((pos + 1) % ratio == 0) {
             require_ok(ds4_gpu_qwen4_idx_block_key_tensor(bk[0][r], ikc[0][r], pos3[r], a->base, a->size, gik_off, n_blocks - 1, 1,
-                                                          ratio, Di, n_rot, (float)base, (float)eps), "rows: block key");
+                                                          ratio, Di, n_rot, ik_ring, (float)base, (float)eps), "rows: block key");
         }
         if (sparse) {
             require_ok(ds4_gpu_qwen4_idx_score_tensor(v[9], v[10], v[7], bk[0][r], 1, n_blocks, Hi, Di, pos, ratio), "rows: score");
@@ -1471,6 +1473,7 @@ static void test_attention_rows(arena_t *a) {
     for (uint32_t r = 0; r < R; r++) {
         rows[r].k_cache = kc[1][r]; rows[r].v_cache = vc[1][r]; rows[r].ik_cache = ikc[1][r]; rows[r].block_key = bk[1][r];
         rows[r].pos3 = pos3[r]; rows[r].pos = pos_of[r]; rows[r].use_sel = pos_of[r] >= sparse_pos;
+        rows[r].ik_ring = ik_ring;
     }
     require_ok(table && ds4_gpu_qwen4_attn_rows_stage(table, 0, rows, R, ratio), "rows: stage");
     require_ok(ds4_gpu_qwen4_attn_prep_rows_tensor(q[1], gate[1], iqn[1], gqg, gkp, gvp, giq, gik, table, 0, rows, R,

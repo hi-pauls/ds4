@@ -288,6 +288,7 @@ typedef struct {
     const ds4_gpu_tensor *pos3;
     uint32_t pos;
     int use_sel;
+    uint32_t ik_ring;   /* the session's raw indexer key ring rows, 0 for one row per position */
 } ds4_gpu_qwen4_attn_row;
 #define DS4_GPU_QWEN4_ATTN_ROW_BYTES 64u   /* one staged table entry */
 /* One session of a decode batch for the GDN rows kernels: its state and
@@ -3471,12 +3472,13 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
-        uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap,
+        uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap, uint32_t ik_ring,
         float rope_base, float eps);
+/* ik_ring: the raw indexer key cache holds rows at pos % ik_ring; 0 keeps one row per position. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
         const void *model_map, uint64_t model_size, uint64_t g_ik_offset,
-        uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot,
+        uint32_t block0, uint32_t n_blocks, uint32_t ratio, uint32_t idx_dim, uint32_t n_rot, uint32_t ik_ring,
         float rope_base, float eps);
 int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
