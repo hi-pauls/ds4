@@ -59073,8 +59073,12 @@ static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_
     return ok;
 }
 
-/* Makes room for need rows: doubling up to the session's limit, within what
- * the shared pool has left.  Without a pool the caches are already full size. */
+/* Makes room for need rows: doubling up to 128k rows, then 64k rows at a time,
+ * up to the session's limit, within what the shared pool has left.  Doubling
+ * all the way would jump from 256k straight to a full 512k allocation, and at
+ * the wired limit decode halves (400k context: 25.2 t/s with 448k rows
+ * allocated, 12.4 t/s with 512k).  Without a pool the caches are already full
+ * size. */
 static bool qwen4_graph_reserve(ds4_qwen4_gpu_graph *g, uint32_t need) {
     bool ok = need <= g->ctx_cap;
     if (!ok && need <= g->ctx_max && g->pool_used) {
@@ -59083,7 +59087,8 @@ static bool qwen4_graph_reserve(ds4_qwen4_gpu_graph *g, uint32_t need) {
             g->pool_reclaim(g->pool_ud, need - g->ctx_cap - free_rows, g);
             free_rows = g->pool_limit > *g->pool_used ? g->pool_limit - *g->pool_used : 0u;
         }
-        uint64_t want = (uint64_t)g->ctx_cap * 2u > need ? (uint64_t)g->ctx_cap * 2u : need;
+        const uint64_t step = g->ctx_cap < 131072u ? g->ctx_cap : 65536u;
+        uint64_t want = (uint64_t)g->ctx_cap + step > need ? (uint64_t)g->ctx_cap + step : need;
         want = (want + 1023u) & ~(uint64_t)1023u;
         if (want > g->ctx_max) want = g->ctx_max;
         if (want - g->ctx_cap > free_rows) want = (uint64_t)g->ctx_cap + free_rows;
