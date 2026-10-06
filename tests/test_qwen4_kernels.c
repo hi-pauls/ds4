@@ -3186,8 +3186,17 @@ static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_g
  * faster than linearly past ~130k; this shows which of them is responsible. */
 typedef struct {
     ds4_gpu_tensor *score, *tile_max, *iq, *block_key, *sel;
-    uint32_t n_blocks, pos, T;
+    ds4_gpu_tensor *kc, *vc, *q, *out, *part, *tokens[2], *n_sel;
+    uint32_t n_blocks, pos, T, spread;
 } depth_ctx;
+
+/* sparse attention over the 2048 selected rows (512 blocks of 4) per token */
+static int bench_depth_attn(void *ud) {
+    depth_ctx *c = ud;
+    return ds4_gpu_qwen4_attn_decode_tensor(c->out, c->q, c->q, c->kc, c->vc, c->tokens[c->spread], c->n_sel,
+                                            c->T <= 2 ? c->part : NULL, c->T, 24, 2, 256, c->pos - c->T + 1,
+                                            true, 2052, 0.0625f);
+}
 
 static int bench_depth_score(void *ud) {
     depth_ctx *c = ud;
@@ -3197,7 +3206,8 @@ static int bench_depth_score(void *ud) {
 
 static int bench_depth_select(void *ud) {
     depth_ctx *c = ud;
-    return ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, c->tile_max, c->n_blocks, c->T, 2048);
+    /* the model selects DS4_N_INDEXER_TOP_K / 4 = 512 blocks per token */
+    return ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, c->tile_max, c->n_blocks, c->T, 512);
 }
 
 static int bench_depth_both(void *ud) { return bench_depth_score(ud) && bench_depth_select(ud); }
@@ -3231,6 +3241,42 @@ static void bench_depth(void) {
             snprintf(name, sizeof(name), "score + select T=%u", c.T);
             bench_run(name, bench_depth_both, &c, 50);
         }
+        /* q8 K/V caches of the full depth; rows spread over the whole history
+         * versus only the last 8k tokens separate locality from row count */
+        ds4_gpu_qwen4_set_kv_q8(true);
+        const uint64_t pos_bytes = 2ull * ds4_gpu_qwen4_kv_row_bytes(256);
+        c.kc = ds4_gpu_tensor_alloc((uint64_t)depths[d] * pos_bytes);
+        c.vc = ds4_gpu_tensor_alloc((uint64_t)depths[d] * pos_bytes);
+        c.q = upload(NULL, 3ull * 24 * 256);
+        c.out = upload(NULL, 3ull * 24 * 256);
+        c.part = upload(NULL, ds4_gpu_qwen4_attn_part_floats(2, 24, 256));
+        int32_t *rows = malloc(3ull * 2052 * 4);
+        uint32_t cnt[3] = { 2048, 2048, 2048 };
+        for (uint32_t variant = 0; variant < 2; variant++) {
+            const uint32_t lo = variant ? 0 : c.n_blocks - 2048, span = c.n_blocks - lo;
+            for (uint32_t t = 0; t < 3; t++) {
+                uint32_t b = lo + (uint32_t)(frand() * 0.5f * span) % span;
+                for (uint32_t i = 0; i < 512; i++) {
+                    b = lo + (b - lo + 1 + (uint32_t)((frand() + 1.0f) * 0.5f * (span / 512))) % span;
+                    for (uint32_t r = 0; r < 4; r++) rows[(uint64_t)t * 2052 + i * 4 + r] = (int32_t)(b * 4 + r);
+                }
+            }
+            c.tokens[variant] = ds4_gpu_tensor_alloc(3ull * 2052 * 4);
+            require_ok(c.tokens[variant] && ds4_gpu_tensor_write(c.tokens[variant], 0, rows, 3ull * 2052 * 4),
+                       "depth selected rows");
+        }
+        c.n_sel = ds4_gpu_tensor_alloc(3 * 4);
+        require_ok(c.kc && c.vc && c.n_sel && ds4_gpu_tensor_write(c.n_sel, 0, cnt, sizeof(cnt)), "depth attn caches");
+        free(rows);
+        for (c.spread = 0; c.spread < 2; c.spread++) {
+            for (c.T = 1; c.T <= 3; c.T++) {
+                snprintf(name, sizeof(name), "attn %s T=%u", c.spread ? "spread" : "recent", c.T);
+                bench_run(name, bench_depth_attn, &c, 50);
+            }
+        }
+        ds4_gpu_tensor_free(c.kc); ds4_gpu_tensor_free(c.vc); ds4_gpu_tensor_free(c.q); ds4_gpu_tensor_free(c.out);
+        ds4_gpu_tensor_free(c.part); ds4_gpu_tensor_free(c.tokens[0]); ds4_gpu_tensor_free(c.tokens[1]);
+        ds4_gpu_tensor_free(c.n_sel);
         ds4_gpu_tensor_free(c.block_key); ds4_gpu_tensor_free(c.iq); ds4_gpu_tensor_free(c.score);
         ds4_gpu_tensor_free(c.tile_max); ds4_gpu_tensor_free(c.sel);
     }
