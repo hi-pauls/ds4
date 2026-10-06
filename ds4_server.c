@@ -10189,6 +10189,8 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int think_budget_ratio;
+    int reasoning_cut_keep;
+    int reasoning_cut_threshold;
     int last_prefill_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -11786,7 +11788,7 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
 /* Qwen3.8 span markers: reasoning and tool results are the spans whose
  * content a client drops or prunes while the rest of the history stays. */
 typedef struct {
-    int think_open, think_close, tool_open, tool_close;
+    int think_open, think_close, tool_open, tool_close, im_start, user;
 } qwen_span_ids;
 
 typedef struct {
@@ -11798,19 +11800,24 @@ enum { QWEN_SPAN_NONE, QWEN_SPAN_THINK, QWEN_SPAN_TOOL };
 
 /* the marker tokens, or NULL when one of them is not a single token */
 static const qwen_span_ids *qwen_span_ids_get(ds4_engine *engine) {
-    static qwen_span_ids ids = { -1, -1, -1, -1 };
+    static qwen_span_ids ids = { -1, -1, -1, -1, -1, -1 };
     static bool looked_up = false, valid = false;
     if (!looked_up) {
-        const char *markers[4] = { "<think>", "</think>", "<tool_response>", "</tool_response>" };
-        int *dst[4] = { &ids.think_open, &ids.think_close, &ids.tool_open, &ids.tool_close };
+        const char *markers[5] = { "<think>", "</think>", "<tool_response>", "</tool_response>", "<|im_start|>" };
+        int *dst[5] = { &ids.think_open, &ids.think_close, &ids.tool_open, &ids.tool_close, &ids.im_start };
         valid = true;
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < 5; k++) {
             ds4_tokens t = {0};
             ds4_tokenize_rendered_chat(engine, markers[k], &t);
             *dst[k] = t.len == 1 ? t.v[0] : -1;
             valid = valid && t.len == 1;
             ds4_tokens_free(&t);
         }
+        ds4_tokens t = {0};
+        ds4_tokenize_rendered_chat(engine, "<|im_start|>user", &t);
+        ids.user = t.len == 2 && t.v[0] == ids.im_start ? t.v[1] : -1;
+        valid = valid && ids.user >= 0;
+        ds4_tokens_free(&t);
         looked_up = true;
     }
     return valid ? &ids : NULL;
@@ -12272,6 +12279,69 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
     if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
     if (common != prompt_len) return -1;
     return prompt_len - 1;
+}
+
+/* Under context pressure, cuts the reasoning of user turns older than the last
+ * keep ones out of the live Qwen3.8 session.  The client stopped sending that
+ * reasoning long ago and the server only kept it for exact reuse, but it is
+ * also a second copy of details the visible answers left out, hence the kept
+ * turns, the threshold, and the option being off by default.  Tool results
+ * render as user messages and do not count as turns.  Rebuilds the prompt to
+ * sync from the cut session and the prompt's tail; returns the tokens kept, 0
+ * when nothing was cut.  Caller holds inference_mu. */
+static int qwen_reasoning_cut(server *s, server_slot *slot, const ds4_tokens *prompt, ds4_tokens *out) {
+    const qwen_span_ids *ids = qwen_span_ids_get(s->engine);
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    int kept = 0;
+    if (ids && live && prompt->len > live->len &&
+        (int64_t)live->len * 100 > (int64_t)ds4_session_ctx(slot->session) * s->reasoning_cut_threshold) {
+        int turns = 0, boundary = 0;
+        for (int i = live->len - 2; i >= 0 && turns < s->reasoning_cut_keep; i--) {
+            const bool tool = (i + 2 < live->len && live->v[i + 2] == ids->tool_open) ||
+                              (i + 3 < live->len && live->v[i + 3] == ids->tool_open);
+            if (live->v[i] == ids->im_start && live->v[i + 1] == ids->user && !tool) {
+                turns++;
+                boundary = i;
+            }
+        }
+        qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
+        int n = 0, cut_tokens = 0;
+        for (int i = 0; turns == s->reasoning_cut_keep && i < boundary && n < QWEN_SPAN_MAX_CUTS; i++) {
+            if (live->v[i] == ids->think_open) {
+                const int close = qwen_span_find(live, i, ids->think_close);
+                if (close > i && close < boundary) {
+                    const int start = (i + 3) / 4 * 4, end = (close + 1) / 4 * 4;
+                    if (end > start) cuts[n++] = (qwen_span_cut){ start, end };
+                    i = close;
+                }
+            }
+        }
+        if (n > 0) {
+            ds4_tokens tail = {0};
+            for (int k = live->len; k < prompt->len; k++) ds4_tokens_push(&tail, prompt->v[k]);
+            char err[160] = {0};
+            bool ok = true;
+            for (int k = n - 1; ok && k >= 0; k--) {
+                ok = ds4_session_qwen4_cut(slot->session, cuts[k].start, cuts[k].end, err, sizeof(err)) == 0;
+                cut_tokens += cuts[k].end - cuts[k].start;
+            }
+            if (ok) {
+                live = ds4_session_tokens(slot->session);
+                ds4_tokens_free(out);
+                ds4_tokens_copy(out, live);
+                for (int k = 0; k < tail.len; k++) ds4_tokens_push(out, tail.v[k]);
+                kept = live->len;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: reasoning cut %d tokens in %d blocks, kept %d, last %d turns untouched",
+                           cut_tokens, n, kept, s->reasoning_cut_keep);
+            } else {
+                server_log(DS4_LOG_WARNING, "ds4-server: reasoning cut failed: %s", err);
+                ds4_session_invalidate(slot->session);
+            }
+            ds4_tokens_free(&tail);
+        }
+    }
+    return kept;
 }
 
 /* Reuses the live Qwen3.8 session for a prompt that differs from it only in
@@ -14279,6 +14349,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    if (s->reasoning_cut_keep > 0 && cached > 0 && cached == ds4_session_pos(slot->session) &&
+        ds4_engine_is_qwen4(s->engine) && !multimodal && s->cache_mode == DS4_CACHE_PREFIX)
+    {
+        pthread_mutex_lock(&s->inference_mu);
+        const int kept = qwen_reasoning_cut(s, slot, prompt_for_sync, &effective_prompt);
+        if (kept > 0) {
+            cached = kept;
+            prompt_for_sync = &effective_prompt;
+        } else if (!ds4_session_checkpoint_valid(slot->session)) {
+            cached = 0;
+            prompt_for_sync = &j->req.prompt;
+        }
+        pthread_mutex_unlock(&s->inference_mu);
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
@@ -16253,6 +16337,8 @@ typedef struct {
     int batched_sessions;
     int mixed_prefill_quantum;
     int think_budget_ratio;
+    int reasoning_cut_keep;
+    int reasoning_cut_threshold;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -16407,6 +16493,7 @@ static server_config parse_options(int argc, char **argv) {
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
         .think_budget_ratio = 5,
+        .reasoning_cut_threshold = 50,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -16506,6 +16593,10 @@ static server_config parse_options(int argc, char **argv) {
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think-budget-ratio")) {
             c.think_budget_ratio = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--reasoning-cut")) {
+            c.reasoning_cut_keep = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--reasoning-cut-threshold")) {
+            c.reasoning_cut_threshold = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -16802,6 +16893,8 @@ int main(int argc, char **argv) {
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.think_budget_ratio = cfg.think_budget_ratio;
+    s.reasoning_cut_keep = cfg.reasoning_cut_keep;
+    s.reasoning_cut_threshold = cfg.reasoning_cut_threshold;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
@@ -22128,7 +22221,7 @@ static void test_json_escape_replaces_invalid_utf8(void) {
 
 static void test_qwen_span_match(void) {
     /* markers 900-903; other ids are text */
-    const qwen_span_ids ids = { 900, 901, 902, 903 };
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905 };
     qwen_span_cut cuts[4];
     int n = 0, tail = 0;
     /* live: sys, reasoning, tool result of 12, answer; the prompt drops the
