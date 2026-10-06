@@ -5779,32 +5779,22 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
-static void json_escape(buf *b, const char *s) {
-    buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
-    buf_putc(b, '"');
-}
-
-static void json_escape_n(buf *b, const char *s, size_t n) {
-    char *tmp = xstrndup(s ? s : "", n);
-    json_escape(b, tmp);
-    free(tmp);
+/* Length of the well-formed UTF-8 sequence at s, or 0.  Degenerate sampling
+ * can emit byte tokens that do not form characters, and a raw invalid byte
+ * makes the whole JSON response unparseable for strict clients. */
+static size_t json_utf8_len(const unsigned char *s, size_t n) {
+    size_t len = 0;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (s[0] >= 0xC2 && s[0] <= 0xDF) len = 2;
+    else if (s[0] >= 0xE0 && s[0] <= 0xEF) len = 3;
+    else if (s[0] >= 0xF0 && s[0] <= 0xF4) len = 4;
+    if (s[0] == 0xE0) lo = 0xA0;
+    else if (s[0] == 0xED) hi = 0x9F;
+    else if (s[0] == 0xF0) lo = 0x90;
+    else if (s[0] == 0xF4) hi = 0x8F;
+    bool ok = len > 0 && len <= n && s[1] >= lo && s[1] <= hi;
+    for (size_t k = 2; ok && k < len; k++) ok = s[k] >= 0x80 && s[k] <= 0xBF;
+    return ok ? len : 0;
 }
 
 static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
@@ -5821,10 +5811,30 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
             buf_puts(b, "\\t");
         } else if (c < 0x20) {
             buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
+        } else if (c < 0x80) {
             buf_putc(b, (char)c);
+        } else {
+            const size_t len = json_utf8_len((const unsigned char *)s + i, n - i);
+            if (len) {
+                buf_append(b, s + i, len);
+                i += len - 1;
+            } else {
+                buf_puts(b, "\\ufffd");
+            }
         }
     }
+}
+
+static void json_escape(buf *b, const char *s) {
+    buf_putc(b, '"');
+    json_escape_fragment_n(b, s, strlen(s));
+    buf_putc(b, '"');
+}
+
+static void json_escape_n(buf *b, const char *s, size_t n) {
+    char *tmp = xstrndup(s ? s : "", n);
+    json_escape(b, tmp);
+    free(tmp);
 }
 
 #define DS4_DSML "｜DSML｜"
@@ -22105,6 +22115,17 @@ static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
 }
 
+static void test_json_escape_replaces_invalid_utf8(void) {
+    buf b = {0};
+    /* emoji and e-acute stay; a lone continuation byte, a lead byte without
+     * its continuation and a surrogate encoding each become U+FFFD */
+    const char s[] = { 'a', (char)0xf0, (char)0x9f, (char)0x9a, (char)0xa9, (char)0xc3, (char)0xa9,
+                       (char)0x80, (char)0xc3, 'b', (char)0xed, (char)0xa0, (char)0x80, 0 };
+    json_escape(&b, s);
+    TEST_ASSERT(b.ptr && !strcmp(b.ptr, "\"a\xf0\x9f\x9a\xa9\xc3\xa9\\ufffd\\ufffdb\\ufffd\\ufffd\\ufffd\""));
+    buf_free(&b);
+}
+
 static void test_qwen_span_match(void) {
     /* markers 900-903; other ids are text */
     const qwen_span_ids ids = { 900, 901, 902, 903 };
@@ -24064,6 +24085,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
     test_qwen_span_match();
+    test_json_escape_replaces_invalid_utf8();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
