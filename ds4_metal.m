@@ -11680,6 +11680,15 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     }
 }
 
+/* GPU duty cycle for engines without their own power throttle (Qwen3.8):
+ * after each command batch completes, idle for (100 - p) / p of its wall
+ * time, so a charger smaller than the full-load draw can keep up. */
+static uint32_t g_batch_power_percent = 100;
+
+void ds4_gpu_set_batch_power(uint32_t power_percent) {
+    g_batch_power_percent = power_percent > 0 && power_percent < 100 ? power_percent : 100;
+}
+
 int ds4_gpu_end_commands(void) {
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
@@ -11688,11 +11697,18 @@ int ds4_gpu_end_commands(void) {
     ds4_gpu_parallel_ffn_reset_state(YES);
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
+    const double created_ms = g_batch_cb_created_ms;
     g_batch_cb = nil;
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    const int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    if (g_batch_power_percent < 100) {
+        const double work_ms = ds4_gpu_now_ms() - created_ms;
+        const double idle_ms = work_ms * (100.0 - g_batch_power_percent) / g_batch_power_percent;
+        if (idle_ms > 0.0) usleep((useconds_t)(idle_ms * 1000.0));
+    }
+    return ok;
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(

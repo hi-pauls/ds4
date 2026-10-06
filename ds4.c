@@ -71740,15 +71740,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            e->ssd_streaming || opt->dspark ||
+            (e->power_percent != 100 && e->backend != DS4_BACKEND_METAL) ||
             (opt->mtp_path && opt->mtp_path[0])) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
                             "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
-                            "external MTP models and power throttling are not supported\n");
+                            "external MTP models and power throttling off Metal are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Qwen3.8 has no per-layer throttle of its own; --power becomes a duty
+         * cycle on every Metal command batch */
+        if (e->backend == DS4_BACKEND_METAL) ds4_gpu_set_batch_power((uint32_t)e->power_percent);
+#endif
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
