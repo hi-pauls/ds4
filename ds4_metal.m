@@ -50094,6 +50094,17 @@ static bool qwen4_idx_vec_default(void) {
     return ds4_gpu_device_is_m5_apple_silicon() || ds4_gpu_device_name_contains("M1 Max");
 }
 
+/* The simdgroup-matrix scorer serves prefill and 3-row verify; from 16384
+ * blocks (64k tokens) it also beats the vector scorer for 1-2 decode rows on
+ * M1 Max: 2.46 -> 1.02 ms per layer for 2 rows at 512k, decode at 130k
+ * 25.4 -> 27.6 t/s; below that the two are close.  It writes no tile maxima,
+ * so the selector must not prefilter after it.
+ * DS4_QWEN4_IDX_SCORE_MM_DECODE forces it on or off. */
+static bool qwen4_idx_score_mm_decode(uint32_t n_blocks) {
+    const int force = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_MM_DECODE");
+    return force >= 0 ? force != 0 : n_blocks >= 16384u && qwen4_idx_vec_default();
+}
+
 int ds4_gpu_qwen4_idx_score_tensor(
         ds4_gpu_tensor *score, ds4_gpu_tensor *tile_max, const ds4_gpu_tensor *iq, const ds4_gpu_tensor *block_key,
         uint32_t n_tokens, uint32_t n_blocks, uint32_t n_idx_head, uint32_t idx_dim,
@@ -50107,7 +50118,7 @@ int ds4_gpu_qwen4_idx_score_tensor(
         !qwen4_bind_tensor(&b[2], score, (uint64_t)n_tokens * n_blocks * sizeof(float), "indexer scores")) {
         return 0;
     }
-    if (n_tokens > 2u && n_idx_head == 4u && idx_dim == 128u) {
+    if ((n_tokens > 2u || qwen4_idx_score_mm_decode(n_blocks)) && n_idx_head == 4u && idx_dim == 128u) {
         return qwen4_dispatch(QWEN4_K_IDX_SCORE_MM, &args, sizeof(args), b, 3,
                               MTLSizeMake((n_blocks + 63) / 64, (n_tokens + 15) / 16, 1), MTLSizeMake(128, 1, 1), 0);
     }
@@ -50146,6 +50157,7 @@ int ds4_gpu_qwen4_idx_select_tensor(
     const int vec_override = ds4_gpu_env_bool("DS4_QWEN4_IDX_SCORE_VEC");
     const bool vec = vec_override >= 0 ? vec_override != 0 : qwen4_idx_vec_default();
     const bool pre = tile_max && vec && n_tokens <= 2u && n_blocks > 8u * top_k &&
+        !qwen4_idx_score_mm_decode(n_blocks) &&
         (pre_override >= 0 ? pre_override != 0 : qwen4_idx_vec_default());
     if (pre) {
         if (!qwen4_bind_tensor(&b[1], tile_max, (uint64_t)n_tokens * ((n_blocks + 7u) / 8u) * sizeof(uint32_t),

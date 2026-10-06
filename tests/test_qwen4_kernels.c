@@ -3181,6 +3181,61 @@ static int bench_p_moe_mm_q4k_lo(void *ud) { static ds4_gpu_tensor *st[6]; stati
 static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 2, 16, 48, 128, NULL, 0u, NULL, 0u); }
 
+/* QWEN4_BENCH_DEPTH=1: the decode kernels whose work grows with context, per
+ * layer and token, at depths up to the 512k deployment.  Decode slows down
+ * faster than linearly past ~130k; this shows which of them is responsible. */
+typedef struct {
+    ds4_gpu_tensor *score, *tile_max, *iq, *block_key, *sel;
+    uint32_t n_blocks, pos, T;
+} depth_ctx;
+
+static int bench_depth_score(void *ud) {
+    depth_ctx *c = ud;
+    return ds4_gpu_qwen4_idx_score_tensor(c->score, c->tile_max, c->iq, c->block_key, c->T, c->n_blocks, 4, 128,
+                                          c->pos, 4);
+}
+
+static int bench_depth_select(void *ud) {
+    depth_ctx *c = ud;
+    return ds4_gpu_qwen4_idx_select_tensor(c->sel, c->score, c->tile_max, c->n_blocks, c->T, 2048);
+}
+
+static int bench_depth_both(void *ud) { return bench_depth_score(ud) && bench_depth_select(ud); }
+
+static void bench_depth(void) {
+    const uint32_t depths[] = { 32768, 65536, 98304, 131072, 262144, 393216, 524288 };
+    printf("indexer per layer and token (13 layers per decode step)\n");
+    for (uint32_t d = 0; d < sizeof(depths) / sizeof(depths[0]); d++) {
+        depth_ctx c = { .n_blocks = depths[d] / 4, .pos = depths[d] - 1 };
+        const uint64_t keys = (uint64_t)c.n_blocks * 128;
+        _Float16 *k = malloc(keys * 2);
+        for (uint64_t i = 0; i < keys; i++) k[i] = (_Float16)(frand() - 0.5f);
+        c.block_key = ds4_gpu_tensor_alloc(keys * 2);
+        require_ok(c.block_key && ds4_gpu_tensor_write(c.block_key, 0, k, keys * 2), "depth block keys");
+        free(k);
+        float *q = malloc(3 * 512 * 4);
+        for (int i = 0; i < 3 * 512; i++) q[i] = frand() - 0.5f;
+        c.iq = upload(q, 3 * 512);
+        free(q);
+        c.score = upload(NULL, 3ull * c.n_blocks);
+        c.tile_max = ds4_gpu_tensor_alloc(3ull * ((c.n_blocks + 7) / 8) * 4);
+        c.sel = ds4_gpu_tensor_alloc(3 * 2048 * 4);
+        char name[64];
+        printf(" depth %u (%u blocks)\n", depths[d], c.n_blocks);
+        /* MTP verifies up to three rows per step; each row selects its own blocks */
+        for (c.T = 1; c.T <= 3; c.T++) {
+            snprintf(name, sizeof(name), "score T=%u", c.T);
+            bench_run(name, bench_depth_score, &c, 50);
+            snprintf(name, sizeof(name), "select T=%u", c.T);
+            bench_run(name, bench_depth_select, &c, 50);
+            snprintf(name, sizeof(name), "score + select T=%u", c.T);
+            bench_run(name, bench_depth_both, &c, 50);
+        }
+        ds4_gpu_tensor_free(c.block_key); ds4_gpu_tensor_free(c.iq); ds4_gpu_tensor_free(c.score);
+        ds4_gpu_tensor_free(c.tile_max); ds4_gpu_tensor_free(c.sel);
+    }
+}
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -3793,6 +3848,10 @@ int main(void) {
     }
     if (getenv("QWEN4_BENCH")) {
         bench_dispatch(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_BENCH_DEPTH")) {
+        bench_depth();
         return 0;
     }
     if (getenv("QWEN4_BENCH_IQ2")) {
