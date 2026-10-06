@@ -14652,6 +14652,12 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    /* A stop token inside open reasoning ends the turn with no answer.  It is
+     * usually the model quoting the template's end tag, so the tag is fed as
+     * plain text and the reasoning goes on; a stop right after that is meant,
+     * and closes the reasoning instead so the answer still follows. */
+    ds4_tokens literal = {0};
+    int literal_at = 0, literal_subs = 0, literal_end = -1;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -14690,11 +14696,32 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
-        int token = j->req.ignore_eos ?
+        int token = literal_at < literal.len ? literal.v[literal_at++] :
+            j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
                                             j->req.think_mode) :
             ds4_session_sample(slot->session, temperature, top_k,
                                top_p, min_p, &rng);
+        if (token >= 0 && thinking.inside && !j->req.ignore_eos && ds4_token_is_stop(s->engine, token)) {
+            const int stop = token;
+            token = ds4_token_think_end(s->engine);
+            if (literal_subs < 8 && completion != literal_end) {
+                size_t len = 0;
+                char *text = ds4_token_text(s->engine, stop, &len);
+                char *tag = text ? strndup(text, len) : NULL;
+                literal.len = 0;
+                literal_at = 0;
+                if (tag) ds4_tokenize_text(s->engine, tag, &literal);
+                free(tag);
+                free(text);
+                literal_subs++;
+                if (literal.len > 0) {
+                    token = literal.v[literal_at++];
+                    literal_end = completion + literal.len;
+                }
+            }
+            if (token < 0) token = stop;
+        }
         if (token < 0) {
             finish = "error";
             snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -14712,7 +14739,8 @@ decode_again:
         int toks[17];
         int ntok = 0;
         const int block_start = ds4_session_pos(slot->session);
-        if (!s->batched_mode &&
+        const bool literal_pending = literal_at < literal.len;
+        if (!s->batched_mode && !literal_pending &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -14733,7 +14761,7 @@ decode_again:
                 finish = "error";
                 break;
             }
-        } else if (s->batched_mode && s->qwen4_batch_mtp &&
+        } else if (s->batched_mode && s->qwen4_batch_mtp && !literal_pending &&
                    max_tokens - completion >= 2 && !j->req.ignore_eos &&
                    (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                    getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -14765,6 +14793,11 @@ decode_again:
                 break;
             }
             token = toks[ti];
+            /* a drafted stop inside reasoning goes back to the sampler above */
+            if (ti > 0 && thinking.inside && ds4_token_is_stop(s->engine, token)) {
+                resample = true;
+                break;
+            }
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
@@ -14991,6 +15024,7 @@ decode_again:
         }
         if (stop_decode) break;
     }
+    ds4_tokens_free(&literal);
     server_generation_leave(s);
 
     if (job_cancelled(j)) {

@@ -44753,6 +44753,10 @@ int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
 }
 
+int ds4_token_think_end(ds4_engine *e) {
+    return e ? e->vocab.think_end_id : -1;
+}
+
 bool ds4_token_is_stop(ds4_engine *e, int token) {
     return e ? vocab_token_is_generation_stop(&e->vocab, token) : false;
 }
@@ -77926,6 +77930,7 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
+
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;

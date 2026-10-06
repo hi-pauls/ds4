@@ -388,6 +388,7 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
+int ds4_token_think_end(ds4_engine *e);
 bool ds4_token_is_stop(ds4_engine *e, int token);
 bool ds4_token_is_thinking_control(ds4_engine *e, int token);
 bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
