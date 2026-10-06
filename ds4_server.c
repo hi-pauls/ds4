@@ -10178,6 +10178,7 @@ struct server {
     int decode_pending;
     int active_generations;
     int mixed_prefill_quantum;
+    int think_budget_ratio;
     int last_prefill_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -14658,6 +14659,13 @@ decode_again:
      * and closes the reasoning instead so the answer still follows. */
     ds4_tokens literal = {0};
     int literal_at = 0, literal_subs = 0, literal_end = -1;
+    /* Reasoning gets its share of the output budget, then closes with Qwen's
+     * budget-forcing line, so a long think still leaves room for the answer
+     * instead of being cut off at the limit with nothing to show. */
+    const int reasoning_budget = s->think_budget_ratio > 0 && ds4_think_mode_enabled(j->req.think_mode) ?
+        (int)((int64_t)max_tokens * s->think_budget_ratio / (s->think_budget_ratio + 1)) : 0;
+    int reasoning_tokens = 0;
+    bool reasoning_closed = false;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -14696,6 +14704,15 @@ decode_again:
             temperature = 0.0f;
         }
         const int eos_token = ds4_token_eos(s->engine);
+        if (thinking.inside && !reasoning_closed && reasoning_budget > 0 &&
+            reasoning_tokens >= reasoning_budget && literal_at >= literal.len) {
+            literal.len = 0;
+            literal_at = 0;
+            ds4_tokenize_rendered_chat(s->engine, "\n\nConsidering the limited time by the user, I have to give "
+                                       "the solution based on the thinking directly now.\n</think>\n\n", &literal);
+            reasoning_closed = true;
+            server_log(DS4_LOG_DEFAULT, "ds4-server: reasoning budget of %d tokens reached, closing", reasoning_budget);
+        }
         int token = literal_at < literal.len ? literal.v[literal_at++] :
             j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
@@ -14816,6 +14833,7 @@ decode_again:
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             const bool was_thinking = thinking.inside;
+            if (was_thinking) reasoning_tokens++;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
@@ -16224,6 +16242,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
+    int think_budget_ratio;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -16377,6 +16396,7 @@ static server_config parse_options(int argc, char **argv) {
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
         .mixed_prefill_quantum = 128,
+        .think_budget_ratio = 5,
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -16474,6 +16494,8 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--think-budget-ratio")) {
+            c.think_budget_ratio = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -16769,6 +16791,7 @@ int main(int argc, char **argv) {
     s.qwen4_batch_mtp = cfg.engine.backend == DS4_BACKEND_METAL &&
                        ds4_engine_is_qwen4(engine) && ds4_engine_mtp_draft_tokens(engine) > 1;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    s.think_budget_ratio = cfg.think_budget_ratio;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;

@@ -351,6 +351,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--ctx-pool N", "Qwen3.8: context tokens all sessions share; each grows up to --ctx as needed.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
+    opt(fp, c, "--think-budget-ratio N", "Reasoning gets N/(N+1) of the output budget, then closes so the answer fits. Default: 5; 0 disables");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
