@@ -2807,6 +2807,16 @@ constant uint qwen4_mv_type [[function_constant(901)]];
 constant uint qwen4_mv_shared_type [[function_constant(902)]];
 constant uint qwen4_mv_dim [[function_constant(903)]];
 constant uint qwen4_mv_rows [[function_constant(904)]];
+/* Streamed experts: the expert binding is a per-expert table of GPU
+ * addresses (the SSD expert cache's), not the expert tensor itself. */
+constant bool qwen4_moe_addr [[function_constant(906)]];
+
+static inline device const char *qwen4_expert_rows(device const char *base, uint expert, uint64_t expert_bytes) {
+    if (is_function_constant_defined(qwen4_moe_addr) && qwen4_moe_addr) {
+        return reinterpret_cast<device const char *>(((device const ulong *)base)[expert]);
+    }
+    return base + (uint64_t)expert * expert_bytes;
+}
 
 /* mid[t][s][r] = silu(gate_row . x) * (up_row . x) for the selected expert;
  * slot n_slots (when has_shared) is the shared expert from its own bases. */
@@ -2835,12 +2845,12 @@ kernel void kernel_qwen4_moe_mid(
     const bool shared = slot == args.n_slots;
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
-    device const char *gb = shared ? sh_gate : gate_base;
-    device const char *ub = shared ? sh_up : up_base;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    const uint expert = shared ? 0u : (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    device const char *gb = shared ? sh_gate : qwen4_expert_rows(gate_base, expert, args.expert_bytes);
+    device const char *ub = shared ? sh_up : qwen4_expert_rows(up_base, expert, args.expert_bytes);
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-        const uint64_t off = ebase + (uint64_t)r * row_bytes;
+        const uint64_t off = (uint64_t)r * row_bytes;
         const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
         const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
         if (tiisg == 0) {
@@ -2890,7 +2900,8 @@ kernel void kernel_qwen4_moe_mid_q4k(
         }
         return;
     }
-    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    device const char *gate_rows = qwen4_expert_rows(gate_base, (uint)expert, args.expert_bytes);
+    device const char *up_rows = qwen4_expert_rows(up_base, (uint)expert, args.expert_bytes);
     const uint nb = args.in_dim / 256;
     const uint group = tiisg / 4, l = (tiisg % 4) * 8;
     const uint shift = (group & 1u) * 4u;
@@ -2900,9 +2911,9 @@ kernel void kernel_qwen4_moe_mid_q4k(
         float y[8];
         for (uint i = 0; i < 8; i++) y[i] = yp[i];
         for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
-            const uint64_t off = ebase + (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
-            device const uchar *bg = (device const uchar *)(gate_base + off);
-            device const uchar *bu = (device const uchar *)(up_base + off);
+            const uint64_t off = (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
+            device const uchar *bg = (device const uchar *)(gate_rows + off);
+            device const uchar *bu = (device const uchar *)(up_rows + off);
             const float dg = (float)(*(device const half *)bg);
             const float dmg = (float)(*(device const half *)(bg + 2));
             const float du = (float)(*(device const half *)bu);
@@ -2991,9 +3002,11 @@ kernel void kernel_qwen4_moe_mid_iq2xxs(
         }
         return;
     }
-    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes + (uint64_t)row0 * args.row_bytes;
-    device const uchar *gate_rows = (device const uchar *)(gate_base + ebase);
-    device const uchar *up_rows = (device const uchar *)(up_base + ebase);
+    const uint64_t rbase = (uint64_t)row0 * args.row_bytes;
+    device const uchar *gate_rows =
+        (device const uchar *)(qwen4_expert_rows(gate_base, (uint)expert, args.expert_bytes) + rbase);
+    device const uchar *up_rows =
+        (device const uchar *)(qwen4_expert_rows(up_base, (uint)expert, args.expert_bytes) + rbase);
     const uint nb = args.in_dim / 256;
     const uint ib32 = tiisg / 4, j = tiisg % 4;
     float sumg[NR], sumu[NR];
@@ -3217,12 +3230,12 @@ kernel void kernel_qwen4_moe_down(
     const bool shared = slot == args.n_slots;
     const uint type = shared ? st : wt;
     const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
-    device const char *db = shared ? sh_down : down_base;
+    const uint expert = shared ? 0u : (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    device const char *db = shared ? sh_down : qwen4_expert_rows(down_base, expert, args.expert_bytes);
     const uint64_t pair = (uint64_t)tok * n_out + slot;
-    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-        const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, dim, tiisg);
+        const float v = qwen4_row_dot(db + (uint64_t)r * row_bytes, m, type, dim, tiisg);
         if (tiisg == 0) part[pair * args.out_rows + r] = v;
     }
 }
@@ -3258,9 +3271,9 @@ kernel void kernel_qwen4_moe_down_q2k(
         }
         return;
     }
-    const uint64_t ebase = (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes +
-                           (uint64_t)row0 * args.row_bytes;
-    device const uchar *rows = (device const uchar *)(down_base + ebase);
+    const uint expert = (uint)selected[(uint64_t)tok * args.n_slots + slot];
+    device const uchar *rows = (device const uchar *)(qwen4_expert_rows(down_base, expert, args.expert_bytes) +
+                                                      (uint64_t)row0 * args.row_bytes);
     const uint in_dim = args.in_dim;
     const uint nb = (in_dim + 255u) / 256u;
     const uint group = tiisg / 2, l = (tiisg % 2) * 8;

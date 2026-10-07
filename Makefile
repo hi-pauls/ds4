@@ -779,6 +779,24 @@ ifeq ($(UNAME_S),Darwin)
 	tests/test_kolibri1_session "$(KOLIBRI1_MINI_GGUF)"
 endif
 
+# SSD streaming must reproduce the resident logits exactly; a four-expert cache
+# forces evictions on every token.
+KOLIBRI1_MINI_Q8_GGUF ?= gguf/Kolibri-1-mini-q8.gguf
+KOLIBRI1_STREAM_PROMPT ?= Erzähl mir etwas über Hamburg.
+
+.PHONY: test-kolibri1-streaming
+test-kolibri1-streaming: ds4
+	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
+		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
+	python3 tests/make_kolibri1_mini.py --tokenizer "$(KOLIBRI1_TOKENIZER_DIR)" \
+		--expert-type q8_0 --out "$(KOLIBRI1_MINI_Q8_GGUF)"
+	./ds4 -m "$(KOLIBRI1_MINI_Q8_GGUF)" --temp 0 -n 24 \
+		--dump-logprobs "$(KOLIBRI1_MINI_Q8_GGUF).resident.json" -p "$(KOLIBRI1_STREAM_PROMPT)" > /dev/null
+	./ds4 -m "$(KOLIBRI1_MINI_Q8_GGUF)" --ssd-streaming --ssd-streaming-cache-experts 4 --temp 0 -n 24 \
+		--dump-logprobs "$(KOLIBRI1_MINI_Q8_GGUF).stream.json" -p "$(KOLIBRI1_STREAM_PROMPT)" > /dev/null
+	cmp "$(KOLIBRI1_MINI_Q8_GGUF).resident.json" "$(KOLIBRI1_MINI_Q8_GGUF).stream.json"
+	@echo "kolibri1 SSD streaming matches resident"
+
 .PHONY: test-kolibri1-torch
 test-kolibri1-torch: ds4
 	python3 tests/test_kolibri1_torch.py --gguf "$(KOLIBRI1_MINI_GGUF)"

@@ -8563,6 +8563,8 @@ static void model_map_span_vec_include_layer(ds4_model_map_span_vec *spans, cons
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_norm);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_down);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_up);
+    DS4_INCLUDE_TENSOR(l->post_attn_norm);
+    DS4_INCLUDE_TENSOR(l->post_ffn_norm);
 #undef DS4_INCLUDE_TENSOR
 }
 
@@ -8668,6 +8670,8 @@ static void model_map_span_vec_include_layer_decode_static(ds4_model_map_span_ve
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_norm);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_down);
     DS4_INCLUDE_TENSOR(l->nextn_hc_head_up);
+    DS4_INCLUDE_TENSOR(l->post_attn_norm);
+    DS4_INCLUDE_TENSOR(l->post_ffn_norm);
 #undef DS4_INCLUDE_TENSOR
 }
 
@@ -61274,13 +61278,33 @@ static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model 
  * expert matvecs, the shared expert as an extra slot, and the weighted sum
  * (shared unweighted, matching the CPU reference exactly). */
 static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
-                               const ds4_layer_weights *l, uint32_t T) {
+                               const ds4_layer_weights *l, uint32_t il, uint32_t T) {
     const uint32_t slots = DS4_N_EXPERT_USED;
     bool ok = kolibri1_gemv(g->router, m, l->ffn_gate_inp, g->x, T) &&
               ds4_gpu_kolibri_router_topk_tensor(g->selected, g->rweights, g->router,
                                                  l->ffn_exp_probs_b->abs_offset, m->map, m->size,
                                                  T, DS4_N_EXPERT, slots,
-                                                 DS4_EXPERT_WEIGHT_SCALE) &&
+                                                 DS4_EXPERT_WEIGHT_SCALE);
+    if (ok) {
+        /* SSD streaming stages the selected experts in the expert cache;
+         * without it this is a no-op and the experts stay mapped. */
+        uint64_t in_dim = 0, gate_rows = 0, gate_row_bytes = 0, down_rows = 0, down_row_bytes = 0;
+        (void)tensor_expert_bytes(m, l->ffn_gate_exps, 0, &in_dim, &gate_rows, &gate_row_bytes);
+        (void)tensor_expert_bytes(m, l->ffn_down_exps, 0, &in_dim, &down_rows, &down_row_bytes);
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = m->map,
+            .model_size = m->size,
+            .layer = il,
+            .n_total_expert = DS4_N_EXPERT,
+            .gate_offset = l->ffn_gate_exps->abs_offset,
+            .up_offset = l->ffn_up_exps->abs_offset,
+            .down_offset = l->ffn_down_exps->abs_offset,
+            .gate_expert_bytes = gate_rows * gate_row_bytes,
+            .down_expert_bytes = down_rows * down_row_bytes,
+        };
+        ok = ds4_gpu_qwen4_moe_stream_begin(&table, g->selected, T, slots) != 0;
+    }
+    ok = ok &&
               ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
                                            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                            l->ffn_gate_exps->type, DS4_N_EXPERT, T, slots,
@@ -61290,9 +61314,9 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
               ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
                                             l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
                                             DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
-                                            l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
-              ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
-    return ok;
+                                            l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type);
+    ds4_gpu_qwen4_moe_stream_end();
+    return ok && ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
 }
 
 /* Embeddings are staged on the host like the Qwen graph does: one ref_row
@@ -61334,7 +61358,7 @@ static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_m
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
                                                          l->ffn_norm->abs_offset,
                                                          DS4_N_EMBD, T, DS4_RMS_EPS);
-        if (ok) ok = kolibri1_graph_moe(g, m, l, T);
+        if (ok) ok = kolibri1_graph_moe(g, m, l, il, T);
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->moe_out, m->map, m->size,
                                                          l->post_ffn_norm->abs_offset,
                                                          DS4_N_EMBD, T, DS4_RMS_EPS) &&
@@ -73375,11 +73399,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->backend == DS4_BACKEND_CPU;
         if (!backend_ok || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
             opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
-            opt->first_token_test ||
+            (e->ssd_streaming && e->backend != DS4_BACKEND_METAL) || opt->dspark ||
+            e->power_percent != 100 || opt->first_token_test ||
             (opt->mtp_path && opt->mtp_path[0]) || opt->vision_path) {
             fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference or single-host Metal; "
-                            "CUDA, tensor parallelism, pipeline execution, SSD streaming, "
+                            "CUDA, tensor parallelism, pipeline execution, SSD streaming off Metal, "
                             "DSpark, MTP models and vision are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -75994,7 +76018,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         const ds4_kolibri1_gpu_graph *shared =
             share && arena_fits ? e->kolibri_shared_workspace : NULL;
-        if (!kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, shared)) {
+        /* SSD streaming maps only the token embedding up front; the routed
+         * experts come through the expert cache, everything else maps here. */
+        if ((e->ssd_streaming && !metal_graph_stream_map_decode_static_all(&e->model, &e->weights)) ||
+            !kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, shared)) {
             free(s);
             return 1;
         }

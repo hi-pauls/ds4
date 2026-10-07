@@ -21,7 +21,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gguf-tools"))
 from glm53_quantize import (
-    GGUF_ALIGNMENT, QTYPE_F32, align, kv_bool, kv_f32, kv_string, kv_u32,
+    GGUF_ALIGNMENT, QTYPE_F32, QTYPE_Q8_0, align, kv_bool, kv_f32, kv_string, kv_u32,
     kv_u32_array, qtype_nbytes,
 )
 from kolibri1_quantize import tokenize_records
@@ -41,10 +41,27 @@ Q_SIZE = N_HEAD * HEAD_DIM
 KV_SIZE = N_HEAD_KV * HEAD_DIM
 
 
-def tensor_header_item(name, dims, offset):
+def tensor_header_item(name, dims, qtype, offset):
     return (struct.pack("<Q", len(name)) + name.encode() +
             struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims) +
-            struct.pack("<IQ", QTYPE_F32, offset))
+            struct.pack("<IQ", qtype, offset))
+
+
+def quantize_q8_0(values):
+    """Q8_0 blocks of 32: an f16 scale, then 32 int8 weights."""
+    blocks = values.reshape(-1, 32)
+    amax = np.abs(blocks).max(axis=1)
+    scale = (amax / 127.0).astype(np.float16)
+    inv = np.where(scale.astype(np.float32) > 0, 1.0 / scale.astype(np.float32), 0.0)
+    quants = np.clip(np.rint(blocks * inv[:, None]), -127, 127).astype(np.int8)
+    out = np.empty((blocks.shape[0], 34), dtype=np.uint8)
+    out[:, :2] = scale.view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = quants.view(np.uint8)
+    return out.tobytes()
+
+
+def tensor_qtype(name, expert_qtype):
+    return expert_qtype if name.endswith("_exps.weight") else QTYPE_F32
 
 
 def config():
@@ -166,7 +183,10 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--seed", type=int, default=20261004)
     parser.add_argument("--source-revision", default="0" * 40)
+    parser.add_argument("--expert-type", choices=("f32", "q8_0"), default="f32",
+                        help="routed expert storage; SSD streaming needs a quantized type")
     args = parser.parse_args()
+    expert_qtype = QTYPE_Q8_0 if args.expert_type == "q8_0" else QTYPE_F32
 
     for name in ("tokenizer.json", "tokenizer_config.json"):
         if not os.path.isfile(os.path.join(args.tokenizer, name)):
@@ -178,11 +198,11 @@ def main():
     items = plan()
     offset, entries = 0, []
     for name, dims, _ in items:
-        nbytes = qtype_nbytes(QTYPE_F32, dims)
+        nbytes = qtype_nbytes(tensor_qtype(name, expert_qtype), dims)
         entries.append((name, dims, nbytes, offset))
         offset += align(nbytes, GGUF_ALIGNMENT)
     header_len = 4 + 4 + 8 + 8 + sum(map(len, records))
-    header_len += sum(len(tensor_header_item(name, dims, off))
+    header_len += sum(len(tensor_header_item(name, dims, tensor_qtype(name, expert_qtype), off))
                       for name, dims, _, off in entries)
     data_start = align(header_len, GGUF_ALIGNMENT)
 
@@ -191,13 +211,14 @@ def main():
         for record in records:
             fp.write(record)
         for name, dims, _, off in entries:
-            fp.write(tensor_header_item(name, dims, off))
+            fp.write(tensor_header_item(name, dims, tensor_qtype(name, expert_qtype), off))
         fp.write(bytes(data_start - fp.tell()))
         fp.seek(data_start)
         for (name, _, nbytes, off), values in zip(entries, weights(items, args.seed)):
             if fp.tell() != data_start + off:
                 raise ValueError(f"{name}: offset mismatch")
-            fp.write(values.tobytes())
+            quantized = tensor_qtype(name, expert_qtype) == QTYPE_Q8_0
+            fp.write(quantize_q8_0(values) if quantized else values.tobytes())
             fp.write(bytes(align(nbytes, GGUF_ALIGNMENT) - nbytes))
     print(f"{args.out}: {data_start + offset} bytes, {len(entries)} tensors, vocab {N_VOCAB}")
 

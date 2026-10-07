@@ -49272,6 +49272,89 @@ typedef struct {
     uint32_t list_cap, pad0;
 } qwen4_moe_args;
 
+/* Between ds4_gpu_qwen4_moe_stream_begin and _end the routed expert bindings
+ * of the per-token MoE kernels are the SSD expert cache's per-layer address
+ * tables; the kernels read the same expert bytes through them, so the result
+ * matches the mapped-model dispatch bit for bit. */
+static struct {
+    int active;
+    __strong id<MTLBuffer> gate, up, down;
+    __strong id<MTLBuffer> overflow_gate, overflow_up, overflow_down;
+    ds4_gpu_stream_expert_cache_entry *res[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t n_res;
+} g_qwen4_moe_stream;
+
+static bool qwen4_kernel_streams_experts(int kernel) {
+    return kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN ||
+           kernel == QWEN4_K_MOE_MID_Q4K || kernel == QWEN4_K_MOE_MID_Q4K_NR1 ||
+           kernel == QWEN4_K_MOE_MID_IQ2XXS_NR1 || kernel == QWEN4_K_MOE_MID_IQ2XXS_NR2 ||
+           kernel == QWEN4_K_MOE_MID_IQ2XXS_NR4 || kernel == QWEN4_K_MOE_DOWN_Q2K_NR2 ||
+           kernel == QWEN4_K_MOE_DOWN_Q2K_NR4 || kernel == QWEN4_K_MOE_DOWN_Q2K_NR8;
+}
+
+void ds4_gpu_qwen4_moe_stream_end(void) {
+    g_qwen4_moe_stream.active = 0;
+    g_qwen4_moe_stream.gate = g_qwen4_moe_stream.up = g_qwen4_moe_stream.down = nil;
+    g_qwen4_moe_stream.overflow_gate = g_qwen4_moe_stream.overflow_up = g_qwen4_moe_stream.overflow_down = nil;
+    g_qwen4_moe_stream.n_res = 0;
+}
+
+int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table *t, const ds4_gpu_tensor *selected,
+                                   uint32_t n_tokens, uint32_t n_slots) {
+    ds4_gpu_qwen4_moe_stream_end();
+    if (!g_ssd_streaming_mode) return 1;
+    if (!t || !selected) return 0;
+    const int had_batch = g_batch_cb != nil;
+    if (had_batch && ds4_gpu_end_commands() == 0) return 0;
+    uint32_t unique = 0;
+    id<MTLBuffer> gate = nil, up = nil, down = nil, overflow_gate = nil, overflow_up = nil, overflow_down = nil;
+    g_stream_prefill_batch_selected_addr_building++;
+    int ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+            t->model_map, t->model_size, t->layer, selected, n_tokens, t->n_total_expert, n_slots,
+            t->gate_offset, t->up_offset, t->down_offset, t->gate_expert_bytes, t->down_expert_bytes,
+            &gate, &up, &down, g_qwen4_moe_stream.res, &g_qwen4_moe_stream.n_res, &unique,
+            &overflow_gate, &overflow_up, &overflow_down);
+    g_stream_prefill_batch_selected_addr_building--;
+    g_qwen4_moe_stream.gate = gate;
+    g_qwen4_moe_stream.up = up;
+    g_qwen4_moe_stream.down = down;
+    g_qwen4_moe_stream.overflow_gate = overflow_gate;
+    g_qwen4_moe_stream.overflow_up = overflow_up;
+    g_qwen4_moe_stream.overflow_down = overflow_down;
+    if (ok && unique == 0) ok = 0;
+    if (had_batch && ds4_gpu_begin_commands() == 0) ok = 0;
+    if (ok && g_qwen4_moe_stream.n_res != 0) {
+        ok = ds4_gpu_stream_expert_cache_mark_entries_inflight(g_qwen4_moe_stream.res, g_qwen4_moe_stream.n_res, 0);
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: Metal streamed MoE failed to stage the experts of layer %u\n", t->layer);
+        ds4_gpu_qwen4_moe_stream_end();
+    }
+    g_qwen4_moe_stream.active = ok;
+    return ok;
+}
+
+/* The cached experts and overflow views the address tables point into. */
+static void qwen4_moe_stream_use_resources(id<MTLComputeCommandEncoder> enc) {
+    id<MTLResource> res[3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT + 3u];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g_qwen4_moe_stream.n_res; i++) {
+        const ds4_gpu_stream_expert_cache_entry *e = g_qwen4_moe_stream.res[i];
+        id<MTLBuffer> bufs[3] = { e->gate_buffer, e->up_buffer, e->down_buffer };
+        for (uint32_t k = 0; k < 3; k++) {
+            bool seen = false;
+            for (uint32_t j = 0; j < n && !seen; j++) seen = res[j] == bufs[k];
+            if (!seen && bufs[k]) res[n++] = bufs[k];
+        }
+    }
+    id<MTLBuffer> views[3] = { g_qwen4_moe_stream.overflow_gate, g_qwen4_moe_stream.overflow_up,
+                               g_qwen4_moe_stream.overflow_down };
+    for (uint32_t k = 0; k < 3; k++) {
+        if (views[k]) res[n++] = views[k];
+    }
+    if (n) [enc useResources:res count:n usage:MTLResourceUsageRead];
+}
+
 static bool qwen4_moe_mv_specialize(uint32_t type) {
     /* Constant quantization and logical width remove the generic decode
      * branches. Keep the original per-lane reduction order and padded stride.
@@ -49320,17 +49403,25 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = nil;
+        const bool addr = g_qwen4_moe_stream.active && qwen4_kernel_streams_experts(kernel);
+        if (g_qwen4_moe_stream.active && !addr &&
+            (kernel == QWEN4_K_MOE_DOWN_MXFP4_PF || kernel == QWEN4_K_MOE_MID_Q4K_GROUPED ||
+             kernel == QWEN4_K_MOE_DOWN_MXFP4_GROUPED)) {
+            fprintf(stderr, "ds4: %s has no streamed-expert variant\n", qwen4_kernel_names[kernel]);
+            return 0;
+        }
         if (kernel == QWEN4_K_MOE_MID || kernel == QWEN4_K_MOE_DOWN || kernel == QWEN4_K_MOE_DOWN_MXFP4_PF) {
             const qwen4_moe_args *a = args;
             const bool specialize = qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
-            NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u",
-                             qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3]];
+            NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%d",
+                             qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addr ? 1 : 0];
             pipeline = [g_pipeline_cache objectForKey:key];
             if (!pipeline) {
                 MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
                 for (uint32_t i = 0; specialize && i < 4u; i++)
                     [constants setConstantValue:&values[i] type:MTLDataTypeUInt atIndex:901u+i];
+                if (addr) [constants setConstantValue:&addr type:MTLDataTypeBool atIndex:906u];
                 NSError *error = nil;
                 id<MTLFunction> fn = [g_library newFunctionWithName:
                     [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
@@ -49373,6 +49464,24 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 }
                 [g_pipeline_cache setObject:pipeline forKey:key];
             }
+        } else if (qwen4_kernel_streams_experts(kernel)) {
+            NSString *key = [NSString stringWithFormat:@"%s_addr=%d", qwen4_kernel_names[kernel], addr ? 1 : 0];
+            pipeline = [g_pipeline_cache objectForKey:key];
+            if (!pipeline) {
+                MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
+                if (addr) [constants setConstantValue:&addr type:MTLDataTypeBool atIndex:906u];
+                NSError *error = nil;
+                id<MTLFunction> fn = [g_library newFunctionWithName:
+                    [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
+                    constantValues:constants error:&error];
+                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+                if (!pipeline) {
+                    fprintf(stderr, "ds4: Qwen MoE streamed-expert pipeline failed: %s\n",
+                            [[error localizedDescription] UTF8String]);
+                    return 0;
+                }
+                [g_pipeline_cache setObject:pipeline forKey:key];
+            }
         } else {
             if (!g_qwen4_pipelines[kernel]) {
                 g_qwen4_pipelines[kernel] = ds4_gpu_get_pipeline(qwen4_kernel_names[kernel]);
@@ -49409,6 +49518,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             for (uint32_t i = 0; i < n_resident; i++) res[i] = resident[i].buf;
             [enc useResources:res count:n_resident usage:MTLResourceUsageRead | MTLResourceUsageWrite];
         }
+        if (addr) qwen4_moe_stream_use_resources(enc);
         [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, qwen4_kernel_names[kernel]);
@@ -50533,9 +50643,14 @@ int ds4_gpu_qwen4_moe_mid_tensor(
     qwen4_moe_args args = { n_tokens, n_slots, in_dim, ff_dim, weight_type, row_bytes, expert_bytes,
                             has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, n_total_expert, 0u, 0u };
     qwen4_bind b[7];
+    if (g_qwen4_moe_stream.active) {
+        b[0] = (qwen4_bind){ g_qwen4_moe_stream.gate, 0 };
+        b[1] = (qwen4_bind){ g_qwen4_moe_stream.up, 0 };
+    }
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || ff_dim == 0 || (has_shared && sh_row_bytes == 0) ||
-        !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, experts_bytes, "moe gate experts") ||
-        !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, experts_bytes, "moe up experts") ||
+        (!g_qwen4_moe_stream.active &&
+         (!qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, experts_bytes, "moe gate experts") ||
+          !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, experts_bytes, "moe up experts"))) ||
         !qwen4_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
         !qwen4_bind_tensor(&b[3], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
         !qwen4_bind_tensor(&b[4], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
@@ -50603,9 +50718,11 @@ int ds4_gpu_qwen4_moe_down_tensor(
     qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
                             has_shared ? 1u : 0u, has_shared ? shared_type : 0u, sh_row_bytes, 0u, 0u, 0u };
     qwen4_bind b[5];
+    if (g_qwen4_moe_stream.active) b[0] = (qwen4_bind){ g_qwen4_moe_stream.down, 0 };
     if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || (ff_dim % 32u) != 0 ||
         out_dim == 0 || (has_shared && sh_row_bytes == 0) ||
-        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, experts_bytes, "moe down experts") ||
+        (!g_qwen4_moe_stream.active &&
+         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, experts_bytes, "moe down experts")) ||
         !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
         !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||
         !qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
@@ -50632,7 +50749,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
      * chain order, byte-identical); M5 default, DS4_QWEN4_MOE_DOWN_PREFETCH=0/1
      * overrides on any device. */
     const int prefetch_override = ds4_gpu_env_bool("DS4_QWEN4_MOE_DOWN_PREFETCH");
-    const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 &&
+    const bool prefetch = weight_type == 39u && (ff_dim % 32u) == 0 && !g_qwen4_moe_stream.active &&
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
     return qwen4_dispatch(prefetch ? QWEN4_K_MOE_DOWN_MXFP4_PF : QWEN4_K_MOE_DOWN, &args, sizeof(args), b, 5,
                           MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),

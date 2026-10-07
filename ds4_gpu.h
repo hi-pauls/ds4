@@ -426,6 +426,15 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected);
 #ifdef __APPLE__
+/* SSD streaming for the per-token Qwen MoE kernels (Kolibri-1): stages the
+ * layer's selected experts in the expert cache, ending and reopening the
+ * active command batch to read `selected`; until _end the MoE mid/down
+ * wrappers read routed experts through the cache's address tables. A no-op
+ * when SSD streaming is off. */
+int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table *table,
+                                   const ds4_gpu_tensor *selected,
+                                   uint32_t n_tokens, uint32_t n_slots);
+void ds4_gpu_qwen4_moe_stream_end(void);
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and
  * the caller retries synchronously). */
