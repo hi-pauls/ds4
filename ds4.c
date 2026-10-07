@@ -56,8 +56,8 @@
 #define DS4_HAS_QWEN4_METAL 1
 #endif
 #endif
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
-#define DS4_HAS_KOLIBRI1_METAL 1
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+#define DS4_HAS_KOLIBRI1_GPU 1
 #endif
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
@@ -40741,7 +40741,7 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
 static uint32_t kolibri1_prefill_chunk_tokens(uint32_t ctx) {
     const char *env = getenv("DS4_KOLIBRI1_PREFILL_CHUNK");
     const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
@@ -40757,7 +40757,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     if (ds4_backend_uses_graph(backend) && ds4_model_is_kolibri1()) {
         /* Full layers keep one f32 K/V row per absolute position; the 40
          * sliding layers a ring of window + prefill-chunk rows (capped at
@@ -43439,7 +43439,7 @@ struct ds4_engine {
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     /* Kolibri sessions borrow the first session's transients the same way;
      * only the per-session K/V rings and logits stay private. */
     struct ds4_kolibri1_gpu_graph *kolibri_shared_workspace;
@@ -61022,7 +61022,7 @@ static int generate_qwen4_metal_argmax(
 
 #endif
 
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
 /* ------------------------------------------------------------------------
  * Kolibri-1 GPU graph.  The same shape as the CPU reference forward
  * (kolibri1_forward_token_cpu): a plain residual stream, sandwich norms,
@@ -61285,6 +61285,7 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
                                                  l->ffn_exp_probs_b->abs_offset, m->map, m->size,
                                                  T, DS4_N_EXPERT, slots,
                                                  DS4_EXPERT_WEIGHT_SCALE);
+#ifdef __APPLE__
     if (ok) {
         /* SSD streaming stages the selected experts in the expert cache;
          * without it this is a no-op and the experts stay mapped. */
@@ -61304,6 +61305,9 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
         };
         ok = ds4_gpu_qwen4_moe_stream_begin(&table, g->selected, T, slots) != 0;
     }
+#else
+    (void)il;
+#endif
     ok = ok &&
               ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
                                            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -61315,7 +61319,9 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
                                             l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
                                             DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
                                             l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type);
+#ifdef __APPLE__
     ds4_gpu_qwen4_moe_stream_end();
+#endif
     return ok && ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
 }
 
@@ -62341,7 +62347,7 @@ struct ds4_session {
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     ds4_kolibri1_gpu_graph kolibri_gpu;
     bool kolibri_graph_ready;
 #endif
@@ -63371,7 +63377,7 @@ static bool ds4_session_is_kolibri1(const ds4_session *s) {
     return s && s->engine && ds4_model_is_kolibri1();
 }
 
-/* Kolibri-1 sessions run the dedicated Metal graph; the CPU branch above
+/* Kolibri-1 sessions run the dedicated GPU graph; the CPU branch above
  * already handled the CPU backend before this is consulted. */
 static bool ds4_session_kolibri_uses_gpu(const ds4_session *s) {
     return ds4_session_is_kolibri1(s) && !ds4_session_is_cpu(s);
@@ -64613,7 +64619,7 @@ static uint32_t kolibri1_payload_live_rows(bool full, uint32_t tokens,
 static uint64_t kolibri1_payload_body_bytes(const ds4_session *s, uint32_t tokens) {
     uint32_t ctx_rows = s->kolibri1_cpu.ctx;
     uint32_t slide_rows = DS4_N_SWA;
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     if (ds4_session_kolibri_uses_gpu(s)) {
         ctx_rows = s->kolibri_gpu.ctx_cap;
         slide_rows = s->kolibri_gpu.slide_rows;
@@ -64637,7 +64643,7 @@ static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t err
     uint32_t slide_rows = DS4_N_SWA;
     uint32_t saved_slide = 0;
     if (gpu) {
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         if (!s->kolibri_graph_ready || s->kolibri_gpu.pos != tokens) {
             payload_set_err(err, errlen, "Kolibri-1 graph has no complete frontier to save");
             return 1;
@@ -64686,7 +64692,7 @@ static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t err
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         const bool full = ds4_kolibri1_layer_is_full(il);
         const uint32_t live = kolibri1_payload_live_rows(full, tokens, ctx_rows, slide_rows);
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         if (gpu) {
             const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
             for (uint32_t r = 0; rc == 0 && r < live; r++) {
@@ -64733,7 +64739,7 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         return 1;
     }
     if (gpu) {
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
         /* A ring smaller than the window is only valid when the context
          * itself is smaller than the window (all positions fit, so the file
@@ -64784,7 +64790,7 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         return 1;
     }
     if (gpu) {
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         if (ds4_gpu_synchronize() == 0) {
             token_vec_free(&new_checkpoint);
             s->checkpoint.len = 0;
@@ -64800,7 +64806,7 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         const bool full = ds4_kolibri1_layer_is_full(il);
         const uint32_t live = kolibri1_payload_live_rows(full, saved_tokens,
                                                          saved_ctx_rows, load_slide);
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         if (gpu) {
             ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
             for (uint32_t r = 0; rc == 0 && r < live; r++) {
@@ -64833,7 +64839,7 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         s->checkpoint.len = 0;
         ds4_session_dspark_capture_invalidate(s);
         if (gpu) {
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
             kolibri1_graph_reset(&s->kolibri_gpu);
 #endif
         } else {
@@ -64842,7 +64848,7 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
         return 1;
     }
     if (gpu) {
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         s->kolibri_gpu.pos = saved_tokens;
 #endif
     } else {
@@ -64889,7 +64895,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (ds4_session_is_kolibri1(s)) {
         const bool gpu = ds4_session_kolibri_uses_gpu(s);
         if (gpu) {
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
             if (!s->kolibri_graph_ready ||
                 s->kolibri_gpu.pos != (uint32_t)s->checkpoint.len) return 0;
 #else
@@ -73389,12 +73395,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (ds4_model_is_kolibri1() && !opt->inspect_only) {
-        /* The Kolibri-1 Metal graph runs the plain decoder stack; CUDA,
-         * tensor parallelism and the other execution modes stay reserved
-         * until their graphs exist. */
+        /* The Kolibri-1 graph runs the plain decoder stack on one Metal or
+         * CUDA device; tensor parallelism and the other execution modes stay
+         * reserved until their graphs exist. */
         const bool backend_ok =
-#ifdef DS4_HAS_KOLIBRI1_METAL
-            e->backend == DS4_BACKEND_METAL ||
+#ifdef DS4_HAS_KOLIBRI1_GPU
+            e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
 #endif
             e->backend == DS4_BACKEND_CPU;
         if (!backend_ok || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
@@ -73402,8 +73408,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (e->ssd_streaming && e->backend != DS4_BACKEND_METAL) || opt->dspark ||
             e->power_percent != 100 || opt->first_token_test ||
             (opt->mtp_path && opt->mtp_path[0]) || opt->vision_path) {
-            fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference or single-host Metal; "
-                            "CUDA, tensor parallelism, pipeline execution, SSD streaming off Metal, "
+            fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference, Metal or one CUDA device; "
+                            "tensor parallelism, pipeline execution, SSD streaming off Metal, "
                             "DSpark, MTP models and vision are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -75572,7 +75578,7 @@ void ds4_engine_close(ds4_engine *e) {
         e->qwen4_shared_workspace = NULL;
     }
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     if (e->kolibri_shared_workspace) {
         kolibri1_graph_free(e->kolibri_shared_workspace);
         free(e->kolibri_shared_workspace);
@@ -75994,10 +76000,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         return 0;
     }
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     if (ds4_model_is_kolibri1()) {
-        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
-            fprintf(stderr, "ds4: Kolibri-1 sessions require single-host Metal\n");
+        if ((e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: Kolibri-1 sessions require single-host Metal or CUDA\n");
             free(s);
             return 1;
         }
@@ -76413,7 +76420,7 @@ void ds4_session_free(ds4_session *s) {
             qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
         if (ds4_session_is_kolibri1(s)) {
             if (s->kolibri_graph_ready && !s->kolibri_gpu.owns_scratch && s->engine) {
                 s->engine->kolibri_arena_users--;
@@ -78489,7 +78496,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return 0;
     }
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     if (ds4_session_kolibri_uses_gpu(s)) {
         ds4_engine *e = s->engine;
         int start = 0;
@@ -80681,7 +80688,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     if (ds4_session_kolibri_uses_gpu(s)) {
         ds4_engine *e = s->engine;
         if (!s->kolibri_graph_ready) {
@@ -82387,7 +82394,7 @@ static bool ds4_sessions_eval_batch_metal_supported(
     if (items[0].session && ds4_session_is_qwen4(items[0].session))
         return qwen4_graph_native_session_batch_supported(items, count, e);
 #endif
-#ifdef DS4_HAS_KOLIBRI1_METAL
+#ifdef DS4_HAS_KOLIBRI1_GPU
     /* The Kolibri graph has no cross-session batch encode: its rings and
      * command stream are per session.  Decline so the caller serializes. */
     if (items[0].session && ds4_session_is_kolibri1(items[0].session)) return false;
