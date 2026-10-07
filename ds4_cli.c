@@ -69,9 +69,11 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    int top_k;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_k_set;
     uint64_t seed;
     bool dump_tokens;
     const char *dump_logits_path;
@@ -359,6 +361,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
 static bool is_rendered_chat_prompt(const char *prompt) {
     static const char *prefixes[] = {
+        "<|im_start|>",
         "<｜begin▁of▁sentence｜>",
         "<｜User｜>",
         "[gMASK]",
@@ -380,7 +383,9 @@ typedef struct {
     ds4_engine *engine;
     FILE *fp;
     bool format_thinking;
+    bool hide_tool_calls;
     bool in_think;
+    bool in_tool_call;
     bool color_open;
     bool use_color;
     bool last_output_newline;
@@ -418,9 +423,27 @@ static void token_printer_write_char(token_printer *p, char c) {
     p->last_output_newline = c == '\n';
 }
 
+/* A tool-call stanza in plain chat is wire format, not answer text.  Hide it
+ * behind a dim placeholder like the agent and server do; the model's prose
+ * before and after the stanza keeps printing normally. */
+static void token_printer_tool_call_note(token_printer *p) {
+    token_printer_reset_color(p);
+    if (!p->last_output_newline) {
+        fputc('\n', p->fp);
+        p->last_output_newline = true;
+    }
+    if (p->use_color) fputs("\x1b[90m", p->fp);
+    fputs("[tool call]", p->fp);
+    if (p->use_color) fputs("\x1b[0m", p->fp);
+    fputc('\n', p->fp);
+    p->last_output_newline = true;
+}
+
 static void token_printer_process(token_printer *p, const char *text, size_t len, bool finish) {
     const char *think_open = "<think>";
     const char *think_close = "</think>";
+    const char *call_open = "<tool_call>";
+    const char *call_close = "</tool_call>";
     size_t total = p->pending_len + len;
     char *buf = malloc(total ? total : 1);
     if (!buf) return;
@@ -432,12 +455,31 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
     while (i < total) {
         const char *cur = buf + i;
         const size_t rem = total - i;
-        if (bytes_has_prefix(cur, rem, think_open)) {
+        /* Inside a call, drop the body; only the closing marker matters. */
+        if (p->in_tool_call) {
+            if (bytes_has_prefix(cur, rem, call_close)) {
+                p->in_tool_call = false;
+                i += strlen(call_close);
+                continue;
+            }
+            if (!finish && cur[0] == '<' &&
+                bytes_is_partial_prefix(cur, rem, call_close))
+            {
+                if (rem < sizeof(p->pending)) {
+                    memcpy(p->pending, cur, rem);
+                    p->pending_len = rem;
+                }
+                break;
+            }
+            i++;
+            continue;
+        }
+        if (p->format_thinking && bytes_has_prefix(cur, rem, think_open)) {
             p->in_think = true;
             i += strlen(think_open);
             continue;
         }
-        if (bytes_has_prefix(cur, rem, think_close)) {
+        if (p->format_thinking && bytes_has_prefix(cur, rem, think_close)) {
             p->in_think = false;
             token_printer_reset_color(p);
             if (!p->last_output_newline) {
@@ -447,9 +489,23 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
             i += strlen(think_close);
             continue;
         }
+        /* Tool calls are executable only outside thinking; inside thinking the
+         * marker is prose and stays visible with the rest of the trace. */
+        if (p->hide_tool_calls && !p->in_think &&
+            bytes_has_prefix(cur, rem, call_open))
+        {
+            p->in_tool_call = true;
+            token_printer_tool_call_note(p);
+            i += strlen(call_open);
+            continue;
+        }
         if (!finish && cur[0] == '<' &&
-            (bytes_is_partial_prefix(cur, rem, think_open) ||
-             bytes_is_partial_prefix(cur, rem, think_close)))
+            ((p->format_thinking &&
+              (bytes_is_partial_prefix(cur, rem, think_open) ||
+               bytes_is_partial_prefix(cur, rem, think_close))) ||
+             (p->hide_tool_calls && !p->in_think &&
+              (bytes_is_partial_prefix(cur, rem, call_open) ||
+               bytes_is_partial_prefix(cur, rem, call_close)))))
         {
             if (rem < sizeof(p->pending)) {
                 memcpy(p->pending, cur, rem);
@@ -465,7 +521,7 @@ static void token_printer_process(token_printer *p, const char *text, size_t len
 }
 
 static void token_printer_finish(token_printer *p) {
-    if (p->format_thinking) {
+    if (p->format_thinking || p->hide_tool_calls) {
         token_printer_process(p, NULL, 0, true);
         token_printer_reset_color(p);
     }
@@ -483,7 +539,7 @@ static void generation_done(void *ud) {
 }
 
 static void token_printer_write_text(token_printer *p, const char *text, size_t len) {
-    if (p->format_thinking) {
+    if (p->format_thinking || p->hide_tool_calls) {
         token_printer_process(p, text, len, false);
     } else if (len) {
         fwrite(text, 1, len, p->fp);
@@ -529,7 +585,16 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static void cli_apply_model_sampling_defaults(
         ds4_engine             *engine,
         cli_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
+    if (ds4_engine_is_kolibri1(engine)) {
+        /* released sampling defaults: temp 1.0, top_p 0.97, top_k 128 */
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.97f;
+        if (!gen->top_k_set) gen->top_k = 128;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        return;
+    }
+    if (!ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -556,6 +621,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         .engine = engine,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
+        .hide_tool_calls = !cfg->gen.raw_prompt,
         .in_think = ds4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
@@ -608,7 +674,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(session, cfg->gen.temperature, 0,
+            token = ds4_session_sample(session, cfg->gen.temperature, cfg->gen.top_k,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
@@ -620,7 +686,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
                 session, token, max_tokens - generated,
-                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                ds4_token_eos(engine), cfg->gen.temperature, cfg->gen.top_k,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
@@ -1252,6 +1318,7 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
                 .engine = engine,
                 .fp = stdout,
                 .format_thinking = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+                .hide_tool_calls = !cfg->gen.raw_prompt,
                 .in_think = ds4_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
                 .use_color = isatty(fileno(stdout)) != 0,
                 .last_output_newline = true,
@@ -1449,7 +1516,8 @@ static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config 
     chat->think_prefix_pos = chat->transcript.len;
     repl_chat_apply_think_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
     if (cfg->gen.system && cfg->gen.system[0]) {
-        ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
+        ds4_chat_append_system_effort(engine, &chat->transcript, cfg->gen.system,
+                                      cli_effective_think_mode(&cfg->gen));
     }
     ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
     if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
@@ -1582,6 +1650,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         .engine = engine,
         .fp = stdout,
         .format_thinking = ds4_think_mode_enabled(think_mode),
+        .hide_tool_calls = true,
         .in_think = ds4_think_mode_enabled(think_mode),
         .use_color = isatty(fileno(stdout)) != 0,
         .last_output_newline = true,
@@ -1612,7 +1681,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         } else {
             token = ds4_session_sample(chat->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -1626,7 +1695,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
                 chat->session, token, max_tokens - generated,
-                ds4_token_eos(engine), cfg->gen.temperature, 0,
+                ds4_token_eos(engine), cfg->gen.temperature, cfg->gen.top_k,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
@@ -2049,6 +2118,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
@@ -2339,8 +2411,9 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
-    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 &&
+        !ds4_engine_is_deepseek41(engine) && !ds4_engine_is_kolibri1(engine)) {
+        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 or Kolibri-1 model\n");
         ds4_engine_close(engine);
         ds4_dist_options_free(cfg.dist);
         ds4_prompt_prefix_free(&cfg.gen.prefix);

@@ -56,6 +56,9 @@
 #define DS4_HAS_QWEN4_METAL 1
 #endif
 #endif
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#define DS4_HAS_KOLIBRI1_METAL 1
+#endif
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
 #endif
@@ -527,6 +530,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_KOLIBRI1   = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -537,6 +541,8 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_KOLIBRI1 = 7,
+    DS4_VARIANT_KOLIBRI1_MINI = 8,
 } ds4_variant;
 
 typedef struct {
@@ -877,6 +883,59 @@ static const ds4_shape DS4_SHAPE_QWEN4_MINI = {
     .rope_orig_ctx = 262144,
 };
 
+/* Kolibri-1: 50 identical layers, every one a MoE block of 384 routed
+ * experts (top-6) plus one shared expert of width 512. Attention repeats four
+ * sliding-window GQA layers (513 tokens, RoPE) with one full GQA layer that
+ * carries no positional encoding at all. QK get per-head RMSNorm, and each
+ * sublayer output is normalized again before the residual add. */
+static const ds4_shape DS4_SHAPE_KOLIBRI1 = {
+    .name = "Kolibri-1",
+    .family = DS4_MODEL_FAMILY_KOLIBRI1,
+    .variant = DS4_VARIANT_KOLIBRI1,
+    .n_layer = 50,
+    .n_embd = 2560,
+    .n_vocab = 128000,
+    .n_head = 48,
+    .n_head_kv = 4,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,
+    .n_expert = 384,
+    .n_expert_used = 6,
+    .n_expert_shared = 1,
+    .n_ff_exp = 512,
+    .n_swa = 513,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000.0f,
+    .rope_orig_ctx = 262144,
+};
+
+/* Synthetic fixture: same structure at toy widths, real tokenizer. The odd
+ * window length keeps the sliding-window ring logic honest. */
+static const ds4_shape DS4_SHAPE_KOLIBRI1_MINI = {
+    .name = "Kolibri-1 mini",
+    .family = DS4_MODEL_FAMILY_KOLIBRI1,
+    .variant = DS4_VARIANT_KOLIBRI1_MINI,
+    .n_layer = 5,
+    .n_embd = 64,
+    .n_vocab = 128000,
+    .n_head = 4,
+    .n_head_kv = 2,
+    .n_head_dim = 16,
+    .n_value_dim = 16,
+    .n_rot = 16,
+    .n_expert = 8,
+    .n_expert_used = 2,
+    .n_expert_shared = 1,
+    .n_ff_exp = 32,
+    .n_swa = 33,
+    .rms_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000.0f,
+    .rope_orig_ctx = 4096,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -1026,6 +1085,16 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER;
 }
 
+static bool ds4_model_is_kolibri1(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1;
+}
+
+/* Every fifth layer attends to the whole context without positional encoding;
+ * the four before it use the sliding window and RoPE. */
+static bool ds4_kolibri1_layer_is_full(uint32_t il) {
+    return ds4_model_is_kolibri1() && (il + 1u) % 5u == 0u;
+}
+
 static int g_ds4_lock_fd = -1;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -1165,6 +1234,34 @@ typedef struct {
     float *output_embd;
     float *output_norm;
 } ds4_cpu_decode_scratch;
+
+typedef struct {
+    float *k;          /* rows x kv_dim; rows 0..count-1 hold the current span */
+    float *v;
+    uint32_t rows;     /* window for sliding layers, context for full ones */
+} ds4_kolibri1_kv_layer;
+
+typedef struct {
+    ds4_kolibri1_kv_layer layer[DS4_MAX_LAYER];
+    uint32_t ctx;
+    uint32_t filled;
+} ds4_kolibri1_kv;
+
+typedef struct {
+    float *residual;
+    float *x;
+    float *q;
+    float *k;
+    float *v;
+    float *context;
+    float *attn;
+    float *moe;
+    float *router;
+    float *scores;
+    float *ff_a;
+    float *ff_b;
+    uint32_t selected[DS4_MAX_EXPERT_USED];
+} ds4_kolibri1_cpu_scratch;
 
 static const uint8_t kmask_iq2xs[8] = {
     1, 2, 4, 8, 16, 32, 64, 128
@@ -3316,6 +3413,17 @@ static void model_summary(const ds4_model *m) {
         model_get_u32(m, "deepseek41.num_experts_per_tok", &n_expert_used);
     }
 
+    if (ds4_streq(arch, "kolibri1")) {
+        model_get_u32(m, "kolibri1.block_count", &layers);
+        model_get_u64_compat(m, "kolibri1.context_length", &ctx_train);
+        model_get_u32(m, "kolibri1.attention.head_count", &n_head);
+        model_get_u32(m, "kolibri1.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "kolibri1.attention.key_length", &head_dim);
+        model_get_u32(m, "kolibri1.attention.sliding_window", &n_swa);
+        model_get_u32(m, "kolibri1.expert_count", &n_expert);
+        model_get_u32(m, "kolibri1.expert_used_count", &n_expert_used);
+    }
+
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
@@ -4842,6 +4950,9 @@ typedef struct {
     ds4_tensor *nextn_hc_head_norm;
     ds4_tensor *nextn_hc_head_down;
     ds4_tensor *nextn_hc_head_up;
+    /* Kolibri-1: RMSNorm applied to each sublayer output before the residual */
+    ds4_tensor *post_attn_norm;
+    ds4_tensor *post_ffn_norm;
 } ds4_layer_weights;
 
 typedef struct {
@@ -5475,7 +5586,8 @@ static void tensor_expect_routed_expert(
 
 static bool weights_have_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        ds4_model_is_kolibri1()) {
         return w && w->output_norm && w->output;
     }
     if (ds4_model_is_qwen4()) {
@@ -5491,7 +5603,8 @@ static bool weights_have_output_head(const ds4_weights *w) {
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        ds4_model_is_kolibri1()) {
         return w && (w->output_norm || w->output);
     }
     if (ds4_model_is_qwen4()) {
@@ -5608,16 +5721,17 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
-static bool tensor_type_is_qwen4_dense(uint32_t type) {
+/* Dense projections for the MoE families: Q8_0 and F16 from our recipes,
+ * BF16 and Q4_0 from upstream GGUFs, F32 for the CPU reference and fixtures. */
+static bool tensor_type_is_moe_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
            type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
 }
 
-static void tensor_expect_qwen4_dense_layout(
+static void tensor_expect_moe_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (!tensor_type_is_qwen4_dense(t->type)) {
+    if (!tensor_type_is_moe_dense(t->type)) {
         fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, F16, BF16 or F32\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -5625,7 +5739,7 @@ static void tensor_expect_qwen4_dense_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
-static void tensor_expect_qwen4_expert_layout(
+static void tensor_expect_moe_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
@@ -5660,7 +5774,7 @@ static void weights_validate_qwen4_layout(
 
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
     if (w->token_embd) {
-        tensor_expect_qwen4_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        tensor_expect_moe_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
     if (require_token_embd && !w->ple_embd)
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
@@ -5685,9 +5799,9 @@ static void weights_validate_qwen4_layout(
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
     if (have_output) {
         tensor_expect_layout(w->output_hc_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-        tensor_expect_qwen4_dense_layout(w->output_hc_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-        tensor_expect_qwen4_dense_layout(w->output_hc_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        tensor_expect_moe_dense_layout(w->output_hc_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_moe_dense_layout(w->output_hc_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_moe_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -5697,39 +5811,39 @@ static void weights_validate_qwen4_layout(
             exit(1);
         }
         tensor_expect_layout(l->hc_attn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_attn_inject, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_moe_dense_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_moe_dense_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_moe_dense_layout(l->hc_attn_inject, 2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(l->hc_ffn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_qwen4_dense_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_moe_dense_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_moe_dense_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_moe_dense_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
 
         if (ds4_qwen4_layer_is_linear(il)) {
-            tensor_expect_qwen4_dense_layout(l->lin_qkv, 2, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_gate, 2, DS4_N_EMBD, lin_v_dim, 0);
+            tensor_expect_moe_dense_layout(l->lin_qkv, 2, DS4_N_EMBD, 2u * lin_k_dim + lin_v_dim, 0);
+            tensor_expect_moe_dense_layout(l->lin_gate, 2, DS4_N_EMBD, lin_v_dim, 0);
             tensor_expect_layout(l->lin_conv, DS4_TENSOR_F32, 2, DS4_N_LIN_CONV, 2u * lin_k_dim + lin_v_dim, 0);
             tensor_expect_layout(l->lin_dt_bias, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
             tensor_expect_layout(l->lin_a, DS4_TENSOR_F32, 1, DS4_N_LIN_V_HEAD, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_moe_dense_layout(l->lin_beta, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
+            tensor_expect_moe_dense_layout(l->lin_alpha, 2, DS4_N_EMBD, DS4_N_LIN_V_HEAD, 0);
             tensor_expect_layout(l->lin_norm, DS4_TENSOR_F32, 1, DS4_N_LIN_HEAD_DIM, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->lin_out, 2, lin_v_dim, DS4_N_EMBD, 0);
         } else {
-            tensor_expect_qwen4_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->attn_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
+            tensor_expect_moe_dense_layout(l->attn_k, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_moe_dense_layout(l->attn_v, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_moe_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
             tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->indexer_q_proj, 2, DS4_N_EMBD, index_q_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->indexer_k_proj, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
+            tensor_expect_moe_dense_layout(l->indexer_q_proj, 2, DS4_N_EMBD, index_q_dim, 0);
+            tensor_expect_moe_dense_layout(l->indexer_k_proj, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
             tensor_expect_layout(l->indexer_q_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
             tensor_expect_layout(l->indexer_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
         }
         if (ds4_qwen4_layer_is_ple(il)) {
-            tensor_expect_qwen4_dense_layout(l->ple_key, 2, DS4_N_EMBD, hc_dim, 0);
-            tensor_expect_qwen4_dense_layout(l->ple_value, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->ple_key, 2, DS4_N_EMBD, hc_dim, 0);
+            tensor_expect_moe_dense_layout(l->ple_value, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
             tensor_expect_layout(l->ple_norm_key, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
             tensor_expect_layout(l->ple_norm_query, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
             tensor_expect_layout(l->ple_norm_conv, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
@@ -5737,13 +5851,13 @@ static void weights_validate_qwen4_layout(
                                  2, DS4_N_PLE_CONV, hc_dim, 0);
         }
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
          * Activations remain 640 wide; only the weight row stride is padded. */
         const uint32_t down_width = l->ffn_down_exps->type == DS4_TENSOR_Q2_K ?
             (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
-        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -5754,16 +5868,16 @@ static void weights_validate_qwen4_layout(
         } else {
             tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 2, DS4_N_EMBD, 1, 0);
         }
-        tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
-        tensor_expect_qwen4_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        tensor_expect_moe_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
         if (ds4_qwen4_layer_is_nextn(il)) {
-            tensor_expect_qwen4_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_moe_dense_layout(l->nextn_eh_proj, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
             tensor_expect_layout(l->nextn_enorm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
             tensor_expect_layout(l->nextn_hnorm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
             tensor_expect_layout(l->nextn_hc_head_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
-            tensor_expect_qwen4_dense_layout(l->nextn_hc_head_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
-            tensor_expect_qwen4_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+            tensor_expect_moe_dense_layout(l->nextn_hc_head_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+            tensor_expect_moe_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         }
     }
 }
@@ -6014,12 +6128,82 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+static bool weights_kolibri1_layer_has_required(const ds4_layer_weights *l) {
+    if (!l) return false;
+    return l->attn_norm && l->post_attn_norm && l->ffn_norm && l->post_ffn_norm &&
+           l->attn_q && l->attn_k && l->attn_v && l->attn_output &&
+           l->attn_q_norm && l->attn_k_norm && l->ffn_gate_inp && l->ffn_exp_probs_b &&
+           l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+           l->ffn_gate_shexp && l->ffn_up_shexp && l->ffn_down_shexp;
+}
+
+static void weights_validate_kolibri1_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+    if (!w) ds4_die("internal error: missing weights while validating Kolibri layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in Kolibri weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in Kolibri weight layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_moe_dense_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_moe_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_kolibri1_layer_has_required(l)) {
+            fprintf(stderr, "ds4: required Kolibri tensors for layer %u are missing\n", il);
+            exit(1);
+        }
+        tensor_expect_layout(l->attn_norm,      DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->post_attn_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->ffn_norm,       DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->post_ffn_norm,  DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_moe_dense_layout(l->attn_q,      2, DS4_N_EMBD, q_dim, 0);
+        tensor_expect_moe_dense_layout(l->attn_k,      2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_moe_dense_layout(l->attn_v,      2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_moe_dense_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->ffn_gate_inp,    DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+        tensor_expect_moe_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_moe_expert_layout(l->ffn_down_exps, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        tensor_expect_moe_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_moe_dense_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (ds4_model_is_kolibri1()) {
+        weights_validate_kolibri1_layout(w, layer_start, layer_end,
+                                         require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -7295,6 +7479,66 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+/* Kolibri-1 GGUFs carry the released architecture in `kolibri1.*` metadata.
+ * The converter freezes those keys, so every value is checked against the
+ * compiled shape instead of being trusted for scheduling decisions. */
+static void config_validate_kolibri1_model(const ds4_model *m) {
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_embd = required_u32(m, "kolibri1.embedding_length");
+    if (n_embd == DS4_SHAPE_KOLIBRI1.n_embd) {
+        g_ds4_shape = DS4_SHAPE_KOLIBRI1;
+    } else if (n_embd == DS4_SHAPE_KOLIBRI1_MINI.n_embd) {
+        g_ds4_shape = DS4_SHAPE_KOLIBRI1_MINI;
+    } else {
+        fprintf(stderr, "ds4: unsupported kolibri1 embedding_length %u\n", n_embd);
+        exit(1);
+    }
+
+    const struct { const char *key; uint32_t value; } ints[] = {
+        {"block_count", DS4_N_LAYER},
+        {"context_length", DS4_ROPE_ORIG_CTX},
+        {"feed_forward_length", DS4_N_FF_EXP},
+        {"expert_count", DS4_N_EXPERT},
+        {"expert_used_count", DS4_N_EXPERT_USED},
+        {"expert_shared_count", DS4_N_EXPERT_SHARED},
+        {"attention.head_count", DS4_N_HEAD},
+        {"attention.head_count_kv", DS4_N_HEAD_KV},
+        {"attention.key_length", DS4_N_HEAD_DIM},
+        {"attention.value_length", DS4_N_VALUE_DIM},
+        {"attention.sliding_window", DS4_N_SWA},
+        {"rope.dimension_count", DS4_N_ROT},
+    };
+    for (size_t i = 0; i < sizeof(ints) / sizeof(ints[0]); i++) {
+        char key[128];
+        snprintf(key, sizeof(key), "kolibri1.%s", ints[i].key);
+        config_expect_u32(key, required_u32(m, key), ints[i].value);
+    }
+    config_expect_f32("kolibri1.attention.layer_norm_rms_epsilon",
+                      required_f32(m, "kolibri1.attention.layer_norm_rms_epsilon"),
+                      DS4_RMS_EPS);
+    config_expect_f32("kolibri1.rope.freq_base",
+                      required_f32(m, "kolibri1.rope.freq_base"),
+                      DS4_ROPE_FREQ_BASE);
+    config_expect_f32("kolibri1.expert_weights_scale",
+                      required_f32(m, "kolibri1.expert_weights_scale"),
+                      DS4_EXPERT_WEIGHT_SCALE);
+    config_expect_bool("kolibri1.expert_weights_norm",
+                       required_bool(m, "kolibri1.expert_weights_norm"), false);
+    config_expect_bool("kolibri1.router.expert_bias",
+                       required_bool(m, "kolibri1.router.expert_bias"), true);
+    config_expect_bool("kolibri1.attention.full_attention_rope",
+                       required_bool(m, "kolibri1.attention.full_attention_rope"), false);
+
+    /* The 4:1 pattern is fixed, but the array is what the file declares, so
+     * a converted model with a different schedule is rejected here. */
+    uint32_t layer_types[DS4_MAX_LAYER];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        layer_types[il] = ds4_kolibri1_layer_is_full(il) ? 1u : 0u;
+    config_expect_u32_array(m, "kolibri1.attention.layer_types",
+                            layer_types, DS4_N_LAYER);
+}
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7313,6 +7557,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "kolibri1")) {
+            config_validate_kolibri1_model(m);
             return;
         }
     }
@@ -7804,7 +8052,8 @@ static void weights_bind_output(
             w->output         = model_find_tensor(m, "output.weight");
         }
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+        ds4_model_is_kolibri1()) {
 
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -7967,7 +8216,34 @@ static void weights_bind_qwen4_layer(ds4_layer_weights *l, const ds4_model *m, u
     }
 }
 
+/* Kolibri-1 tensors: GQA projections with per-head QK norms, the four
+ * sandwich norms, and one MoE block per layer. Every layer is routed. */
+static void weights_bind_kolibri1_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm      = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->post_attn_norm = required_tensorf(m, "blk.%u.post_attn_norm.weight", il);
+    l->ffn_norm       = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+    l->post_ffn_norm  = required_tensorf(m, "blk.%u.post_ffn_norm.weight", il);
+    l->attn_q         = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k         = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v         = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_output    = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->attn_q_norm    = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k_norm    = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->ffn_gate_inp   = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+    l->ffn_gate_exps  = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps    = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps  = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp   = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (ds4_model_is_kolibri1()) {
+        weights_bind_kolibri1_layer(l, m, il);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         weights_bind_qwen4_layer(l, m, il);
         return;
@@ -40461,6 +40737,15 @@ static uint32_t qwen4_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+#ifdef DS4_HAS_KOLIBRI1_METAL
+static uint32_t kolibri1_prefill_chunk_tokens(uint32_t ctx) {
+    const char *env = getenv("DS4_KOLIBRI1_PREFILL_CHUNK");
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10) : 8192ul;
+    uint32_t chunk = v == 0 || v > 65536ul ? 8192u : (uint32_t)v;
+    return chunk > ctx ? ctx : chunk;
+}
+#endif
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -40468,6 +40753,29 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_backend_uses_graph(backend) && ds4_model_is_kolibri1()) {
+        /* Full layers keep one f32 K/V row per absolute position; the 40
+         * sliding layers a ring of window + prefill-chunk rows (capped at
+         * the context, where it never wraps).  Transients scale with the
+         * prefill chunk. */
+        const uint64_t T = prefill_chunk ? prefill_chunk : kolibri1_prefill_chunk_tokens(ctx);
+        const uint64_t E = DS4_N_EMBD;
+        const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t slide_rows = DS4_N_SWA + T < ctx ? DS4_N_SWA + T : ctx;
+        uint64_t cache_rows = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+            cache_rows += ds4_kolibri1_layer_is_full(il) ? ctx : slide_rows;
+        m.prefill_cap = (uint32_t)T;
+        m.raw_cap = ctx;
+        m.comp_cap = 2u;
+        m.raw_bytes = cache_rows * kv_row * 2u;
+        m.scratch_bytes = T * (4u * E + (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM + 2u * (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM +
+                               DS4_N_EXPERT + 2u * ((uint64_t)DS4_N_EXPERT_USED + 1u) * (DS4_N_FF_EXP + E)) * 4u;
+        m.total_bytes = m.raw_bytes + m.scratch_bytes;
+        return m;
+    }
+#endif
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
         /* per-token f16 K/V and raw indexer keys per attention layer, pooled
          * block keys, rope positions; transients scale with the prefill chunk */
@@ -43127,6 +43435,12 @@ struct ds4_engine {
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
     uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    /* Kolibri sessions borrow the first session's transients the same way;
+     * only the per-session K/V rings and logits stay private. */
+    struct ds4_kolibri1_gpu_graph *kolibri_shared_workspace;
+    uint32_t kolibri_arena_users;
+#endif
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
@@ -43903,12 +44217,15 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
     return c;
 }
 
-/* Qwen3.8 pre-tokenization (tokenizer.ggml.pre = "qwen35"), the ordered
- * alternation
- *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
- *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
- * with the Unicode classes generated from the `regex` module. */
-static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+/* Shared ChatML-style pre-tokenization for Qwen3.8
+ * (tokenizer.ggml.pre = "qwen35") and Kolibri-1 ("kolibri1"), which release the
+ * same ordered alternation
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} |
+ *    ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * The only difference is combining marks: Qwen counts \p{M} inside letter runs
+ * and its punctuation class, Kolibri splits them out. */
+static void bpe_tokenize_text_chatml(const ds4_vocab *vocab, const char *text,
+                                     token_vec *out, bool marks) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -43936,20 +44253,20 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
             }
         }
 
-        /* an optional non-letter prefix, then a run of letters and marks */
+        /* an optional non-letter prefix, then a run of letters (and marks) */
         {
             uint64_t run = UINT64_MAX;
-            if (cur.letter || cur.mark) {
+            if (cur.letter || (marks && cur.mark)) {
                 run = cur.next;
             } else if (cur.cp != '\r' && cur.cp != '\n' && !cur.number) {
                 qwen4_char_info n1 = qwen4_char_at(text, len, cur.next);
-                if (n1.valid && (n1.letter || n1.mark)) run = n1.next;
+                if (n1.valid && (n1.letter || (marks && n1.mark))) run = n1.next;
             }
             if (run != UINT64_MAX) {
                 pos = run;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || !(scan.letter || scan.mark)) break;
+                    if (!scan.valid || !(scan.letter || (marks && scan.mark))) break;
                     pos = scan.next;
                 }
                 bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
@@ -43970,11 +44287,13 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
                 punct_pos = cur.next;
                 punct = qwen4_char_at(text, len, punct_pos);
             }
-            if (punct.valid && !punct.space && !punct.letter && !punct.mark && !punct.number) {
+            if (punct.valid && !punct.space && !punct.letter && !punct.number &&
+                !(marks && punct.mark)) {
                 pos = punct_pos;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || scan.space || scan.letter || scan.mark || scan.number) break;
+                    if (!scan.valid || scan.space || scan.letter || scan.number ||
+                        (marks && scan.mark)) break;
                     pos = scan.next;
                 }
                 while (pos < len) {
@@ -44017,6 +44336,16 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
     }
 }
 
+static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_text_chatml(vocab, text, out, true);
+}
+
+/* Kolibri-1 splits combining marks out of letter runs, so German text with
+ * decomposed forms tokenizes as its released pre-tokenizer does. */
+static void bpe_tokenize_text_kolibri1(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    bpe_tokenize_text_chatml(vocab, text, out, false);
+}
+
 /*
  * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
  * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
@@ -44042,6 +44371,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
     }
     if (ds4_model_is_qwen4()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
+    }
+    if (ds4_model_is_kolibri1()) {
+        bpe_tokenize_text_kolibri1(vocab, text, out);
         return;
     }
 
@@ -44194,6 +44527,33 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         return;
     }
 
+    if (ds4_model_is_kolibri1()) {
+        /* ChatML without BOS. <think> is an ordinary added token, and
+         * 127901 doubles as a second generation stop. */
+        vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
+        vocab->im_end_id = vocab_lookup(vocab, "<|im_end|>");
+        vocab->endoftext_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->bos_id = -1;
+        vocab->eos_id = vocab->im_end_id;
+        vocab->system_id = -1;
+        vocab->user_id = -1;
+        vocab->assistant_id = -1;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
@@ -44282,6 +44642,10 @@ const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
                                    token_vec       *out) {
+    if (ds4_model_is_kolibri1()) {
+        /* the effort sentence renders inside the system block */
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
@@ -44347,12 +44711,151 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+/* Kolibri-1 chat rendering (released template).  Every prompt opens with a
+ * system block that always carries the "# Reasoning effort" sentence for the
+ * requested level; turns are <|im_start|>role\n…<|im_end|> with plain-text
+ * role names (the im / tool / think markers are added tokens, no role ids);
+ * consecutive tool results share one user turn wrapped in tool-response
+ * tags; thinking-enabled generation ends after "assistant\n" and the model
+ * opens its own think block, while disabled thinking force-closes an empty
+ * think block. */
+static const char *DS4_KOLIBRI_REASONING_DISABLED =
+    "Reasoning is disabled. Proceed straight to answering according "
+    "to the user's instructions.";
+static const char *DS4_KOLIBRI_REASONING_LOW =
+    "Reasoning effort is set to low. Think briefly through only the "
+    "essential steps in the user's language, then proceed directly "
+    "to the answer.";
+static const char *DS4_KOLIBRI_REASONING_MEDIUM =
+    "Reasoning effort is set to medium. Think through the task "
+    "methodically in the user's language, check key assumptions, and "
+    "provide a well-supported answer.";
+static const char *DS4_KOLIBRI_REASONING_HIGH =
+    "Reasoning effort is set to high. Think carefully through the task in "
+    "the user's language, validate key assumptions, consider plausible "
+    "alternatives, and prioritize correctness and clarity.";
+
+const char *ds4_kolibri_reasoning_effort_text(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE:    return DS4_KOLIBRI_REASONING_DISABLED;
+    case DS4_THINK_LOW:     return DS4_KOLIBRI_REASONING_LOW;
+    case DS4_THINK_MEDIUM:  return DS4_KOLIBRI_REASONING_MEDIUM;
+    case DS4_THINK_HIGH:
+    case DS4_THINK_MAX:     return DS4_KOLIBRI_REASONING_HIGH;
+    }
+    const int level = ds4_think_mode_level(mode);
+    /* Numeric level 0 is the flag spelling of --nothink. */
+    if (level == 0) return DS4_KOLIBRI_REASONING_DISABLED;
+    if (level < 0 || level > 100) return DS4_KOLIBRI_REASONING_HIGH;
+    if (level <= 33) return DS4_KOLIBRI_REASONING_LOW;
+    if (level <= 66) return DS4_KOLIBRI_REASONING_MEDIUM;
+    return DS4_KOLIBRI_REASONING_HIGH;
+}
+
+static void kolibri_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    char *role_line = xmalloc(strlen(role) + 2);
+    sprintf(role_line, "%s\n", role);
+    bpe_tokenize_text(vocab, role_line, out);
+    free(role_line);
+}
+
+static void kolibri_chat_close(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->im_end_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+/* The system body must be tokenized as ONE span so BPE merges across the
+ * section boundaries exactly like the reference encoder: the rendered text is
+ * content + "\n\n# Reasoning effort\n\n" + sentence (+ "\n\n" + tools), with
+ * no marker splits in between. */
+static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
+                                         token_vec *out);
+static void kolibri_chat_body(const ds4_vocab *vocab, const char *content,
+                              const char *effort, const char *tools,
+                              token_vec *out) {
+    const bool have_system = content && content[0];
+    const bool have_tools = tools && tools[0];
+    size_t n = (have_system ? strlen(content) : 0) +
+               (effort ? strlen(effort) + 24 : 0) +
+               (have_tools ? strlen(tools) + 2 : 0) + 1;
+    char *body = xmalloc(n);
+    size_t pos = 0;
+    if (have_system) {
+        size_t len = strlen(content);
+        memcpy(body + pos, content, len);
+        pos += len;
+    }
+    if (effort) {
+        if (have_system) {
+            body[pos++] = '\n';
+            body[pos++] = '\n';
+        }
+        memcpy(body + pos, "# Reasoning effort\n\n", 20);
+        pos += 20;
+        size_t len = strlen(effort);
+        memcpy(body + pos, effort, len);
+        pos += len;
+    }
+    if (have_tools) {
+        body[pos++] = '\n';
+        body[pos++] = '\n';
+        size_t len = strlen(tools);
+        memcpy(body + pos, tools, len);
+        pos += len;
+    }
+    body[pos] = '\0';
+    tokenize_rendered_chat_vocab(vocab, body, out);
+    free(body);
+}
+
+static void kolibri_chat_system(const ds4_vocab *vocab, const char *system,
+                                ds4_think_mode think_mode, token_vec *out) {
+    const char *effort = ds4_kolibri_reasoning_effort_text(think_mode);
+    kolibri_chat_open(vocab, "system", out);
+    kolibri_chat_body(vocab, system, effort, NULL, out);
+    kolibri_chat_close(vocab, out);
+}
+
+static void kolibri_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode think_mode,
+                                          token_vec *out) {
+    kolibri_chat_open(vocab, "assistant", out);
+    if (!ds4_think_mode_enabled(think_mode)) {
+        token_vec_push(out, vocab->think_start_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+        token_vec_push(out, vocab->think_end_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+    }
+}
+
+void ds4_chat_append_system_effort(ds4_engine *e, ds4_tokens *tokens, const char *system,
+                                   ds4_think_mode think_mode) {
+    /* Kolibri-1 folds the "# Reasoning effort" sentence into the first
+     * system block; the plain append path cannot know the think mode. */
+    if (ds4_model_is_kolibri1()) {
+        kolibri_chat_system(&e->vocab, system, think_mode, tokens);
+        return;
+    }
+    ds4_chat_append_message(e, tokens, "system", system);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_kolibri1()) {
+        if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+            ds4_die("this tokenizer does not provide the Kolibri chat markers; use raw prompt tokenization");
+        }
+        kolibri_chat_system(vocab, system, think_mode, out);
+        kolibri_chat_open(vocab, "user", out);
+        bpe_tokenize_text(vocab, prompt ? prompt : "", out);
+        kolibri_chat_close(vocab, out);
+        kolibri_chat_assistant_prefix(vocab, think_mode, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -44481,6 +44984,51 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
+/* Kolibri-1 tool results defer the user turn's <|im_end|> so consecutive
+ * results share one turn, as the released template renders them.  Openness is
+ * derived from the transcript content (the last <|im_start|> without a
+ * following <|im_end|>), because callers rebuild transcripts idempotently:
+ * the agent projects a candidate append to size it, then re-appends on the
+ * real transcript.  A per-call mutable flag would make those two renders
+ * disagree. */
+static bool kolibri_tool_turn_pending(const ds4_vocab *vocab, const token_vec *tokens) {
+    int32_t im_start = vocab->im_start_id;
+    if (im_start < 0) return false;
+    int open_at = -1;
+    for (int i = 0; i < tokens->len; i++) {
+        if (tokens->v[i] == im_start) open_at = i;
+        else if (open_at >= 0 && tokens->v[i] == vocab->im_end_id) open_at = -1;
+    }
+    return open_at >= 0;
+}
+
+/* Kolibri-1 renders the agent's tool definitions inside the same system block
+ * as the effort sentence, exactly as the released template does when the
+ * caller passes tools: after the system text and the "# Reasoning effort"
+ * sentence, a "# Tools" section carries each tool as one JSON object inside
+ * <tools></tools>, followed by the assistant-facing JSON-call instructions.
+ * `tools` is the pre-built section body (schemas + instructions), so the
+ * renderer stays byte-exact without re-deriving wording here. */
+void ds4_chat_append_system_effort_tools(ds4_engine *e, ds4_tokens *tokens,
+                                         const char *system,
+                                         ds4_think_mode think_mode,
+                                         const char *tools) {
+    if (!ds4_model_is_kolibri1()) {
+        /* Families that fold effort elsewhere still want the tools text. */
+        if (system && system[0]) ds4_chat_append_message(e, tokens, "system", system);
+        if (tools && tools[0]) ds4_chat_append_message(e, tokens, "system", tools);
+        return;
+    }
+    ds4_vocab *vocab = &e->vocab;
+    if (vocab->im_start_id < 0 || vocab->im_end_id < 0) {
+        ds4_die("this tokenizer does not provide the Kolibri chat markers; use raw prompt tokenization");
+    }
+    kolibri_chat_open(vocab, "system", tokens);
+    kolibri_chat_body(vocab, system, ds4_kolibri_reasoning_effort_text(think_mode),
+                      tools, tokens);
+    kolibri_chat_close(vocab, tokens);
+}
+
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     chat_push_bos_sequence(&e->vocab, tokens);
 }
@@ -44492,6 +45040,17 @@ void ds4_encode_chat_prompt(
         ds4_think_mode think_mode,
         ds4_tokens *out) {
     encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
+}
+
+/* Close the streamed assistant turn.  Kolibri-1's template ends each turn
+ * with <|im_end|> plus a newline; the other families push their EOS token
+ * bare, which is what the agent loop has always done. */
+void ds4_chat_append_assistant_turn_end(ds4_engine *e, ds4_tokens *tokens) {
+    if (ds4_model_is_kolibri1()) {
+        kolibri_chat_close(&e->vocab, tokens);
+        return;
+    }
+    ds4_tokens_push(tokens, ds4_token_eos(e));
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
@@ -44549,6 +45108,45 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (ds4_model_is_kolibri1()) {
+        /* Consecutive tool results share one user turn: the closing
+         * <|im_end|> is deferred until a non-tool message follows. */
+        if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            if (kolibri_tool_turn_pending(vocab, tokens)) {
+                bpe_tokenize_text(vocab, "\n", tokens);
+            } else {
+                kolibri_chat_open(vocab, "user", tokens);
+            }
+            token_vec_push(tokens, vocab->tool_response_start_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            bpe_tokenize_tool_response_text(vocab, content, tokens);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            token_vec_push(tokens, vocab->tool_response_end_id);
+            return;
+        }
+        if (kolibri_tool_turn_pending(vocab, tokens)) {
+            token_vec_push(tokens, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+        }
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            kolibri_chat_open(vocab, "system", tokens);
+            /* Rendered-chat tokenization: ds4-authored system text carries
+             * tool-call marker spellings that the released tokenizer maps to
+             * their added-token ids. */
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            kolibri_chat_close(vocab, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            kolibri_chat_open(vocab, "assistant", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            kolibri_chat_close(vocab, tokens);
+        } else {
+            kolibri_chat_open(vocab, "user", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+            kolibri_chat_close(vocab, tokens);
+        }
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
@@ -44616,6 +45214,14 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_kolibri1()) {
+        if (kolibri_tool_turn_pending(&e->vocab, tokens)) {
+            token_vec_push(tokens, e->vocab.im_end_id);
+            bpe_tokenize_text(&e->vocab, "\n", tokens);
+        }
+        kolibri_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -58285,7 +58891,8 @@ static int generate_glm_metal_argmax(
 }
 #endif
 
-static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
+/* Row dequantization for the CPU reference paths, shared by every MoE family. */
+static void ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
@@ -59758,7 +60365,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         float *dst = row + (uint64_t)t * hc_dim;
         const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
         if (img) memcpy(dst, img, E * sizeof(float));
-        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
+        else ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
         for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);
         g->host_pos3[(uint64_t)t * 4u + 3u] = 0;
@@ -60166,7 +60773,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const ds4_layer_weights *l = &w->layer[il];
     for (uint32_t t = 0; t < T; t++) {
         if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
+        ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
     }
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
@@ -60261,7 +60868,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
+    ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, emb_bytes) ||
         !glm_graph_begin_commands_if_needed()) return false;
     ds4_gpu_tensor *R_save = g->R;
@@ -60409,6 +61016,352 @@ static int generate_qwen4_metal_argmax(
     return 0;
 }
 
+#endif
+
+#ifdef DS4_HAS_KOLIBRI1_METAL
+/* ------------------------------------------------------------------------
+ * Kolibri-1 GPU graph.  The same shape as the CPU reference forward
+ * (kolibri1_forward_token_cpu): a plain residual stream, sandwich norms,
+ * GQA attention with per-head QK RMSNorm, RoPE on sliding layers only,
+ * and every layer a top-6 sigmoid-router MoE plus an unweighted shared
+ * expert.  One command batch per forward; f32 transients sized for
+ * cap_tokens rows so the same kernels serve decode (T=1) and chunked
+ * prefill.  Full layers keep K/V rows at absolute positions and attend
+ * 0..pos; sliding layers keep a ring of window + chunk rows (so the cache
+ * costs the window, not the context) and attend the last min(pos+1, window)
+ * rows, mirroring the CPU cache spans.
+ * --------------------------------------------------------------------- */
+
+typedef struct ds4_kolibri1_gpu_graph {
+    uint32_t ctx_cap;
+    uint32_t pos;
+    uint32_t cap_tokens;
+    uint32_t slide_rows; /* sliding K/V ring rows: min(ctx, window + chunk) */
+    bool owns_scratch;   /* false when the scratch is borrowed from the engine arena */
+    ds4_gpu_tensor *R, *x, *blk, *attn_o, *moe_out, *logits;
+    ds4_gpu_tensor *q, *kv;       /* [T][H*D] and [T][2*Hkv*D] projections */
+    ds4_gpu_tensor *attn_part;    /* split partials, decode-sized */
+    ds4_gpu_tensor *router, *selected, *rweights;
+    ds4_gpu_tensor *mid, *part;
+    ds4_gpu_tensor *layer_k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
+    float *host_row;
+} ds4_kolibri1_gpu_graph;
+
+/* Projections the graph accepts: the fixture is all F32, the released
+ * recipes carry Q8_0 attention/experts and an F16 or Q8_0 embedding. */
+static bool kolibri1_graph_dense_ok(const ds4_tensor *t) {
+    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 ||
+                 t->type == DS4_TENSOR_F32 || t->type == DS4_TENSOR_BF16);
+}
+
+/* The routed experts run through the shared qwen4 MoE kernels, so they accept
+ * the same expert types as the Qwen graph (and the same 256-wide block
+ * constraint for the K-quants). */
+static bool kolibri1_graph_expert_ok(const ds4_tensor *t) {
+    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
+                 t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
+                 ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
+                  (t->dim[0] % 256u) == 0));
+}
+
+static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
+    if (!kolibri1_graph_dense_ok(w->token_embd) || !kolibri1_graph_dense_ok(w->output)) {
+        fprintf(stderr, "ds4: Kolibri-1 GPU graph needs Q8_0/F16/BF16/F32 embedding and output weights\n");
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const ds4_tensor *dense[] = {
+            l->attn_q, l->attn_k, l->attn_v, l->attn_output,
+            l->ffn_gate_shexp, l->ffn_up_shexp, l->ffn_down_shexp,
+        };
+        for (size_t i = 0; i < sizeof(dense) / sizeof(dense[0]); i++) {
+            if (!kolibri1_graph_dense_ok(dense[i])) {
+                fprintf(stderr, "ds4: Kolibri-1 GPU graph: unsupported dense weight type %u in layer %u\n",
+                        dense[i] ? dense[i]->type : 0u, il);
+                return false;
+            }
+        }
+        if (!kolibri1_graph_expert_ok(l->ffn_gate_exps) ||
+            l->ffn_up_exps->type != l->ffn_gate_exps->type ||
+            !kolibri1_graph_expert_ok(l->ffn_down_exps)) {
+            fprintf(stderr, "ds4: Kolibri-1 GPU graph: unsupported routed-expert weight types in layer %u\n", il);
+            return false;
+        }
+        /* The expert row-dot walks 32-wide blocks, and the norms and rope
+         * staging want a float4-multiple head dimension. */
+        if (l->attn_q->dim[0] % 32u != 0 || l->attn_output->dim[0] % 32u != 0) {
+            fprintf(stderr, "ds4: Kolibri-1 GPU graph needs projection widths divisible by 32\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Transients a session can borrow from the engine arena.  The per-session
+ * K/V rings and the logits row are not in the list. */
+#define DS4_KOLIBRI1_SCRATCH_FIELDS(X) \
+    X(R) X(x) X(blk) X(attn_o) X(moe_out) X(q) X(kv) X(attn_part) \
+    X(router) X(selected) X(rweights) X(mid) X(part)
+
+static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
+    if (!g) return;
+    if (g->owns_scratch) {
+#define DS4_KOLIBRI1_SCRATCH_FREE(field_) ds4_gpu_tensor_free(g->field_);
+        DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_FREE)
+#undef DS4_KOLIBRI1_SCRATCH_FREE
+        free(g->host_row);
+    }
+    /* The logits row and the K/V rings are always private to the session. */
+    ds4_gpu_tensor_free(g->logits);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_k_cache[il]);
+        ds4_gpu_tensor_free(g->layer_v_cache[il]);
+        g->layer_k_cache[il] = NULL;
+        g->layer_v_cache[il] = NULL;
+    }
+    g->host_row = NULL;
+    memset(g, 0, sizeof(*g));
+}
+
+/* Move the transients out of the first session and into the engine, which
+ * then outlives every session and lends them to the next ones.  The session
+ * keeps using the same buffers; only ownership moves. */
+static void kolibri1_graph_transfer_scratch(ds4_kolibri1_gpu_graph *dst, ds4_kolibri1_gpu_graph *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->ctx_cap = src->ctx_cap;
+    dst->cap_tokens = src->cap_tokens;
+    dst->slide_rows = src->slide_rows;
+#define DS4_KOLIBRI1_SCRATCH_TAKE(field_) dst->field_ = src->field_;
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_TAKE)
+#undef DS4_KOLIBRI1_SCRATCH_TAKE
+    dst->host_row = src->host_row;
+    dst->owns_scratch = true;
+    src->owns_scratch = false;
+}
+
+static uint64_t kolibri1_graph_scratch_bytes(const ds4_kolibri1_gpu_graph *g) {
+    uint64_t total = 0;
+#define DS4_KOLIBRI1_SCRATCH_COUNT(field_) total += ds4_gpu_tensor_bytes(g->field_);
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_COUNT)
+#undef DS4_KOLIBRI1_SCRATCH_COUNT
+    return total;
+}
+
+static ds4_gpu_tensor *kolibri1_graph_alloc_f32(uint64_t n) {
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(n * sizeof(float));
+    if (t) ds4_gpu_tensor_fill_f32(t, 0.0f, n);
+    return t;
+}
+
+static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w,
+                                 uint32_t ctx_cap, uint32_t cap_tokens,
+                                 const ds4_kolibri1_gpu_graph *shared) {
+    memset(g, 0, sizeof(*g));
+    if (!kolibri1_graph_weights_supported(w)) return false;
+    const uint64_t E = DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    g->ctx_cap = ctx_cap;
+    g->cap_tokens = cap_tokens;
+    /* Sliding layers hold only the window plus the in-flight chunk: a token
+     * attends the last DS4_N_SWA rows, and the current batch stages its rows
+     * before the attention runs, so no two positions within one window plus
+     * chunk collide modulo this ring.  Contexts shorter than that never wrap. */
+    g->slide_rows = DS4_N_SWA + cap_tokens;
+    if (g->slide_rows > ctx_cap) g->slide_rows = ctx_cap;
+
+    bool ok = true;
+    g->owns_scratch = shared == NULL;
+#define KOLIBRI1_ALLOC(field_, n_) do { g->field_ = kolibri1_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
+    if (shared) {
+#define KOLIBRI1_BORROW(field_) g->field_ = shared->field_;
+        KOLIBRI1_BORROW(R) KOLIBRI1_BORROW(x) KOLIBRI1_BORROW(blk) KOLIBRI1_BORROW(attn_o)
+        KOLIBRI1_BORROW(moe_out) KOLIBRI1_BORROW(q) KOLIBRI1_BORROW(kv) KOLIBRI1_BORROW(attn_part)
+        KOLIBRI1_BORROW(router) KOLIBRI1_BORROW(selected) KOLIBRI1_BORROW(rweights)
+        KOLIBRI1_BORROW(mid) KOLIBRI1_BORROW(part)
+#undef KOLIBRI1_BORROW
+        g->host_row = shared->host_row;
+        goto private_state;
+    }
+    KOLIBRI1_ALLOC(R, cap_tokens * E);
+    KOLIBRI1_ALLOC(x, cap_tokens * E);
+    KOLIBRI1_ALLOC(blk, cap_tokens * E);
+    KOLIBRI1_ALLOC(attn_o, cap_tokens * q_dim);
+    KOLIBRI1_ALLOC(moe_out, cap_tokens * E);
+    KOLIBRI1_ALLOC(q, cap_tokens * q_dim);
+    KOLIBRI1_ALLOC(kv, cap_tokens * 2u * kv_dim);
+    KOLIBRI1_ALLOC(attn_part, ds4_gpu_kolibri_attn_part_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    KOLIBRI1_ALLOC(router, cap_tokens * DS4_N_EXPERT);
+    KOLIBRI1_ALLOC(selected, cap_tokens * DS4_N_EXPERT_USED);
+    KOLIBRI1_ALLOC(rweights, cap_tokens * DS4_N_EXPERT_USED);
+    KOLIBRI1_ALLOC(mid, cap_tokens * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP);
+    KOLIBRI1_ALLOC(part, cap_tokens * (DS4_N_EXPERT_USED + 1u) * E);
+    g->host_row = xmalloc((size_t)cap_tokens * E * sizeof(float));
+    ok = ok && g->host_row;
+
+private_state:
+    /* The logits belong to the caller that reads them back. */
+    KOLIBRI1_ALLOC(logits, DS4_N_VOCAB);
+#undef KOLIBRI1_ALLOC
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        /* Full layers keep one row per absolute position; sliding layers a
+         * ring of window + chunk rows (see slide_rows). */
+        const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? ctx_cap : g->slide_rows;
+        g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * sizeof(float));
+        g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * sizeof(float));
+        ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il];
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: Kolibri-1 graph allocation failed (ctx %u)\n", ctx_cap);
+        kolibri1_graph_free(g);
+        return false;
+    }
+    return true;
+}
+
+static void kolibri1_graph_reset(ds4_kolibri1_gpu_graph *g) {
+    if (!g) return;
+    g->pos = 0;
+}
+
+/* One dense projection of the same weight for n_tok rows. */
+static bool kolibri1_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                          const ds4_gpu_tensor *x, uint32_t n_tok) {
+    const uint64_t in_dim = w->dim[0], out_dim = w->ndim >= 2 ? w->dim[1] : 1u;
+    return metal_graph_matmul_plain_tensor(out, m, w, in_dim, out_dim, x, n_tok);
+}
+
+/* Attention sublayer: q/k/v projections, per-head QK norm + rope into the
+ * f32 caches, span attention, output projection.  The output lands in blk;
+ * the caller norms it against post_attn_norm and folds it into R. */
+static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
+                                     const ds4_layer_weights *l, uint32_t il,
+                                     uint32_t pos0, uint32_t T) {
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint32_t full = ds4_kolibri1_layer_is_full(il);
+    const uint32_t cache_rows = full ? 0u : g->slide_rows;
+    ds4_gpu_tensor *kproj = ds4_gpu_tensor_view(g->kv, 0, (uint64_t)T * kv_dim * sizeof(float));
+    ds4_gpu_tensor *vproj = ds4_gpu_tensor_view(g->kv, (uint64_t)T * kv_dim * sizeof(float),
+                                                (uint64_t)T * kv_dim * sizeof(float));
+    if (!kproj || !vproj) {
+        ds4_gpu_tensor_free(kproj);
+        ds4_gpu_tensor_free(vproj);
+        return false;
+    }
+    bool ok = kolibri1_gemv(g->q, m, l->attn_q, g->x, T) &&
+              kolibri1_gemv(kproj, m, l->attn_k, g->x, T) &&
+              kolibri1_gemv(vproj, m, l->attn_v, g->x, T) &&
+              ds4_gpu_kolibri_attn_prep_tensor(g->q, g->layer_k_cache[il], g->layer_v_cache[il],
+                                               g->q, kproj, vproj, m->map, m->size,
+                                               l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                               T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                               pos0, cache_rows, full ? 0u : 1u,
+                                               DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
+              ds4_gpu_kolibri_attn_decode_tensor(g->attn_o, g->q, g->layer_k_cache[il], g->layer_v_cache[il],
+                                                 T <= 2u ? g->attn_part : NULL, T,
+                                                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0,
+                                                 full ? 0u : DS4_N_SWA, cache_rows,
+                                                 1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
+              kolibri1_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+    ds4_gpu_tensor_free(kproj);
+    ds4_gpu_tensor_free(vproj);
+    return ok;
+}
+
+/* Every layer's MLP: sigmoid router with expert bias, per-(token, slot)
+ * expert matvecs, the shared expert as an extra slot, and the weighted sum
+ * (shared unweighted, matching the CPU reference exactly). */
+static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
+                               const ds4_layer_weights *l, uint32_t T) {
+    const uint32_t slots = DS4_N_EXPERT_USED;
+    bool ok = kolibri1_gemv(g->router, m, l->ffn_gate_inp, g->x, T) &&
+              ds4_gpu_kolibri_router_topk_tensor(g->selected, g->rweights, g->router,
+                                                 l->ffn_exp_probs_b->abs_offset, m->map, m->size,
+                                                 T, DS4_N_EXPERT, slots,
+                                                 DS4_EXPERT_WEIGHT_SCALE) &&
+              ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
+                                           l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+                                           l->ffn_gate_exps->type, DS4_N_EXPERT, T, slots,
+                                           DS4_N_EMBD, DS4_N_FF_EXP,
+                                           l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                                           l->ffn_gate_shexp->type) &&
+              ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size,
+                                            l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
+                                            DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
+                                            l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) &&
+              ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
+    return ok;
+}
+
+/* Embeddings are staged on the host like the Qwen graph does: one ref_row
+ * per token from the mmap, then one write into R. */
+static bool kolibri1_graph_stage_inputs(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
+                                        const ds4_weights *w, const int *tokens, uint32_t T) {
+    for (uint32_t t = 0; t < T; t++) {
+        ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * DS4_N_EMBD);
+    }
+    return ds4_gpu_tensor_write(g->R, 0, g->host_row, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
+}
+
+/* Forward T tokens at pos0.  Norms run in-place through x as scratch: each
+ * sandwich norm normalizes its sublayer output, adds it to R, and the next
+ * pre-norm reads R again — the exact CPU reference order. */
+static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                          const int *tokens, uint32_t T, float *logits_out) {
+    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: Kolibri-1 token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+    }
+    const uint32_t pos0 = g->pos;
+    if (!kolibri1_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
+                                                         l->attn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS);
+        if (!kolibri1_graph_attention(g, m, l, il, pos0, T)) { ok = false; break; }
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->blk, m->map, m->size,
+                                                         l->post_attn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS) &&
+                     ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
+                                                         l->ffn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS);
+        if (ok) ok = kolibri1_graph_moe(g, m, l, T);
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->moe_out, m->map, m->size,
+                                                         l->post_ffn_norm->abs_offset,
+                                                         DS4_N_EMBD, T, DS4_RMS_EPS) &&
+                     ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
+    }
+    /* Final norm and head on the last row; callers read one logit row. */
+    if (ok) {
+        ds4_gpu_tensor *last_R = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * DS4_N_EMBD * sizeof(float),
+                                                     (uint64_t)DS4_N_EMBD * sizeof(float));
+        ok = last_R &&
+             ds4_gpu_rms_norm_weight_tensor(g->x, last_R, m->map, m->size,
+                                            w->output_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS);
+        if (ok) ok = kolibri1_gemv(g->logits, m, w->output, g->x, 1);
+        ds4_gpu_tensor_free(last_R);
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok && logits_out) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok) g->pos += T;
+    return ok;
+}
+
+static bool kolibri1_graph_forward_token(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                         int token, float *logits_out) {
+    return kolibri1_graph_forward_tokens(g, m, w, &token, 1, logits_out);
+}
 #endif
 
 #ifndef DS4_NO_GPU
@@ -61364,6 +62317,10 @@ struct ds4_session {
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    ds4_kolibri1_gpu_graph kolibri_gpu;
+    bool kolibri_graph_ready;
+#endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
      * pending point-mass draft; sampled decoding discards a draft when its
@@ -61391,6 +62348,8 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    ds4_kolibri1_kv kolibri1_cpu;
+    ds4_kolibri1_cpu_scratch kolibri1_cpu_scratch;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -62384,6 +63343,16 @@ static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
 }
 
+static bool ds4_session_is_kolibri1(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_kolibri1();
+}
+
+/* Kolibri-1 sessions run the dedicated Metal graph; the CPU branch above
+ * already handled the CPU backend before this is consulted. */
+static bool ds4_session_kolibri_uses_gpu(const ds4_session *s) {
+    return ds4_session_is_kolibri1(s) && !ds4_session_is_cpu(s);
+}
+
 #ifndef DS4_NO_GPU
 static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     if (!s) return;
@@ -62477,6 +63446,7 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 static void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
+    s->kolibri1_cpu.filled = 0;
 }
 
 static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_end) {
@@ -62490,6 +63460,7 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
+    if (ds4_session_is_kolibri1(s)) return 0;
     if (ds4_session_is_cpu(s)) return 0;
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU
@@ -62559,6 +63530,10 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
+        return 1;
+    }
+    if (ds4_session_is_kolibri1(s)) {
+        payload_set_err(err, errlen, "distributed layer payloads are not supported for Kolibri-1");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -62827,6 +63802,10 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
+        return 1;
+    }
+    if (ds4_session_is_kolibri1(s)) {
+        payload_set_err(err, errlen, "distributed layer payloads are not supported for Kolibri-1");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -63589,6 +64568,270 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
     return rc;
 }
 #endif
+
+/* Kolibri-1 session payload: header, checkpoint tokens, logits, then the live
+ * K/V rows of every layer in logical position order.  The GPU graph keeps
+ * full-layer rows at absolute positions and a sliding ring (row = pos %
+ * slide_rows); the CPU reference keeps full layers absolute and slides a
+ * compacted window.  Storing logical rows lets the loader rebuild whichever
+ * physical layout the current session uses.  A zero slide_rows header field
+ * marks the CPU layout, so a ring payload is never restored as a compacted
+ * window or the reverse.  The header's tag keeps payloads from other
+ * families out and the geometry fields reject shape mismatches. */
+#define DS4_KOLIBRI1_PAYLOAD_TAG UINT32_C(0x4b314b02) /* "K1K2" little-endian */
+
+static uint32_t kolibri1_payload_live_rows(bool full, uint32_t tokens,
+                                           uint32_t ctx_rows, uint32_t slide_rows) {
+    const uint32_t rows = full ? ctx_rows : slide_rows;
+    return tokens < rows ? tokens : rows;
+}
+
+static uint64_t kolibri1_payload_body_bytes(const ds4_session *s, uint32_t tokens) {
+    uint32_t ctx_rows = s->kolibri1_cpu.ctx;
+    uint32_t slide_rows = DS4_N_SWA;
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_session_kolibri_uses_gpu(s)) {
+        ctx_rows = s->kolibri_gpu.ctx_cap;
+        slide_rows = s->kolibri_gpu.slide_rows;
+    }
+#endif
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    uint64_t bytes = (uint64_t)tokens * sizeof(uint32_t) +
+                     (uint64_t)DS4_N_VOCAB * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t live = kolibri1_payload_live_rows(ds4_kolibri1_layer_is_full(il),
+                                                         tokens, ctx_rows, slide_rows);
+        bytes += (uint64_t)live * kv_row * 2u;
+    }
+    return bytes;
+}
+
+static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    const bool gpu = ds4_session_kolibri_uses_gpu(s);
+    const uint32_t tokens = (uint32_t)s->checkpoint.len;
+    uint32_t ctx_rows = s->kolibri1_cpu.ctx;
+    uint32_t slide_rows = DS4_N_SWA;
+    uint32_t saved_slide = 0;
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (!s->kolibri_graph_ready || s->kolibri_gpu.pos != tokens) {
+            payload_set_err(err, errlen, "Kolibri-1 graph has no complete frontier to save");
+            return 1;
+        }
+        if (ds4_gpu_synchronize() == 0) {
+            payload_set_err(err, errlen, "failed to synchronize accelerator before Kolibri-1 snapshot");
+            return 1;
+        }
+        ctx_rows = s->kolibri_gpu.ctx_cap;
+        slide_rows = s->kolibri_gpu.slide_rows;
+        saved_slide = slide_rows;
+#else
+        payload_set_err(err, errlen, "graph backend support is not compiled in");
+        return 1;
+#endif
+    } else if (!s->kolibri1_cpu.ctx || s->kolibri1_cpu.filled != tokens) {
+        payload_set_err(err, errlen, "Kolibri-1 CPU cache has no complete frontier to save");
+        return 1;
+    }
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        (uint32_t)s->ctx_size,
+        s->prefill_cap,
+        ctx_rows,
+        saved_slide,
+        DS4_N_SWA,
+        tokens,
+        DS4_N_LAYER,
+        DS4_N_HEAD_DIM,
+        DS4_N_HEAD_KV,
+        DS4_N_VOCAB,
+        DS4_KOLIBRI1_PAYLOAD_TAG,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    }
+    for (int i = 0; i < s->checkpoint.len; i++) {
+        if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
+    }
+    if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
+
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const bool full = ds4_kolibri1_layer_is_full(il);
+        const uint32_t live = kolibri1_payload_live_rows(full, tokens, ctx_rows, slide_rows);
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (gpu) {
+            const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
+            for (uint32_t r = 0; rc == 0 && r < live; r++) {
+                const uint32_t pos = tokens - live + r;
+                const uint32_t phys = full ? pos : pos % slide_rows;
+                const uint64_t offset = (uint64_t)phys * kv_row;
+                rc = payload_write_tensor_span(fp, g->layer_k_cache[il], offset, kv_row,
+                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) {
+                    rc = payload_write_tensor_span(fp, g->layer_v_cache[il], offset, kv_row,
+                                                   buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                }
+            }
+            continue;
+        }
+#endif
+        const ds4_kolibri1_kv_layer *layer = &s->kolibri1_cpu.layer[il];
+        rc = payload_write_bytes(fp, layer->k, (uint64_t)live * kv_row, err, errlen);
+        if (rc == 0) {
+            rc = payload_write_bytes(fp, layer->v, (uint64_t)live * kv_row, err, errlen);
+        }
+    }
+    free(buf);
+    return rc;
+}
+
+static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
+                                 uint64_t *remaining, char *err, size_t errlen) {
+    const bool gpu = ds4_session_kolibri_uses_gpu(s);
+    const uint32_t saved_ctx = h[2];
+    const uint32_t saved_ctx_rows = h[4];
+    const uint32_t saved_slide = h[5];
+    const uint32_t saved_tokens = h[7];
+    if (h[12] != DS4_KOLIBRI1_PAYLOAD_TAG || h[6] != DS4_N_SWA ||
+        h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
+        h[10] != DS4_N_HEAD_KV || h[11] != DS4_N_VOCAB) {
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (saved_ctx > (uint32_t)s->ctx_size || saved_tokens >= (uint32_t)s->ctx_size ||
+        saved_ctx_rows == 0 || saved_ctx_rows > saved_ctx ||
+        saved_tokens > saved_ctx_rows) {
+        payload_set_err(err, errlen, "KV checkpoint does not fit current context");
+        return 1;
+    }
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
+        /* A ring smaller than the window is only valid when the context
+         * itself is smaller than the window (all positions fit, so the file
+         * covers the whole history). */
+        const bool ring_ok = saved_ctx_rows <= DS4_N_SWA
+            ? saved_slide == saved_ctx_rows
+            : saved_slide > DS4_N_SWA;
+        if (!s->kolibri_graph_ready || !ring_ok ||
+            kolibri1_payload_live_rows(false, saved_tokens, saved_ctx_rows, saved_slide) >
+                g->slide_rows) {
+            payload_set_err(err, errlen, "KV checkpoint Kolibri-1 ring layout does not match current runtime");
+            return 1;
+        }
+#else
+        payload_set_err(err, errlen, "graph backend support is not compiled in");
+        return 1;
+#endif
+    } else if (saved_slide != 0 || !s->kolibri1_cpu.ctx) {
+        payload_set_err(err, errlen, saved_slide != 0
+            ? "KV checkpoint was written by the Kolibri-1 GPU runtime"
+            : "Kolibri-1 CPU cache is not initialized");
+        return 1;
+    }
+    /* The CPU layout has no ring field; its sliding layers hold one window. */
+    const uint32_t load_slide = gpu ? saved_slide : DS4_N_SWA;
+
+    token_vec new_checkpoint = {0};
+    for (uint32_t i = 0; i < saved_tokens; i++) {
+        uint32_t token = 0;
+        if (payload_read_u32(fp, &token, remaining, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (token >= DS4_N_VOCAB) {
+            token_vec_free(&new_checkpoint);
+            payload_set_err(err, errlen, "invalid Kolibri-1 snapshot token");
+            return 1;
+        }
+        token_vec_push(&new_checkpoint, (int)token);
+    }
+    /* From the first write onward, failure must leave no reusable checkpoint. */
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+                           remaining, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        s->checkpoint.len = 0;
+        return 1;
+    }
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (ds4_gpu_synchronize() == 0) {
+            token_vec_free(&new_checkpoint);
+            s->checkpoint.len = 0;
+            payload_set_err(err, errlen, "failed to synchronize accelerator before Kolibri-1 restore");
+            return 1;
+        }
+#endif
+    }
+    const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = 0;
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        const bool full = ds4_kolibri1_layer_is_full(il);
+        const uint32_t live = kolibri1_payload_live_rows(full, saved_tokens,
+                                                         saved_ctx_rows, load_slide);
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (gpu) {
+            ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
+            for (uint32_t r = 0; rc == 0 && r < live; r++) {
+                const uint32_t pos = saved_tokens - live + r;
+                const uint32_t phys = full ? pos : pos % g->slide_rows;
+                const uint64_t offset = (uint64_t)phys * kv_row;
+                rc = payload_read_tensor_span(fp, g->layer_k_cache[il], offset, kv_row,
+                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0) {
+                    rc = payload_read_tensor_span(fp, g->layer_v_cache[il], offset, kv_row,
+                                                  buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                }
+            }
+            continue;
+        }
+#endif
+        ds4_kolibri1_kv_layer *layer = &s->kolibri1_cpu.layer[il];
+        rc = payload_read_bytes(fp, layer->k, (uint64_t)live * kv_row, remaining, err, errlen);
+        if (rc == 0) {
+            rc = payload_read_bytes(fp, layer->v, (uint64_t)live * kv_row, remaining, err, errlen);
+        }
+    }
+    free(buf);
+    if (rc == 0 && *remaining != 0) {
+        payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
+        rc = 1;
+    }
+    if (rc != 0) {
+        token_vec_free(&new_checkpoint);
+        s->checkpoint.len = 0;
+        ds4_session_dspark_capture_invalidate(s);
+        if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+            kolibri1_graph_reset(&s->kolibri_gpu);
+#endif
+        } else {
+            s->kolibri1_cpu.filled = 0;
+        }
+        return 1;
+    }
+    if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        s->kolibri_gpu.pos = saved_tokens;
+#endif
+    } else {
+        s->kolibri1_cpu.filled = saved_tokens;
+    }
+    token_vec_free(&s->checkpoint);
+    s->checkpoint = new_checkpoint;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_invalidate(s);
+    return 0;
+}
+
 #ifdef DS4_HAS_QWEN4_GPU
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
@@ -63619,6 +64862,22 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
                ds41_payload_body_bytes(&s->ds41_graph, (uint32_t)s->checkpoint.len);
     }
 #endif
+    if (ds4_session_is_kolibri1(s)) {
+        const bool gpu = ds4_session_kolibri_uses_gpu(s);
+        if (gpu) {
+#ifdef DS4_HAS_KOLIBRI1_METAL
+            if (!s->kolibri_graph_ready ||
+                s->kolibri_gpu.pos != (uint32_t)s->checkpoint.len) return 0;
+#else
+            return 0;
+#endif
+        } else if (!s->kolibri1_cpu.ctx ||
+                   s->kolibri1_cpu.filled != (uint32_t)s->checkpoint.len) {
+            return 0;
+        }
+        return (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+               kolibri1_payload_body_bytes(s, (uint32_t)s->checkpoint.len);
+    }
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -64004,6 +65263,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
+    if (ds4_session_is_kolibri1(s)) return kolibri1_save_payload(s, fp, err, errlen);
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -64391,6 +65651,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
+    if (ds4_session_is_kolibri1(s)) return kolibri1_load_payload(s, fp, h, &remaining, err, errlen);
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -65088,8 +66349,9 @@ int ds4_dump_chat_tokenization(const char *model_path,
     model_open(&model, model_path, false, false);
     config_validate_model(&model);
     if (ds4_think_mode_level(think_mode) >= 0 &&
-        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
-        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        !ds4_model_is_kolibri1()) {
+        fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 or Kolibri-1 model\n");
         model_close(&model);
         return 2;
     }
@@ -65723,7 +66985,8 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) ||
+        ds4_session_is_kolibri1(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -66181,6 +67444,77 @@ static int ds4_session_eval_splitkv_spec_after_first(
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+/* Greedy generation through a session.  Sessions drive the family-appropriate
+ * backend, and they are the only working Kolibri-1 CPU path: the raw-wa
+ * helpers below are DeepSeek layer-major code.  Kept outside the GPU guard so
+ * CPU-only builds can use it too. */
+static int generate_session_argmax(
+        ds4_engine        *e,
+        const ds4_tokens  *prompt,
+        int                n_predict,
+        int                ctx_size,
+        ds4_token_emit_fn  emit,
+        ds4_generation_done_fn done,
+        void              *emit_ud,
+        ds4_session_progress_fn progress,
+        void              *progress_ud) {
+    ds4_session *s = NULL;
+    char err[256] = {0};
+    const double t_prefill0 = now_sec();
+    if (ds4_session_create(&s, e, ctx_size) != 0) {
+        fprintf(stderr, "ds4: failed to create the generation session\n");
+        return 1;
+    }
+    ds4_session_set_progress(s, progress, progress_ud);
+    if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(s, NULL, NULL);
+        fprintf(stderr, "ds4: session prefill failed: %s\n", err);
+        ds4_session_free(s);
+        return 1;
+    }
+    ds4_session_set_progress(s, NULL, NULL);
+    const double t_prefill1 = now_sec();
+
+    int rc = 0;
+    int n_generated = 0;
+    const double t_decode0 = now_sec();
+    const char *greedy_env = getenv("DS4_CUDA_GREEDY_TOP1");
+    const bool greedy_top1 = !greedy_env || !greedy_env[0] || strcmp(greedy_env, "0") != 0;
+    int token = ds4_session_argmax(s);
+    for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
+        if (token < 0) {
+            fprintf(stderr, "ds4: session argmax failed\n");
+            rc = 1;
+            break;
+        }
+        if (ds4_token_is_stop(e, token)) break;
+        if (emit) emit(emit_ud, token);
+        n_generated++;
+        if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
+        if (greedy_top1) {
+            token = ds4_session_eval_argmax(s, token, err, sizeof(err));
+        } else if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
+            token = ds4_session_argmax(s);
+        } else {
+            token = -1;
+        }
+        if (token < 0) {
+            fprintf(stderr, "ds4: session decode failed: %s\n", err);
+            rc = 1;
+            break;
+        }
+    }
+    const double t_decode1 = now_sec();
+    if (done) done(emit_ud);
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+            (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
+            (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
+    ds4_session_free(s);
+    return rc;
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -66202,61 +67536,10 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
-            ds4_session *s = NULL;
-            char err[256] = {0};
-            const double t_prefill0 = now_sec();
-            if (ds4_session_create(&s, e, ctx_size) != 0) {
-                fprintf(stderr, "ds4: failed to create multi-tier graph session\n");
-                return 1;
-            }
-            ds4_session_set_progress(s, progress, progress_ud);
-            if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
-                ds4_session_set_progress(s, NULL, NULL);
-                fprintf(stderr, "ds4: multi-tier prefill failed: %s\n", err);
-                ds4_session_free(s);
-                return 1;
-            }
-            ds4_session_set_progress(s, NULL, NULL);
-            const double t_prefill1 = now_sec();
-
-            int rc = 0;
-            int n_generated = 0;
-            const double t_decode0 = now_sec();
-            const bool greedy_top1 = metal_graph_tp_env_flag("DS4_CUDA_GREEDY_TOP1", true);
-            int token = ds4_session_argmax(s);
-            for (int i = 0; i < n_predict && ds4_session_pos(s) < ctx_size; i++) {
-                if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier argmax failed\n");
-                    rc = 1;
-                    break;
-                }
-                if (ds4_token_is_stop(e, token)) break;
-                if (emit) emit(emit_ud, token);
-                n_generated++;
-                if (i == n_predict - 1 || ds4_session_pos(s) + 1 >= ctx_size) break;
-                if (greedy_top1) {
-                    token = ds4_session_eval_argmax(s, token, err, sizeof(err));
-                } else if (ds4_session_eval(s, token, err, sizeof(err)) == 0) {
-                    token = ds4_session_argmax(s);
-                } else {
-                    token = -1;
-                }
-                if (token < 0) {
-                    fprintf(stderr, "ds4: multi-tier decode failed: %s\n", err);
-                    rc = 1;
-                    break;
-                }
-            }
-            const double t_decode1 = now_sec();
-            if (done) done(emit_ud);
-            ds4_log(stderr,
-                    DS4_LOG_TIMING,
-                    "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
-                    (t_prefill1 - t_prefill0) > 0.0 ? (double)prompt->len / (t_prefill1 - t_prefill0) : 0.0,
-                    (t_decode1 - t_decode0) > 0.0 ? (double)n_generated / (t_decode1 - t_decode0) : 0.0);
-            ds4_session_free(s);
-            return rc;
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1) {
+            return generate_session_argmax(e, prompt, n_predict, ctx_size,
+                                           emit, done, emit_ud, progress, progress_ud);
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
                                             n_predict, ctx_size, e->quality,
@@ -66277,6 +67560,14 @@ int ds4_engine_generate_argmax(
                 ds4_backend_name(e->backend));
         return 1;
 #endif
+    }
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_KOLIBRI1) {
+        /* The raw-wa CPU path is DeepSeek layer-major code; route Kolibri-1
+         * through a session, whose prefill and decode call the Kolibri CPU
+         * reference forward. */
+        return generate_session_argmax(e, prompt, n_predict, ctx_size,
+                                       emit, done, emit_ud, progress, progress_ud);
     }
 
     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
@@ -68142,7 +69433,7 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
  * gammas except ssm_norm are folded to 1+w, ssm_a holds -exp(A_log).
  * --------------------------------------------------------------------- */
 
-static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
+static void ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
     case DS4_TENSOR_F32:
@@ -68276,7 +69567,7 @@ static void qwen4_ref_matvec_rows(
     const uint64_t n = w->dim[0];
     float *row = xmalloc(n * sizeof(float));
     for (uint64_t r = 0; r < n_rows; r++) {
-        qwen4_ref_row(m, w, row0 + r, row);
+        ref_row(m, w, row0 + r, row);
         double acc = 0.0;
         for (uint64_t i = 0; i < n; i++) acc += (double)row[i] * x[i];
         out[r] = (float)acc;
@@ -68288,8 +69579,8 @@ static void qwen4_ref_matvec(const ds4_model *m, const ds4_tensor *w, const floa
     qwen4_ref_matvec_rows(m, w, 0, w->ndim >= 2 ? w->dim[1] : 1u, x, out);
 }
 
-static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t) {
-    if (t->type != DS4_TENSOR_F32) ds4_die("qwen4 reference: expected an F32 tensor");
+static const float *ref_f32(const ds4_model *m, const ds4_tensor *t) {
+    if (t->type != DS4_TENSOR_F32) ds4_die("CPU reference: expected an F32 tensor");
     return (const float *)tensor_data(m, t);
 }
 
@@ -68379,7 +69670,7 @@ static void qwen4_ref_hc_mix(
     float *xn = xmalloc(hc_dim * sizeof(float));
     float *lo = xmalloc(rank * sizeof(float));
     float *gate = xmalloc(hc_dim * sizeof(float));
-    qwen4_ref_grouped_rms(xn, R, qwen4_ref_f32(m, norm), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(xn, R, ref_f32(m, norm), hc, E, DS4_RMS_EPS);
     qwen4_ref_matvec(m, down, xn, lo);
     for (uint32_t r = 0; r < rank; r++) lo[r] = silu(lo[r] / (float)hc);
     qwen4_ref_matvec(m, up, lo, gate);
@@ -68450,8 +69741,8 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
     float *gated = xmalloc(hc_dim * sizeof(float));
     float *normed = xmalloc(hc_dim * sizeof(float));
     qwen4_ref_matvec(m, l->ple_key, emb, key);
-    qwen4_ref_grouped_rms(keyn, key, qwen4_ref_f32(m, l->ple_norm_key), hc, E, DS4_RMS_EPS);
-    qwen4_ref_grouped_rms(query, R, qwen4_ref_f32(m, l->ple_norm_query), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(keyn, key, ref_f32(m, l->ple_norm_key), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(query, R, ref_f32(m, l->ple_norm_query), hc, E, DS4_RMS_EPS);
     qwen4_ref_matvec(m, l->ple_value, emb, value);
     for (uint32_t s = 0; s < hc; s++) {
         double dot = 0.0;
@@ -68461,17 +69752,17 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
         g = sigmoid_stable(g > 0.0f ? mag : (g < 0.0f ? -mag : 0.0f));
         for (uint32_t d = 0; d < E; d++) gated[s * E + d] = g * value[d];
     }
-    qwen4_ref_grouped_rms(normed, gated, qwen4_ref_f32(m, l->ple_norm_conv), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(normed, gated, ref_f32(m, l->ple_norm_conv), hc, E, DS4_RMS_EPS);
 
     /* depthwise conv, kernel K dilated by the n-gram size: tap k reads (K-1-k)*dil back */
     float *cw_f16 = NULL;
     const float *cw;
     if (l->ple_conv->type == DS4_TENSOR_F16) {
         cw_f16 = xmalloc((size_t)hc_dim * DS4_N_PLE_CONV * sizeof(float));
-        for (uint32_t c = 0; c < hc_dim; c++) qwen4_ref_row(m, l->ple_conv, c, cw_f16 + (uint64_t)c * DS4_N_PLE_CONV);
+        for (uint32_t c = 0; c < hc_dim; c++) ref_row(m, l->ple_conv, c, cw_f16 + (uint64_t)c * DS4_N_PLE_CONV);
         cw = cw_f16;
     } else {
-        cw = qwen4_ref_f32(m, l->ple_conv);
+        cw = ref_f32(m, l->ple_conv);
     }
     for (uint32_t c = 0; c < hc_dim; c++) {
         double acc = 0.0;
@@ -68505,7 +69796,7 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
     qwen4_ref_matvec(m, l->lin_alpha, x, a);
 
     float *hist = st->lin_hist + (uint64_t)il * (K - 1u) * conv_dim;
-    const float *cw = qwen4_ref_f32(m, l->lin_conv);
+    const float *cw = ref_f32(m, l->lin_conv);
     for (uint32_t c = 0; c < conv_dim; c++) {
         double acc = (double)cw[(uint64_t)c * K + (K - 1u)] * qkv[c];
         for (uint32_t k = 0; k + 1u < K; k++) acc += (double)cw[(uint64_t)c * K + k] * hist[(uint64_t)k * conv_dim + c];
@@ -68521,9 +69812,9 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
         qwen4_ref_l2norm(k + h * D, D);
         for (uint32_t i = 0; i < D; i++) q[h * D + i] *= qscale;
     }
-    const float *A = qwen4_ref_f32(m, l->lin_a);
-    const float *dt = qwen4_ref_f32(m, l->lin_dt_bias);
-    const float *nw = qwen4_ref_f32(m, l->lin_norm);
+    const float *A = ref_f32(m, l->lin_a);
+    const float *dt = ref_f32(m, l->lin_dt_bias);
+    const float *nw = ref_f32(m, l->lin_norm);
     for (uint32_t j = 0; j < Hv; j++) {
         const uint32_t kh = j % Hk;
         const float g = expf(A[j] * qwen4_ref_softplus(a[j] + dt[j]));
@@ -68573,8 +69864,8 @@ static uint32_t qwen4_ref_select(const ds4_model *m, const ds4_layer_weights *l,
         free(qi);
         return n_sel;
     }
-    const float *gq = qwen4_ref_f32(m, l->indexer_q_norm);
-    const float *gk = qwen4_ref_f32(m, l->indexer_k_norm);
+    const float *gq = ref_f32(m, l->indexer_q_norm);
+    const float *gk = ref_f32(m, l->indexer_k_norm);
     for (uint32_t h = 0; h < Hi; h++) {
         float tmp[DS4_MAX_INDEXER_HEAD_DIM];
         qwen4_ref_rms(tmp, qi + h * Di, gq, Di, DS4_RMS_EPS);
@@ -68633,8 +69924,8 @@ static void qwen4_ref_attention(const ds4_model *m, const ds4_layer_weights *l, 
     qwen4_ref_matvec(m, l->attn_q, x, qg);
     qwen4_ref_matvec(m, l->attn_k, x, kc);
     qwen4_ref_matvec(m, l->attn_v, x, vc);
-    const float *gqn = qwen4_ref_f32(m, l->attn_q_norm);
-    const float *gkn = qwen4_ref_f32(m, l->attn_k_norm);
+    const float *gqn = ref_f32(m, l->attn_q_norm);
+    const float *gkn = ref_f32(m, l->attn_k_norm);
     for (uint32_t h = 0; h < H; h++) {
         qwen4_ref_rms(q + h * D, qg + (uint64_t)h * 2u * D, gqn, D, DS4_RMS_EPS);
         qwen4_ref_rope(q + h * D, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
@@ -68755,7 +70046,7 @@ static void qwen4_ref_forward_token(const ds4_model *m, const ds4_weights *w, qw
     const ds4_vision_span *fake = qwen4_fake_spans(&n_fake);
     const float *img = n_fake ? qwen4_span_row(fake, n_fake, pos) : NULL;
     if (img) memcpy(R, img, E * sizeof(float));
-    else qwen4_ref_row(m, w->token_embd, (uint64_t)token, R);
+    else ref_row(m, w->token_embd, (uint64_t)token, R);
     for (uint32_t s = 1; s < hc; s++) memcpy(R + (uint64_t)s * E, R, E * sizeof(float));
     qwen4_mrope_pos(fake, n_fake, pos, &st->mrope_delta, st->pos3 + (uint64_t)pos * 3u);
     for (uint32_t il = 0; il < n_trunk; il++) {
@@ -68787,9 +70078,9 @@ static void qwen4_ref_mtp(const ds4_model *m, const ds4_weights *w, qwen4_ref_st
     float *ep = xmalloc(E * sizeof(float));
     float mixed[DS4_MAX_EMBD], blk[DS4_MAX_EMBD], inj[DS4_MAX_HC];
 
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, e);
-    qwen4_ref_rms(en, e, qwen4_ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
-    qwen4_ref_rms(hn, R_pre, qwen4_ref_f32(m, l->nextn_hnorm), hc_dim, DS4_RMS_EPS);
+    ref_row(m, w->token_embd, (uint64_t)next_token, e);
+    qwen4_ref_rms(en, e, ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
+    qwen4_ref_rms(hn, R_pre, ref_f32(m, l->nextn_hnorm), hc_dim, DS4_RMS_EPS);
     /* eh_proj = [W_e | W_h] over concat(e, h): e once, h per stream */
     memcpy(cat, en, E * sizeof(float));
     memset(cat + E, 0, E * sizeof(float));
@@ -69140,6 +70431,348 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
     free(logits);
     free(seq);
     return 0;
+}
+
+/* ================= Kolibri-1 CPU reference =================
+ *
+ * The CPU pass is the correctness reference for the Metal graph, so it stays
+ * plain: one token at a time, F32 accumulation, and exactly the released block
+ * structure. Each pre-norm is a fused add-RMSNorm, so the residual stream
+ * advances there and each sublayer's normalized output joins it at the next
+ * pre-norm:
+ *
+ *   residual += hidden;  x = rmsnorm(residual) * input_layernorm
+ *   attn = o_proj(attend(qk_norm(q), k_norm(k)))
+ *   attn = post_attn_norm(attn);  residual += attn
+ *   x = rmsnorm(residual) * post_attention_layernorm
+ *   y = shared_experts(x) + sum_e sigmoid(router_e) * expert_e(x)
+ *   y = post_ffn_norm(y);  residual += y
+ *
+ * Routing selects the top-k experts on router + expert_bias and weights them
+ * with the unbiased sigmoid. Sliding layers rotate q/k by RoPE over their
+ * window; full layers take no positional encoding at all.
+ */
+
+static void kolibri1_kv_free(ds4_kolibri1_kv *cache) {
+    if (!cache) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        free(cache->layer[il].k);
+        free(cache->layer[il].v);
+        cache->layer[il].k = NULL;
+        cache->layer[il].v = NULL;
+    }
+    cache->ctx = 0;
+    cache->filled = 0;
+}
+
+/* Sliding layers keep exactly one window of rows; full layers keep the whole
+ * context (about 0.5 GB per F32 KV tensor per full layer at 262k on the
+ * released shape). */
+static bool kolibri1_kv_init(ds4_kolibri1_kv *cache, uint32_t ctx) {
+    memset(cache, 0, sizeof(*cache));
+    const uint32_t kv_dim = DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? ctx : DS4_N_SWA;
+        if (!rows) ds4_die("Kolibri-1 KV cache needs a positive window");
+        cache->layer[il].k = xmalloc((size_t)rows * kv_dim * sizeof(float));
+        cache->layer[il].v = xmalloc((size_t)rows * kv_dim * sizeof(float));
+        if (!cache->layer[il].k || !cache->layer[il].v) {
+            kolibri1_kv_free(cache);
+            return false;
+        }
+        cache->layer[il].rows = rows;
+    }
+    cache->ctx = ctx;
+    cache->filled = 0;
+    return true;
+}
+
+static void kolibri1_cpu_scratch_free(ds4_kolibri1_cpu_scratch *s) {
+    if (!s) return;
+    free(s->residual);
+    free(s->x);
+    free(s->q);
+    free(s->k);
+    free(s->v);
+    free(s->context);
+    free(s->attn);
+    free(s->moe);
+    free(s->router);
+    free(s->scores);
+    free(s->ff_a);
+    free(s->ff_b);
+    memset(s, 0, sizeof(*s));
+}
+
+static bool kolibri1_cpu_scratch_init(ds4_kolibri1_cpu_scratch *s) {
+    memset(s, 0, sizeof(*s));
+    const size_t embd = (size_t)DS4_N_EMBD * sizeof(float);
+    const size_t q_dim = (size_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    const size_t kv_dim = (size_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    s->residual = xmalloc(embd);
+    s->x = xmalloc(embd);
+    s->attn = xmalloc(embd);
+    s->moe = xmalloc(embd);
+    s->q = xmalloc(q_dim);
+    s->k = xmalloc(kv_dim);
+    s->v = xmalloc(kv_dim);
+    s->context = xmalloc(q_dim);
+    s->router = xmalloc((size_t)DS4_N_EXPERT * sizeof(float));
+    /* Attention can span the whole context on full-attention layers, so the
+     * score buffer must cover the context, not just the sliding window. */
+    const uint64_t widest_score = (uint64_t)(DS4_N_SWA > DS4_ROPE_ORIG_CTX ?
+                                             DS4_N_SWA : DS4_ROPE_ORIG_CTX);
+    s->scores = xmalloc((size_t)widest_score * sizeof(float));
+    s->ff_a = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    s->ff_b = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
+    if (!s->residual || !s->x || !s->attn || !s->moe || !s->q || !s->k ||
+        !s->v || !s->context || !s->router || !s->scores || !s->ff_a || !s->ff_b) {
+        kolibri1_cpu_scratch_free(s);
+        return false;
+    }
+    return true;
+}
+
+/* NeoX-style RoPE over the full head dimension, base from the shape. */
+static void kolibri1_rope(float *vec, uint32_t n_head, uint32_t head_dim, uint32_t pos) {
+    const uint32_t half = head_dim / 2u;
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *v = vec + (uint64_t)h * head_dim;
+        for (uint32_t i = 0; i < half; i++) {
+            const double freq = pow(DS4_ROPE_FREQ_BASE, -2.0 * (double)i / (double)head_dim);
+            const float angle = (float)((double)pos * freq);
+            const float c = cosf(angle), s = sinf(angle);
+            const float x1 = v[i], x2 = v[i + half];
+            v[i] = x1 * c - x2 * s;
+            v[i + half] = x1 * s + x2 * c;
+        }
+    }
+}
+
+/* One routed expert: rows of a GGUF [in, out, n] tensor, expert-major. */
+static void kolibri1_expert_matvec(
+        const ds4_model  *m,
+        const ds4_tensor *t,
+        uint32_t          expert,
+        uint32_t          out_dim,
+        const float      *x,
+        float            *out) {
+    if ((uint64_t)expert >= t->dim[2]) ds4_die("expert id is outside expert tensor");
+    if ((uint64_t)out_dim != t->dim[1]) ds4_die("expert matvec row count does not match the plane");
+    const uint64_t in_dim = t->dim[0];
+    if (t->type == 0) {
+        const float *base = (const float *)tensor_data(m, t) +
+                            (uint64_t)expert * (out_dim * in_dim);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            const float *row = base + (uint64_t)r * in_dim;
+            double acc = 0.0;
+            for (uint64_t i = 0; i < in_dim; i++) acc += (double)row[i] * x[i];
+            out[r] = (float)acc;
+        }
+        return;
+    }
+    if (t->type == 8) {
+        /* Block bytes must not be dereferenced as floats: each Q8_0 row is
+         * fp16 scale × int8 quants, and the activation is prequantized the
+         * same way as the dense path. */
+        matvec_q8_0_3d_slice(out, m, t, x, expert);
+        return;
+    }
+    if (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K ||
+        t->type == DS4_TENSOR_IQ2_XXS) {
+        /* Same recipe as the dense Q4_K/Q2_K/IQ2_XXS matvecs: quantize the
+         * activation to Q8_K once, then dot every expert row against it. */
+        if (in_dim % QK_K != 0) {
+            ds4_die("quantized expert matvec needs a 256-aligned input width");
+        }
+        uint64_t plane_in = 0, plane_out = 0, row_bytes = 0;
+        const uint8_t *base = tensor_expert_bytes(m, t, expert, &plane_in, &plane_out, &row_bytes);
+        (void)plane_in;
+        (void)plane_out;
+        block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+        ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
+        for (uint32_t r = 0; r < out_dim; r++) {
+            const uint8_t *row = base + (uint64_t)r * row_bytes;
+            float sum = 0.0f;
+            if (t->type == DS4_TENSOR_Q4_K) {
+                ds4_vec_dot_q4_K_q8_K((int)in_dim, &sum, (const block_q4_K *)row, xq);
+            } else if (t->type == DS4_TENSOR_Q2_K) {
+                ds4_vec_dot_q2_K_q8_K((int)in_dim, &sum, (const block_q2_K *)row, xq);
+            } else {
+                ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &sum, (const block_iq2_xxs *)row, xq);
+            }
+            out[r] = sum;
+        }
+        free(xq);
+        return;
+    }
+    ds4_die("unsupported expert tensor type");
+}
+
+/* Top-k on router + bias, insertion ordered so equal scores keep the lower
+ * expert index. Slots are only read once they hold a candidate. */
+static uint32_t kolibri1_route(
+        const float *router,
+        const float *bias,
+        uint32_t      n_expert,
+        uint32_t      top_k,
+        uint32_t     *selected) {
+    float best[DS4_MAX_EXPERT_USED];
+    uint32_t count = 0;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const float score = router[e] + bias[e];
+        if (count == top_k && score <= best[top_k - 1u]) continue;
+        uint32_t slot = count < top_k ? count : top_k - 1u;
+        while (slot > 0 && best[slot - 1u] < score) {
+            best[slot] = best[slot - 1u];
+            selected[slot] = selected[slot - 1u];
+            slot--;
+        }
+        best[slot] = score;
+        selected[slot] = e;
+        if (count < top_k) count++;
+    }
+    return count;
+}
+
+/* SwiGLU over one expert pair. `act`/`scratch` hold ff-sized intermediates;
+ * the result is written with the projection's own output width. */
+static void kolibri1_swiglu(
+        const ds4_model  *m,
+        const ds4_tensor *gate,
+        const ds4_tensor *up,
+        const ds4_tensor *down,
+        const float      *x,
+        float            *act,
+        float            *scratch,
+        float            *out) {
+    const uint32_t ff = DS4_N_FF_EXP;
+    matvec_any(act, m, gate, x);
+    for (uint32_t i = 0; i < ff; i++) act[i] = silu(act[i]);
+    matvec_any(scratch, m, up, x);
+    for (uint32_t i = 0; i < ff; i++) act[i] *= scratch[i];
+    matvec_any(out, m, down, act);
+}
+
+static void kolibri1_forward_token_cpu(
+        float                  *logits,
+        const ds4_model        *m,
+        const ds4_weights      *w,
+        ds4_kolibri1_kv        *cache,
+        int                    token,
+        uint32_t               pos,
+        ds4_kolibri1_cpu_scratch *s) {
+    const uint32_t embd = DS4_N_EMBD;
+    const uint32_t head = DS4_N_HEAD, kv_head = DS4_N_HEAD_KV, head_dim = DS4_N_HEAD_DIM;
+    const uint32_t ff = DS4_N_FF_EXP;
+    const uint32_t kv_dim = kv_head * head_dim;
+    const uint32_t group = head / kv_head;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint32_t n_layers = DS4_N_LAYER;
+
+    if (pos >= cache->ctx) ds4_die("Kolibri-1 position is outside the allocated context");
+    ref_row(m, w->token_embd, (uint64_t)token, s->residual);
+
+    for (uint32_t il = 0; il < n_layers; il++) {
+        const ds4_layer_weights *layer = &w->layer[il];
+        const bool full = ds4_kolibri1_layer_is_full(il);
+        ds4_kolibri1_kv_layer *kv = &cache->layer[il];
+
+        rms_norm_weight(s->x, s->residual, ref_f32(m, layer->attn_norm), embd, DS4_RMS_EPS);
+        matvec_any(s->q, m, layer->attn_q, s->x);
+        matvec_any(s->k, m, layer->attn_k, s->x);
+        matvec_any(s->v, m, layer->attn_v, s->x);
+        const float *qk_norm = ref_f32(m, layer->attn_q_norm);
+        const float *kk_norm = ref_f32(m, layer->attn_k_norm);
+        for (uint32_t h = 0; h < head; h++)
+            rms_norm_weight(s->q + (uint64_t)h * head_dim, s->q + (uint64_t)h * head_dim,
+                            qk_norm, head_dim, DS4_RMS_EPS);
+        for (uint32_t h = 0; h < kv_head; h++)
+            rms_norm_weight(s->k + (uint64_t)h * head_dim, s->k + (uint64_t)h * head_dim,
+                            kk_norm, head_dim, DS4_RMS_EPS);
+        if (!full) {
+            kolibri1_rope(s->q, head, head_dim, pos);
+            kolibri1_rope(s->k, kv_head, head_dim, pos);
+        }
+
+        /* Sliding layers hold exactly one window of rows, compacted so that
+         * rows 0..count-1 are positions pos+1-count..pos: shift left once the
+         * window is full, then append; full layers just append at pos. */
+        const uint32_t count = full ? pos + 1u :
+            (pos + 1u < DS4_N_SWA ? pos + 1u : DS4_N_SWA);
+        if (!full && pos >= kv->rows) {
+            memmove(kv->k, kv->k + (size_t)kv_dim,
+                    (size_t)(count - 1u) * kv_dim * sizeof(float));
+            memmove(kv->v, kv->v + (size_t)kv_dim,
+                    (size_t)(count - 1u) * kv_dim * sizeof(float));
+        }
+        const uint32_t write_row = full ? pos : count - 1u;
+        memcpy(kv->k + (size_t)write_row * kv_dim, s->k, (size_t)kv_dim * sizeof(float));
+        memcpy(kv->v + (size_t)write_row * kv_dim, s->v, (size_t)kv_dim * sizeof(float));
+        for (uint32_t h = 0; h < head; h++) {
+            const float *qh = s->q + (uint64_t)h * head_dim;
+            const uint32_t g = (h / group) * head_dim;
+            float max_score = -3.402823466e+38f;
+            for (uint32_t i = 0; i < count; i++) {
+                const float *kr = kv->k + (size_t)i * kv_dim + g;
+                double acc = 0.0;
+                for (uint32_t d = 0; d < head_dim; d++) acc += (double)kr[d] * qh[d];
+                const float score = (float)acc * scale;
+                s->scores[i] = score;
+                if (score > max_score) max_score = score;
+            }
+            double sum = 0.0;
+            for (uint32_t i = 0; i < count; i++) {
+                s->scores[i] = expf(s->scores[i] - max_score);
+                sum += s->scores[i];
+            }
+            float *dst = s->context + (uint64_t)h * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) dst[d] = 0.0f;
+            for (uint32_t i = 0; i < count; i++) {
+                const float *vr = kv->v + (size_t)i * kv_dim + g;
+                const float wgt = s->scores[i];
+                for (uint32_t d = 0; d < head_dim; d++) dst[d] += wgt * vr[d];
+            }
+            const float inv = (float)(1.0 / sum);
+            for (uint32_t d = 0; d < head_dim; d++) dst[d] *= inv;
+        }
+        matvec_any(s->attn, m, layer->attn_output, s->context);
+        rms_norm_weight(s->attn, s->attn, ref_f32(m, layer->post_attn_norm), embd, DS4_RMS_EPS);
+        for (uint32_t i = 0; i < embd; i++) s->residual[i] += s->attn[i];
+
+        rms_norm_weight(s->x, s->residual, ref_f32(m, layer->ffn_norm), embd, DS4_RMS_EPS);
+
+        const float *router_w = ref_f32(m, layer->ffn_gate_inp);
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < embd; i++) acc += (double)router_w[(uint64_t)e * embd + i] * s->x[i];
+            s->router[e] = (float)acc;
+        }
+        const float *bias = ref_f32(m, layer->ffn_exp_probs_b);
+        const uint32_t top_k = kolibri1_route(s->router, bias, DS4_N_EXPERT, DS4_N_EXPERT_USED, s->selected);
+        /* s->attn accumulates the routed experts while s->context holds the
+         * shared one; s->moe is the sum that enters the residual stream. */
+        for (uint32_t i = 0; i < embd; i++) s->attn[i] = 0.0f;
+        for (uint32_t i = 0; i < top_k; i++) {
+            const uint32_t e = s->selected[i];
+            const float weight = sigmoid_stable(s->router[e]);
+            kolibri1_expert_matvec(m, layer->ffn_gate_exps, e, ff, s->x, s->ff_a);
+            for (uint32_t j = 0; j < ff; j++) s->ff_a[j] = silu(s->ff_a[j]);
+            kolibri1_expert_matvec(m, layer->ffn_up_exps, e, ff, s->x, s->ff_b);
+            for (uint32_t j = 0; j < ff; j++) s->ff_a[j] *= s->ff_b[j];
+            kolibri1_expert_matvec(m, layer->ffn_down_exps, e, embd, s->ff_a, s->context);
+            for (uint32_t j = 0; j < embd; j++) s->attn[j] += weight * s->context[j];
+        }
+        kolibri1_swiglu(m, layer->ffn_gate_shexp, layer->ffn_up_shexp, layer->ffn_down_shexp,
+                        s->x, s->ff_a, s->ff_b, s->moe);
+        for (uint32_t i = 0; i < embd; i++) s->moe[i] += s->attn[i];
+        rms_norm_weight(s->moe, s->moe, ref_f32(m, layer->post_ffn_norm), embd, DS4_RMS_EPS);
+        for (uint32_t i = 0; i < embd; i++) s->residual[i] += s->moe[i];
+    }
+
+    rms_norm_weight(s->x, s->residual, ref_f32(m, w->output_norm), embd, DS4_RMS_EPS);
+    matvec_any(logits, m, w->output, s->x);
+    cache->filled = pos + 1u;
 }
 
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
@@ -71731,6 +73364,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_kolibri1() && !opt->inspect_only) {
+        /* The Kolibri-1 Metal graph runs the plain decoder stack; CUDA,
+         * tensor parallelism and the other execution modes stay reserved
+         * until their graphs exist. */
+        const bool backend_ok =
+#ifdef DS4_HAS_KOLIBRI1_METAL
+            e->backend == DS4_BACKEND_METAL ||
+#endif
+            e->backend == DS4_BACKEND_CPU;
+        if (!backend_ok || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
+            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            opt->first_token_test ||
+            (opt->mtp_path && opt->mtp_path[0]) || opt->vision_path) {
+            fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference or single-host Metal; "
+                            "CUDA, tensor parallelism, pipeline execution, SSD streaming, "
+                            "DSpark, MTP models and vision are not supported\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -72153,6 +73808,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (opt->inspect_only) {
+        if (ds4_model_is_kolibri1()) {
+            /* There is no Kolibri inference path yet, so inspection is the
+             * one place that binds and validates the converted layout. */
+            weights_bind(&e->weights, &e->model, false, 0, 0, true, false);
+        }
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
             model_open(&e->mtp_model, opt->mtp_path, false, false);
@@ -72999,6 +74659,11 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
+}
+
+bool ds4_engine_is_kolibri1(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_kolibri1();
 }
 
 /* The official template's default effort is xhigh; medium adds no text. */
@@ -73883,6 +75548,13 @@ void ds4_engine_close(ds4_engine *e) {
         e->qwen4_shared_workspace = NULL;
     }
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (e->kolibri_shared_workspace) {
+        kolibri1_graph_free(e->kolibri_shared_workspace);
+        free(e->kolibri_shared_workspace);
+        e->kolibri_shared_workspace = NULL;
+    }
+#endif
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
@@ -74133,6 +75805,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                      e->prefill_chunk);
         kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
         cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        if (ds4_model_is_kolibri1() &&
+            (!kolibri1_kv_init(&s->kolibri1_cpu, (uint32_t)ctx_size) ||
+             !kolibri1_cpu_scratch_init(&s->kolibri1_cpu_scratch))) {
+            fprintf(stderr, "ds4: cannot allocate the Kolibri-1 CPU KV cache\n");
+            ds4_session_free(s);
+            return 1;
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -74280,6 +75959,57 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->qwen4_graph_ready = true;
         if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_model_is_kolibri1()) {
+        if (e->backend != DS4_BACKEND_METAL || e->distributed.role != DS4_DISTRIBUTED_NONE) {
+            fprintf(stderr, "ds4: Kolibri-1 sessions require single-host Metal\n");
+            free(s);
+            return 1;
+        }
+        const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
+            e->prefill_chunk : kolibri1_prefill_chunk_tokens((uint32_t)ctx_size);
+        /* One arena of transients serves every server session; each session
+         * still owns its K/V rings and logits.  A wider arena replaces the
+         * shared one when no live session borrows it. */
+        const bool share = e->share_session_prefill_workspace &&
+                           e->backend == DS4_BACKEND_METAL;
+        const bool arena_fits = e->kolibri_shared_workspace &&
+            e->kolibri_shared_workspace->cap_tokens >= cap_tokens;
+        if (share && e->kolibri_shared_workspace && !arena_fits &&
+            e->kolibri_arena_users == 0) {
+            kolibri1_graph_free(e->kolibri_shared_workspace);
+            free(e->kolibri_shared_workspace);
+            e->kolibri_shared_workspace = NULL;
+        }
+        const ds4_kolibri1_gpu_graph *shared =
+            share && arena_fits ? e->kolibri_shared_workspace : NULL;
+        if (!kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, shared)) {
+            free(s);
+            return 1;
+        }
+        if (share && !e->kolibri_shared_workspace) {
+            e->kolibri_shared_workspace = xcalloc(1, sizeof(*e->kolibri_shared_workspace));
+            const uint64_t arena = kolibri1_graph_scratch_bytes(&s->kolibri_gpu);
+            kolibri1_graph_transfer_scratch(e->kolibri_shared_workspace, &s->kolibri_gpu);
+            fprintf(stderr,
+                    "ds4: shared Kolibri-1 session transients: cap=%u, %.2f GiB once; "
+                    "each further session costs its caches only\n",
+                    cap_tokens, (double)arena / (1024.0 * 1024.0 * 1024.0));
+        }
+        kolibri1_graph_reset(&s->kolibri_gpu);
+        s->kolibri_graph_ready = true;
+        if (!s->kolibri_gpu.owns_scratch) e->kolibri_arena_users++;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -74624,6 +76354,8 @@ void ds4_session_free(ds4_session *s) {
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
+        kolibri1_kv_free(&s->kolibri1_cpu);
+        kolibri1_cpu_scratch_free(&s->kolibri1_cpu_scratch);
     }
 #ifndef DS4_NO_GPU
     else {
@@ -74652,6 +76384,14 @@ void ds4_session_free(ds4_session *s) {
                 }
             }
             qwen4_graph_free(&s->qwen4_graph);
+        } else
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+        if (ds4_session_is_kolibri1(s)) {
+            if (s->kolibri_graph_ready && !s->kolibri_gpu.owns_scratch && s->engine) {
+                s->engine->kolibri_arena_users--;
+            }
+            kolibri1_graph_free(&s->kolibri_gpu);
         } else
 #endif
         if (ds4_session_is_glm(s)) {
@@ -76591,6 +78331,33 @@ int ds4_session_sync_multimodal(
     return rc;
 }
 
+static int session_cpu_prefill_tokens(
+        ds4_session     *s,
+        const ds4_tokens *prompt,
+        char            *err,
+        size_t           errlen) {
+    /* Kolibri-1 has no layer-major CPU prefill: one token at a time keeps the
+     * reference straightforward, and the CPU backend is a debug path. */
+    if (!ds4_model_is_kolibri1()) return 1;
+    ds4_engine *e = s->engine;
+    session_cpu_reset_cache(s);
+    for (int i = 0; i < prompt->len; i++) {
+        if (ds4_session_cancelled(s)) {
+            snprintf(err, errlen, "interrupted");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        kolibri1_forward_token_cpu(s->logits, &e->model, &e->weights,
+                                   &s->kolibri1_cpu, prompt->v[i], (uint32_t)i,
+                                   &s->kolibri1_cpu_scratch);
+        if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+    }
+    ds4_tokens_copy(&s->checkpoint, prompt);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_dspark_capture_note_checkpoint(s);
+    return 0;
+}
+
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -76695,8 +78462,85 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return 0;
     }
 #endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_session_kolibri_uses_gpu(s)) {
+        ds4_engine *e = s->engine;
+        int start = 0;
+        if (s->checkpoint_valid &&
+            s->kolibri_gpu.pos == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            kolibri1_graph_reset(&s->kolibri_gpu);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
+                return 1;
+            }
+        }
+        int prefill_rc = 0;
+        for (int i = start; i < prompt->len;) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                prefill_rc = DS4_SESSION_SYNC_INTERRUPTED;
+                break;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > s->kolibri_gpu.cap_tokens) chunk = s->kolibri_gpu.cap_tokens;
+            s->checkpoint_valid = false;
+            if (!kolibri1_graph_forward_tokens(&s->kolibri_gpu, &e->model, &e->weights,
+                                               prompt->v + i, chunk, s->logits)) {
+                snprintf(err, errlen, "Kolibri-1 prefill failed at token %d", i);
+                s->checkpoint_valid = false;
+                prefill_rc = 1;
+                break;
+            }
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        if (prefill_rc != 0) return prefill_rc;
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        if (ds4_model_is_kolibri1()) {
+            /* Kolibri-1 replays a continuation suffix through the same
+             * per-token reference as prefill and decode; the generic decode
+             * path below reads DeepSeek tensor layouts. */
+            if (s->checkpoint_valid &&
+                prompt->len >= s->checkpoint.len &&
+                ds4_tokens_starts_with(prompt, &s->checkpoint))
+            {
+                s->mtp_draft_valid = false;
+                for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                    if (ds4_session_cancelled(s)) {
+                        snprintf(err, errlen, "interrupted");
+                        s->checkpoint_valid = true;
+                        s->mtp_draft_valid = false;
+                        return DS4_SESSION_SYNC_INTERRUPTED;
+                    }
+                    kolibri1_forward_token_cpu(s->logits, &e->model, &e->weights,
+                                               &s->kolibri1_cpu, prompt->v[i],
+                                               (uint32_t)s->checkpoint.len,
+                                               &s->kolibri1_cpu_scratch);
+                    token_vec_push(&s->checkpoint, prompt->v[i]);
+                    if (s->progress)
+                        s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+                }
+                s->checkpoint_valid = true;
+                return 0;
+            }
+            return session_cpu_prefill_tokens(s, prompt, err, errlen);
+        }
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -78735,16 +80579,23 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
-        forward_token_raw_swa_cpu_decode_scratch(s->logits,
-                                                 &e->model,
-                                                 &e->weights,
-                                                 &s->cpu_cache,
-                                                 token,
-                                                 (uint32_t)s->checkpoint.len,
-                                                 e->directional_steering_dirs,
-                                                 e->directional_steering_attn_scale,
-                                                 e->directional_steering_ffn_scale,
-                                                 &s->cpu_scratch);
+        if (ds4_model_is_kolibri1()) {
+            kolibri1_forward_token_cpu(s->logits, &e->model, &e->weights,
+                                       &s->kolibri1_cpu, token,
+                                       (uint32_t)s->checkpoint.len,
+                                       &s->kolibri1_cpu_scratch);
+        } else {
+            forward_token_raw_swa_cpu_decode_scratch(s->logits,
+                                                     &e->model,
+                                                     &e->weights,
+                                                     &s->cpu_cache,
+                                                     token,
+                                                     (uint32_t)s->checkpoint.len,
+                                                     e->directional_steering_dirs,
+                                                     e->directional_steering_attn_scale,
+                                                     e->directional_steering_ffn_scale,
+                                                     &s->cpu_scratch);
+        }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -78799,6 +80650,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->checkpoint_valid = true;
         s->qwen4_rewound = false;
         s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    if (ds4_session_kolibri_uses_gpu(s)) {
+        ds4_engine *e = s->engine;
+        if (!s->kolibri_graph_ready) {
+            if (errlen) snprintf(err, errlen, "Kolibri-1 graph is not initialized");
+            return 1;
+        }
+        if (s->kolibri_gpu.pos >= s->kolibri_gpu.ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!kolibri1_graph_forward_token(&s->kolibri_gpu, &e->model, &e->weights, token, s->logits)) {
+            if (errlen) snprintf(err, errlen, "Kolibri-1 decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
         (void)probe_mtp;
         return 0;
     }
@@ -79776,7 +81649,7 @@ static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
     for (int i = 0; i < count; i++) {
         ds4_qwen4_gpu_graph *rg = &items[i].session->qwen4_graph;
         float *dst = row + (uint64_t)i * hc_dim;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
+        ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
         for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         uint32_t pos3[4];
         qwen4_mrope_pos(NULL, 0, rg->pos, &rg->mrope_delta, pos3);
@@ -80179,7 +82052,7 @@ static bool qwen4_batch_stage_embeddings_ragged(const qwen4_batch_member *mem, i
         for (uint32_t t = 0; t < mem[i].n; t++) {
             const uint32_t r = mem[i].row0 + t;
             float *dst = row + (uint64_t)r * hc_dim;
-            qwen4_ref_row(m, w->token_embd, (uint64_t)mem[i].tokens[t], dst);
+            ref_row(m, w->token_embd, (uint64_t)mem[i].tokens[t], dst);
             for (uint32_t sidx = 1; sidx < hc; sidx++) memcpy(dst + (uint64_t)sidx * E, dst, E * sizeof(float));
             uint32_t pos3[4];
             qwen4_mrope_pos(NULL, 0, rg->pos + t, &rg->mrope_delta, pos3);
@@ -80353,7 +82226,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         }
     }
     for (uint32_t t = 0; t < N; t++)
-        qwen4_ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
+        ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
     if (!ds4_gpu_tensor_write(g->batch_head_x, 0, g->host_row, (uint64_t)N * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
     /* The trunk's MoE scratch is idle here. Reuse it for predictor inputs
@@ -80486,6 +82359,11 @@ static bool ds4_sessions_eval_batch_metal_supported(
 #ifdef DS4_HAS_QWEN4_METAL
     if (items[0].session && ds4_session_is_qwen4(items[0].session))
         return qwen4_graph_native_session_batch_supported(items, count, e);
+#endif
+#ifdef DS4_HAS_KOLIBRI1_METAL
+    /* The Kolibri graph has no cross-session batch encode: its rings and
+     * command stream are per session.  Decline so the caller serializes. */
+    if (items[0].session && ds4_session_is_kolibri1(items[0].session)) return false;
 #endif
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;

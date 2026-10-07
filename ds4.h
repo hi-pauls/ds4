@@ -311,8 +311,21 @@ int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
+bool ds4_engine_is_kolibri1(ds4_engine *e);
+void ds4_chat_append_system_effort(ds4_engine *e, ds4_tokens *tokens,
+                                   const char *system, ds4_think_mode think_mode);
+/* Kolibri-1 folds the agent's tool definitions into the same system block as
+ * the effort sentence; other families get two appended system messages.
+ * `tools` carries the pre-rendered "# Tools" section (schemas + call-format
+ * instructions), tokenized with rendered-chat semantics so the tool-call
+ * markers arrive as their dedicated tokens. */
+void ds4_chat_append_system_effort_tools(ds4_engine *e, ds4_tokens *tokens,
+                                         const char *system,
+                                         ds4_think_mode think_mode,
+                                         const char *tools);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
+const char *ds4_kolibri_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
@@ -385,6 +398,7 @@ void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
 void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
+void ds4_chat_append_assistant_turn_end(ds4_engine *e, ds4_tokens *tokens);
 
 char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);

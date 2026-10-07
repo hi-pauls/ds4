@@ -279,6 +279,12 @@ tests/test_deepseek41_cli.o: tests/test_deepseek41_cli.c ds4_cli.c ds4.h
 tests/test_deepseek41_cli: tests/test_deepseek41_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_cli_printer.o: tests/test_cli_printer.c ds4_cli.c ds4.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_cli_printer: tests/test_cli_printer.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_metal_dense_mpp.o: tests/test_metal_dense_mpp.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
@@ -755,6 +761,64 @@ tests/test_deepseek41_gguf: tests/test_deepseek41_gguf.o ds4_engram.c $(filter-o
 test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
+# Kolibri-1 loader and pre-tokenizer check against a synthetic fixture.  Only
+# the released tokenizer files are needed, not the weights.
+KOLIBRI1_TOKENIZER_DIR ?=
+KOLIBRI1_MINI_GGUF ?= gguf/Kolibri-1-mini.gguf
+
+.PHONY: test-kolibri1-gguf
+test-kolibri1-gguf: ds4 tests/test_kolibri1_session
+	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
+		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
+	python3 tests/make_kolibri1_mini.py --tokenizer "$(KOLIBRI1_TOKENIZER_DIR)" \
+		--out "$(KOLIBRI1_MINI_GGUF)"
+	./ds4 -m "$(KOLIBRI1_MINI_GGUF)" --inspect
+	python3 tests/test_kolibri1_parity.py --gguf "$(KOLIBRI1_MINI_GGUF)"
+	tests/test_kolibri1_session --cpu "$(KOLIBRI1_MINI_GGUF)"
+ifeq ($(UNAME_S),Darwin)
+	tests/test_kolibri1_session "$(KOLIBRI1_MINI_GGUF)"
+endif
+
+.PHONY: test-kolibri1-torch
+test-kolibri1-torch: ds4
+	python3 tests/test_kolibri1_torch.py --gguf "$(KOLIBRI1_MINI_GGUF)"
+
+.PHONY: test-kolibri1-chat
+test-kolibri1-chat: ds4 tests/test_kolibri1_agent_chat tests/test_kolibri1_server_render
+	@test -n "$(KOLIBRI1_TOKENIZER_DIR)" || { \
+		echo "set KOLIBRI1_TOKENIZER_DIR to a Kolibri snapshot directory"; exit 1; }
+	python3 tests/test_kolibri1_chat.py
+
+tests/test_kolibri1_agent_chat.o: tests/test_kolibri1_agent_chat.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_prompt_prefix.h ds4_kvstore.h ds4_web.h linenoise.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_kolibri1_agent_chat: tests/test_kolibri1_agent_chat.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ tests/test_kolibri1_agent_chat.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ tests/test_kolibri1_agent_chat.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+endif
+
+tests/test_kolibri1_server_render.o: tests/test_kolibri1_server_render.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_kolibri1_server_render: tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ tests/test_kolibri1_server_render.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(DS4_LINK_LIBS)
+endif
+
+tests/test_kolibri1_session.o: tests/test_kolibri1_session.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_kolibri1_session: tests/test_kolibri1_session.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
 tests/test_qwen4_ngrams.o: tests/test_qwen4_ngrams.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1026,7 +1090,7 @@ tests/test_web_recovery: tests/test_web_recovery.c ds4_web.c ds4_web.h
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram test-web-recovery \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_image_decode tests/test_prompt_prefix tests/test_cli_printer $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -1036,6 +1100,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_prompt_prefix
+	./tests/test_cli_printer
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
 	./tests/test_image_decode
@@ -1107,6 +1172,7 @@ clean:
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_cli_printer
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

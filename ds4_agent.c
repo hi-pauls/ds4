@@ -76,9 +76,11 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    int top_k;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
+    bool top_k_set;
     uint64_t seed;
     ds4_think_mode think_mode;
 } agent_generation_options;
@@ -270,6 +272,15 @@ typedef struct {
     int argcap;
 } agent_tool_call;
 
+/* Small growable byte buffer, shared by the tool-call parsers. */
+typedef struct {
+    char *ptr;
+    size_t len;
+    size_t cap;
+    size_t limit;
+    bool truncated;
+} agent_buf;
+
 typedef struct {
     agent_tool_call *v;
     int len;
@@ -291,11 +302,27 @@ typedef struct {
     size_t image_cap;
 } agent_tool_observation;
 
+/* Kolibri-1 JSON tool-call walker states (syntax == AGENT_TOOL_SYNTAX_KOLIBRI). */
+typedef enum {
+    KOLIBRI_WANT_OBJECT,
+    KOLIBRI_WANT_KEY,
+    KOLIBRI_KEY_STRING,
+    KOLIBRI_WANT_COLON,
+    KOLIBRI_WANT_VALUE,
+    KOLIBRI_STRING_VALUE,
+    KOLIBRI_NESTED_VALUE,
+    KOLIBRI_LITERAL_VALUE,
+    KOLIBRI_AFTER_VALUE,
+    KOLIBRI_WANT_CLOSE,
+    KOLIBRI_AFTER_CALL,
+} agent_kolibri_step;
+
 typedef enum {
     AGENT_TOOL_SYNTAX_DSML,
     AGENT_TOOL_SYNTAX_GLM,
     AGENT_TOOL_SYNTAX_DSML41,
     AGENT_TOOL_SYNTAX_QWEN,
+    AGENT_TOOL_SYNTAX_KOLIBRI,
 } agent_tool_syntax;
 
 typedef enum {
@@ -323,6 +350,25 @@ typedef struct {
     bool glm_after_call;
     agent_tool_calls calls;
     char error[160];
+    /* Kolibri-1 JSON walker (only meaningful for AGENT_TOOL_SYNTAX_KOLIBRI). */
+    agent_kolibri_step kolibri_step;
+    int kolibri_frame;          /* 0 = top-level object, 1 = arguments object */
+    char kolibri_key[80];
+    size_t kolibri_key_len;
+    bool kolibri_key_full;
+    bool kolibri_have_name;
+    bool kolibri_args_complete; /* one-shot: arguments value just closed */
+    char *kolibri_dec;          /* decoded bytes of the current JSON string */
+    size_t kolibri_dec_len;
+    size_t kolibri_dec_cap;
+    size_t kolibri_value_start; /* raw span start of nested/literal values */
+    int kolibri_nested_depth;
+    bool kolibri_nested_str;
+    bool kolibri_nested_esc;
+    unsigned kolibri_uni_need;
+    unsigned kolibri_uni_val;
+    unsigned kolibri_uni_high;  /* pending high surrogate, 0 when none */
+    bool kolibri_esc;
 } agent_dsml_parser;
 
 typedef enum {
@@ -411,6 +457,7 @@ static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
+    if (ds4_engine_is_kolibri1(engine)) return AGENT_TOOL_SYNTAX_KOLIBRI;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
                                            : AGENT_TOOL_SYNTAX_DSML;
@@ -424,7 +471,9 @@ static const char *agent_dsml_tag_name(agent_tool_syntax syntax, const char *nam
 }
 
 static const char *agent_tool_start(agent_tool_syntax syntax) {
-    if (syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN) return "<tool_call>";
+    if (syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN ||
+        syntax == AGENT_TOOL_SYNTAX_KOLIBRI)
+        return "<tool_call>";
     return syntax == AGENT_TOOL_SYNTAX_DSML41 ? "<｜DSML｜ calls>" : "<｜DSML｜tool_calls>";
 }
 
@@ -436,14 +485,18 @@ static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) 
     return syntax != AGENT_TOOL_SYNTAX_GLM;
 }
 
-/* GLM and Qwen both open a call with <tool_call> and render as chat messages */
+/* GLM and Qwen both open a call with <tool_call> and render as chat messages;
+ * Kolibri shares the <tool_call> start marker (JSON payload). */
 static bool agent_syntax_is_xml_tool_call(agent_tool_syntax syntax) {
-    return syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN;
+    return syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN ||
+           syntax == AGENT_TOOL_SYNTAX_KOLIBRI;
 }
 
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
-    if (agent_tool_syntax_assistant_turn_uses_eos(
-            agent_tool_syntax_for_engine(w->engine)))
+    agent_tool_syntax syntax = agent_tool_syntax_for_engine(w->engine);
+    if (syntax == AGENT_TOOL_SYNTAX_KOLIBRI)
+        ds4_chat_append_assistant_turn_end(w->engine, &w->transcript);
+    else if (agent_tool_syntax_assistant_turn_uses_eos(syntax))
         ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
 }
 
@@ -494,6 +547,48 @@ static void *xrealloc(void *ptr, size_t n) {
         perror("ds4-agent: realloc");
         exit(1);
     }
+    return p;
+}
+
+static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
+    if (!n || b->truncated) return;
+    const size_t max = b->limit ? b->limit : SIZE_MAX - 1;
+    if (n > max - b->len) {
+        n = max > b->len ? max - b->len : 0;
+        while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--;
+        b->truncated = true;
+    }
+    if (!n) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->ptr = xrealloc(b->ptr, cap);
+        b->cap = cap;
+    }
+    memcpy(b->ptr + b->len, s, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
+static void agent_buf_puts(agent_buf *b, const char *s) {
+    agent_buf_append(b, s, strlen(s));
+}
+
+static void agent_buf_free(agent_buf *b) {
+    if (!b) return;
+    free(b->ptr);
+    memset(b, 0, sizeof(*b));
+}
+
+static char *agent_buf_take(agent_buf *b) {
+    if (b->truncated) {
+        b->truncated = false;
+        b->limit = 0;
+        agent_buf_puts(b, "\n[Output truncated at the tool byte limit. Narrow the request.]\n");
+    }
+    if (!b->ptr) return xstrdup("");
+    char *p = b->ptr;
+    memset(b, 0, sizeof(*b));
     return p;
 }
 
@@ -857,6 +952,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.top_p_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
@@ -1006,7 +1104,15 @@ static agent_config parse_options(int argc, char **argv) {
 static void agent_apply_model_sampling_defaults(
         ds4_engine               *engine,
         agent_generation_options *gen) {
-    if (!engine || !gen || !ds4_engine_is_glm_dsa(engine)) return;
+    if (!engine || !gen) return;
+    if (ds4_engine_is_kolibri1(engine)) {
+        if (!gen->temperature_set) gen->temperature = 1.0f;
+        if (!gen->top_p_set) gen->top_p = 0.97f;
+        if (!gen->top_k_set) gen->top_k = 128;
+        if (!gen->min_p_set) gen->min_p = 0.0f;
+        return;
+    }
+    if (!ds4_engine_is_glm_dsa(engine)) return;
 
     if (!gen->temperature_set) gen->temperature = 1.0f;
     if (!gen->top_p_set) gen->top_p = 0.95f;
@@ -1434,6 +1540,110 @@ static char *agent_build_qwen_tools_prompt(bool edit_upto, bool vision) {
     return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * Kolibri-1 tool prompt
+ *
+ * The released template renders the "# Tools" section of the system block
+ * itself: one JSON tool object per line inside <tools></tools>, then the
+ * JSON tool-call instructions, ending at the closing </tool_call>.  Anything
+ * else ds4 wants to tell the model (tool contracts, coding-agent rules) must
+ * ride in the system CONTENT before the "# Reasoning effort" sentence, or the
+ * rendered block would drift from the template.  Schemas are pre-formatted
+ * exactly like jinja's `tool | tojson` output (json.dumps separators, no
+ * characters the htmlsafe filter would escape), so the parity gate can
+ * re-render them from parsed dicts.
+ * --------------------------------------------------------------------------- */
+
+static const char agent_kolibri_tools_prompt_intro[] =
+    "# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>";
+
+static const char agent_kolibri_call_instructions[] =
+    "\n</tools>\n\n"
+    "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+    "<tool_call>\n"
+    "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+    "</tool_call>";
+
+static const char agent_kolibri_vision_tool_schema[] =
+    "{\"function\": {\"description\": \"Open a local PNG or JPEG as a visual observation.\", "
+    "\"name\": \"view_image\", \"parameters\": {\"properties\": {\"path\": {\"type\": \"string\"}}, "
+    "\"required\": [\"path\"], \"type\": \"object\"}}, \"type\": \"function\"}";
+
+/* Key order matches jinja's `tool | tojson` exactly (keys sorted recursively,
+ * separators ", " and ": "). */
+static const char agent_kolibri_tool_schemas[] =
+    "{\"function\": {\"description\": \"Search web pages.\", \"name\": \"google_search\", \"parameters\": {\"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Read a URL in browser.\", \"name\": \"visit_page\", \"parameters\": {\"properties\": {\"url\": {\"type\": \"string\"}}, \"required\": [\"url\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"bash\", \"parameters\": {\"properties\": {\"command\": {\"type\": \"string\"}, \"refresh_sec\": {\"type\": \"integer\"}, \"timeout_sec\": {\"type\": \"integer\"}}, \"required\": [\"command\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Check a bash job.\", \"name\": \"bash_status\", \"parameters\": {\"properties\": {\"job\": {\"type\": \"integer\"}, \"pid\": {\"type\": \"integer\"}, \"refresh_sec\": {\"type\": \"integer\"}}, \"required\": [\"job\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Stop a bash job.\", \"name\": \"bash_stop\", \"parameters\": {\"properties\": {\"job\": {\"type\": \"integer\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Read a text file/range.\", \"name\": \"read\", \"parameters\": {\"properties\": {\"max_lines\": {\"type\": \"integer\"}, \"path\": {\"type\": \"string\"}, \"raw\": {\"type\": \"boolean\"}, \"start_line\": {\"type\": \"integer\"}, \"whole\": {\"type\": \"boolean\"}}, \"required\": [\"path\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Continue previous read-like output.\", \"name\": \"more\", \"parameters\": {\"properties\": {\"count\": {\"type\": \"integer\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Create or overwrite a file.\", \"name\": \"write\", \"parameters\": {\"properties\": {\"content\": {\"type\": \"string\"}, \"path\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Replace one exact old text match.\", \"name\": \"edit\", \"parameters\": {\"properties\": {\"new\": {\"type\": \"string\"}, \"old\": {\"type\": \"string\"}, \"path\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old\", \"new\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"Search files.\", \"name\": \"search\", \"parameters\": {\"properties\": {\"case_sensitive\": {\"type\": \"boolean\"}, \"context\": {\"type\": \"integer\"}, \"glob\": {\"type\": \"string\"}, \"max_results\": {\"type\": \"integer\"}, \"mode\": {\"enum\": [\"literal\", \"regex\"], \"type\": \"string\"}, \"path\": {\"type\": \"string\"}, \"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"type\": \"object\"}}, \"type\": \"function\"}\n"
+    "{\"function\": {\"description\": \"List one directory.\", \"name\": \"list\", \"parameters\": {\"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"], \"type\": \"object\"}}, \"type\": \"function\"}\n";
+
+/* ds4's coding-agent rules ride in the system content, before the effort
+ * sentence; the template renders arbitrary system text verbatim. */
+static char *agent_kolibri_rules_text(bool edit_upto) {
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    agent_buf out = {0};
+    agent_buf_puts(&out,
+        "\n\nTool calls are not allowed inside <think></think>; finish "
+        "thinking before emitting <tool_call>.\n\n"
+        AGENT_TOOL_CONTRACTS
+        "String parameter values are JSON strings; escape embedded quotes and "
+        "backslashes. Numbers, booleans and null stay bare JSON values.\n\n"
+        "# Rules\n\n"
+        "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+        "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+        "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
+        "- " AGENT_EDIT_TARGET_RULE "\n");
+    agent_buf_puts(&out, edit);
+    agent_buf_puts(&out, agent_glm_tools_prompt_rules_tail);
+    return agent_buf_take(&out);
+}
+
+/* The template-shaped tools section: intro + schemas + call instructions. */
+static char *agent_kolibri_tools_section(bool vision) {
+    agent_buf out = {0};
+    agent_buf_puts(&out, agent_kolibri_tools_prompt_intro);
+    const char *p = agent_kolibri_tool_schemas;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len) {
+            agent_buf_puts(&out, "\n");
+            agent_buf_append(&out, p, len);
+        }
+        p += len + (nl ? 1 : 0);
+    }
+    if (vision) {
+        agent_buf_puts(&out, "\n");
+        agent_buf_puts(&out, agent_kolibri_vision_tool_schema);
+    }
+    agent_buf_puts(&out, agent_kolibri_call_instructions);
+    return agent_buf_take(&out);
+}
+
+/* One-blob form for paths that append the tools prompt as an ordinary system
+ * message (mid-session reminders). */
+static char *agent_build_kolibri_tools_prompt(bool edit_upto, bool vision) {
+    char *rules = agent_kolibri_rules_text(edit_upto);
+    char *section = agent_kolibri_tools_section(vision);
+    agent_buf out = {0};
+    agent_buf_puts(&out, rules);
+    agent_buf_puts(&out, section);
+    free(rules);
+    free(section);
+    return agent_buf_take(&out);
+}
+
 static char *agent_dsml41_tools_prompt(const char *source);
 
 static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
@@ -1441,6 +1651,8 @@ static char *agent_build_tools_prompt(ds4_engine *engine, bool edit_upto) {
         return agent_build_qwen_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_GLM)
         return agent_build_glm_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
+    if (agent_tool_syntax_for_engine(engine) == AGENT_TOOL_SYNTAX_KOLIBRI)
+        return agent_build_kolibri_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     char *prompt = agent_build_dsml_tools_prompt(edit_upto, ds4_engine_has_vision(engine));
     if (ds4_engine_is_deepseek41(engine)) {
         char *next = agent_dsml41_tools_prompt(prompt);
@@ -1474,6 +1686,12 @@ static const char agent_qwen_syntax_reminder[] =
     "Tool-call syntax reminder:\n"
     "<tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n$PARAMETER_VALUE\n</parameter>\n"
     "</function>\n</tool_call>\n";
+
+static const char agent_kolibri_syntax_reminder[] =
+    "Tool-call syntax reminder:\n"
+    "<tool_call>\n"
+    "{\"name\": \"$TOOL_NAME\", \"arguments\": {\"$PARAMETER_NAME\": $PARAMETER_VALUE}}\n"
+    "</tool_call>\n";
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
@@ -1867,9 +2085,584 @@ static void agent_dsml_parser_free(agent_dsml_parser *p) {
     free(p->raw);
     agent_tool_call_free(&p->current);
     free(p->param_name);
+    free(p->kolibri_dec);
     agent_tool_calls_free(&p->calls);
     memset(p, 0, sizeof(*p));
     p->syntax = syntax;
+}
+
+/* Kolibri-1 tool calls arrive as JSON inside the tool-call stanza.  The
+ * walker below decodes JSON escapes as bytes stream in, so it never needs a
+ * second pass over the payload. */
+static void agent_dsml_set_error(agent_dsml_parser *p, const char *msg);
+
+static void agent_kolibri_dec_reset(agent_dsml_parser *p) {
+    free(p->kolibri_dec);
+    p->kolibri_dec = NULL;
+    p->kolibri_dec_len = p->kolibri_dec_cap = 0;
+    p->kolibri_esc = false;
+    p->kolibri_uni_need = 0;
+    p->kolibri_uni_val = 0;
+    p->kolibri_uni_high = 0;
+}
+
+static void agent_kolibri_dec_put(agent_dsml_parser *p, char c) {
+    if (p->kolibri_dec_len + 1 > p->kolibri_dec_cap) {
+        p->kolibri_dec_cap = p->kolibri_dec_cap ? p->kolibri_dec_cap * 2 : 64;
+        p->kolibri_dec = xrealloc(p->kolibri_dec, p->kolibri_dec_cap);
+    }
+    p->kolibri_dec[p->kolibri_dec_len++] = c;
+}
+
+static void agent_kolibri_dec_utf8(agent_dsml_parser *p, unsigned cp) {
+    char tmp[4];
+    int n = 0;
+    if (cp < 0x80) tmp[n++] = (char)cp;
+    else if (cp < 0x800) {
+        tmp[n++] = (char)(0xc0 | (cp >> 6));
+        tmp[n++] = (char)(0x80 | (cp & 0x3f));
+    } else if (cp < 0x10000) {
+        tmp[n++] = (char)(0xe0 | (cp >> 12));
+        tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        tmp[n++] = (char)(0x80 | (cp & 0x3f));
+    } else {
+        tmp[n++] = (char)(0xf0 | (cp >> 18));
+        tmp[n++] = (char)(0x80 | ((cp >> 12) & 0x3f));
+        tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3f));
+        tmp[n++] = (char)(0x80 | (cp & 0x3f));
+    }
+    for (int i = 0; i < n; i++) agent_kolibri_dec_put(p, tmp[i]);
+}
+
+static bool agent_kolibri_key_is(const agent_dsml_parser *p, const char *name) {
+    size_t n = strlen(name);
+    return p->kolibri_key_full && p->kolibri_key_len == n &&
+           memcmp(p->kolibri_key, name, n) == 0;
+}
+
+/* Leave any parameter visualization state a string value owned. */
+static void agent_kolibri_end_param_viz(agent_dsml_parser *p) {
+    if (p->state == AGENT_DSML_PARAM_VALUE) {
+        free(p->param_name);
+        p->param_name = NULL;
+        p->param_close_prefix = false;
+        p->state = AGENT_DSML_STRUCTURAL;
+    }
+}
+
+static void agent_kolibri_commit_key(agent_dsml_parser *p) {
+    size_t n = p->kolibri_dec_len;
+    if (n > sizeof(p->kolibri_key) - 1) n = sizeof(p->kolibri_key) - 1;
+    if (n) memcpy(p->kolibri_key, p->kolibri_dec, n);
+    p->kolibri_key[n] = '\0';
+    p->kolibri_key_len = n;
+    p->kolibri_key_full = true;
+    agent_kolibri_dec_reset(p);
+    p->kolibri_step = KOLIBRI_WANT_COLON;
+}
+
+/* Synchronous parse of a complete {"key": value, ...} object into flat tool
+ * arguments; used when the model wraps the argument object in a JSON string.
+ * Strings arrive JSON-decoded (no HTML unescaping), numbers/booleans/null and
+ * nested containers keep their literal JSON text. */
+static int agent_kolibri_parse_args_text(agent_dsml_parser *p,
+                                         const char *s, size_t n) {
+    size_t i = 0;
+    #define KOLIBRI_SKIP_WS() \
+        while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) i++
+    KOLIBRI_SKIP_WS();
+    if (i >= n || s[i] != '{') {
+        agent_dsml_set_error(p, "arguments must be a JSON object");
+        return -1;
+    }
+    i++;
+    for (;;) {
+        KOLIBRI_SKIP_WS();
+        if (i < n && s[i] == '}') {
+            i++;
+            break;
+        }
+        if (i >= n || s[i] != '"') {
+            agent_dsml_set_error(p, "arguments object requires string keys");
+            return -1;
+        }
+        i++;
+        agent_buf key = {0};
+        while (i < n && s[i] != '"') {
+            if (s[i] == '\\' && i + 1 < n) {
+                agent_buf_append(&key, s + i + 1, 1);
+                i += 2;
+            } else {
+                agent_buf_append(&key, s + i, 1);
+                i++;
+            }
+        }
+        if (i >= n) {
+            agent_buf_free(&key);
+            agent_dsml_set_error(p, "unterminated argument key");
+            return -1;
+        }
+        i++;
+        KOLIBRI_SKIP_WS();
+        if (i >= n || s[i] != ':') {
+            agent_buf_free(&key);
+            agent_dsml_set_error(p, "expected ':' after argument key");
+            return -1;
+        }
+        i++;
+        KOLIBRI_SKIP_WS();
+        if (i >= n) {
+            agent_buf_free(&key);
+            agent_dsml_set_error(p, "argument value missing");
+            return -1;
+        }
+        if (s[i] == '"') {
+            i++;
+            agent_buf val = {0};
+            while (i < n && s[i] != '"') {
+                if (s[i] == '\\' && i + 1 < n) {
+                    char e = s[i + 1];
+                    if (e == 'n') agent_buf_append(&val, "\n", 1);
+                    else if (e == 't') agent_buf_append(&val, "\t", 1);
+                    else if (e == 'r') agent_buf_append(&val, "\r", 1);
+                    else agent_buf_append(&val, s + i + 1, 1);
+                    i += 2;
+                } else {
+                    agent_buf_append(&val, s + i, 1);
+                    i++;
+                }
+            }
+            if (i >= n) {
+                agent_buf_free(&key);
+                agent_buf_free(&val);
+                agent_dsml_set_error(p, "unterminated argument string");
+                return -1;
+            }
+            i++;
+            agent_tool_call_add_arg(&p->current, key.ptr ? key.ptr : "",
+                                    val.ptr ? val.ptr : "", val.len, false, "");
+            agent_buf_free(&key);
+            agent_buf_free(&val);
+        } else {
+            size_t start = i;
+            int depth = 0;
+            bool instr = false, esc = false;
+            while (i < n) {
+                char c = s[i];
+                if (instr) {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') instr = false;
+                } else if (c == '"') instr = true;
+                else if (c == '{' || c == '[') depth++;
+                else if (c == '}' || c == ']') {
+                    if (depth == 0) break;
+                    depth--;
+                } else if (depth == 0 && (c == ',' || c == '}')) break;
+                i++;
+            }
+            if (i == start) {
+                agent_buf_free(&key);
+                agent_dsml_set_error(p, "argument value missing");
+                return -1;
+            }
+            agent_tool_call_add_arg(&p->current, key.ptr ? key.ptr : "",
+                                    s + start, i - start, false, "");
+            agent_buf_free(&key);
+        }
+        KOLIBRI_SKIP_WS();
+        if (i < n && s[i] == ',') {
+            i++;
+            continue;
+        }
+        if (i < n && s[i] == '}') {
+            i++;
+            break;
+        }
+        agent_dsml_set_error(p, "malformed arguments object");
+        return -1;
+    }
+    KOLIBRI_SKIP_WS();
+    if (i != n) {
+        agent_dsml_set_error(p, "trailing bytes after arguments object");
+        return -1;
+    }
+    return 0;
+    #undef KOLIBRI_SKIP_WS
+}
+
+static void agent_kolibri_commit_string_value(agent_dsml_parser *p) {
+    if (p->kolibri_frame == 1) {
+        agent_tool_call_add_arg(&p->current, p->kolibri_key,
+                                p->kolibri_dec ? p->kolibri_dec : "",
+                                p->kolibri_dec_len, false, "");
+    } else if (agent_kolibri_key_is(p, "name")) {
+        free(p->current.name);
+        p->current.name = xstrndup(p->kolibri_dec ? p->kolibri_dec : "",
+                                   p->kolibri_dec_len);
+        p->kolibri_have_name = true;
+    } else if (agent_kolibri_key_is(p, "arguments")) {
+        /* The template allows arguments wrapped as a JSON-encoded string. */
+        if (agent_kolibri_parse_args_text(p,
+                                          p->kolibri_dec ? p->kolibri_dec : "",
+                                          p->kolibri_dec_len) != 0)
+            return;
+        p->kolibri_args_complete = true;
+    }
+    /* Unknown top-level members are discarded. */
+    agent_kolibri_dec_reset(p);
+    agent_kolibri_end_param_viz(p);
+    if (p->state != AGENT_DSML_ERROR) p->kolibri_step = KOLIBRI_AFTER_VALUE;
+}
+
+static void agent_kolibri_reset_call_state(agent_dsml_parser *p) {
+    p->kolibri_step = KOLIBRI_WANT_OBJECT;
+    p->kolibri_frame = 0;
+    p->kolibri_key_len = 0;
+    p->kolibri_key_full = false;
+    p->kolibri_have_name = false;
+    p->kolibri_args_complete = false;
+    p->kolibri_nested_depth = 0;
+    p->kolibri_nested_str = p->kolibri_nested_esc = false;
+    agent_kolibri_dec_reset(p);
+}
+
+static int agent_kolibri_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Streaming walker for tool-call stanzas wrapping one JSON object each:
+ * {"name": <function-name>, "arguments": <args-json-object>}.  Consecutive
+ * stanzas continue in the same parser.  Incomplete input waits; malformed
+ * completed input errors so the model gets a retryable tool error. */
+static void agent_kolibri_tool_parse(agent_dsml_parser *p) {
+    static const char start[] = "<tool_call>";
+    static const char close[] = "</tool_call>";
+    static const char open[] = "<tool_call>";
+
+    if (p->raw_len < sizeof(start) - 1 ||
+        memcmp(p->raw, start, sizeof(start) - 1) != 0) {
+        return;
+    }
+
+    while (p->parse_pos < p->raw_len &&
+           (p->state == AGENT_DSML_STRUCTURAL ||
+            p->state == AGENT_DSML_PARAM_VALUE)) {
+        const char c = p->raw[p->parse_pos];
+        const char *rest = p->raw + p->parse_pos;
+        const size_t rest_len = p->raw_len - p->parse_pos;
+
+        switch (p->kolibri_step) {
+        case KOLIBRI_WANT_OBJECT:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '{') {
+                p->parse_pos++;
+                p->kolibri_step = KOLIBRI_WANT_KEY;
+                continue;
+            }
+            agent_dsml_set_error(p, "expected tool-call JSON object");
+            return;
+
+        case KOLIBRI_WANT_KEY:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '"') {
+                agent_kolibri_dec_reset(p);
+                p->kolibri_step = KOLIBRI_KEY_STRING;
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '}') {
+                p->parse_pos++;
+                if (p->kolibri_frame == 1) {
+                    /* Empty arguments object: back to the top level. */
+                    p->kolibri_frame = 0;
+                    p->kolibri_args_complete = true;
+                    p->kolibri_step = KOLIBRI_AFTER_VALUE;
+                } else {
+                    p->kolibri_step = KOLIBRI_WANT_CLOSE;
+                }
+                continue;
+            }
+            agent_dsml_set_error(p, "expected object key in tool call");
+            return;
+
+        case KOLIBRI_KEY_STRING:
+            if (p->kolibri_esc) {
+                p->kolibri_esc = false;
+                if (c == 'u') {
+                    p->kolibri_uni_need = 4;
+                    p->kolibri_uni_val = 0;
+                } else if (c == 'n') agent_kolibri_dec_put(p, '\n');
+                else if (c == 't') agent_kolibri_dec_put(p, '\t');
+                else if (c == 'r') agent_kolibri_dec_put(p, '\r');
+                else agent_kolibri_dec_put(p, c);
+                p->parse_pos++;
+                continue;
+            }
+            if (p->kolibri_uni_need) {
+                int v = agent_kolibri_hexval(c);
+                if (v < 0) {
+                    agent_dsml_set_error(p, "invalid unicode escape in tool-call key");
+                    return;
+                }
+                p->kolibri_uni_val = p->kolibri_uni_val * 16 + (unsigned)v;
+                if (--p->kolibri_uni_need == 0)
+                    agent_kolibri_dec_utf8(p, p->kolibri_uni_val);
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '\\') {
+                p->kolibri_esc = true;
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '"') {
+                p->parse_pos++;
+                agent_kolibri_commit_key(p);
+                continue;
+            }
+            agent_kolibri_dec_put(p, c);
+            p->parse_pos++;
+            continue;
+
+        case KOLIBRI_WANT_COLON:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (c == ':') {
+                p->parse_pos++;
+                p->kolibri_step = KOLIBRI_WANT_VALUE;
+                continue;
+            }
+            agent_dsml_set_error(p, "expected ':' after tool-call key");
+            return;
+
+        case KOLIBRI_WANT_VALUE:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '"') {
+                agent_kolibri_dec_reset(p);
+                if (p->kolibri_frame == 1) {
+                    p->state = AGENT_DSML_PARAM_VALUE;
+                    free(p->param_name);
+                    p->param_name = xstrdup(p->kolibri_key);
+                    p->param_value_start = p->parse_pos + 1;
+                    p->param_close_prefix = false;
+                }
+                p->kolibri_step = KOLIBRI_STRING_VALUE;
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '{' || c == '[') {
+                if (p->kolibri_frame == 0 && agent_kolibri_key_is(p, "arguments")) {
+                    p->kolibri_frame = 1;
+                    p->kolibri_step = KOLIBRI_WANT_KEY;
+                    p->parse_pos++;
+                    continue;
+                }
+                p->kolibri_value_start = p->parse_pos;
+                p->kolibri_nested_depth = 1;
+                p->kolibri_nested_str = p->kolibri_nested_esc = false;
+                p->kolibri_step = KOLIBRI_NESTED_VALUE;
+                p->parse_pos++;
+                continue;
+            }
+            if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' ||
+                c == 't' || c == 'f' || c == 'n') {
+                p->kolibri_value_start = p->parse_pos;
+                p->kolibri_step = KOLIBRI_LITERAL_VALUE;
+                p->parse_pos++;
+                continue;
+            }
+            agent_dsml_set_error(p, "invalid tool-call value");
+            return;
+
+        case KOLIBRI_STRING_VALUE:
+            if (p->kolibri_esc) {
+                p->kolibri_esc = false;
+                switch (c) {
+                case 'n': agent_kolibri_dec_put(p, '\n'); break;
+                case 't': agent_kolibri_dec_put(p, '\t'); break;
+                case 'r': agent_kolibri_dec_put(p, '\r'); break;
+                case 'b': agent_kolibri_dec_put(p, '\b'); break;
+                case 'f': agent_kolibri_dec_put(p, '\f'); break;
+                case 'u':
+                    p->kolibri_uni_need = 4;
+                    p->kolibri_uni_val = 0;
+                    break;
+                default: agent_kolibri_dec_put(p, c); break;
+                }
+                p->parse_pos++;
+                continue;
+            }
+            if (p->kolibri_uni_need) {
+                int v = agent_kolibri_hexval(c);
+                if (v < 0) {
+                    agent_dsml_set_error(p, "invalid unicode escape in tool call");
+                    return;
+                }
+                p->kolibri_uni_val = p->kolibri_uni_val * 16 + (unsigned)v;
+                if (--p->kolibri_uni_need == 0) {
+                    unsigned cp = p->kolibri_uni_val;
+                    if (cp >= 0xd800u && cp <= 0xdbffu) {
+                        p->kolibri_uni_high = cp;
+                    } else if (p->kolibri_uni_high) {
+                        if (cp >= 0xdc00u && cp <= 0xdfffu) {
+                            cp = 0x10000u + ((p->kolibri_uni_high - 0xd800u) << 10) +
+                                 (cp - 0xdc00u);
+                        }
+                        agent_kolibri_dec_utf8(p, cp);
+                        p->kolibri_uni_high = 0;
+                    } else {
+                        agent_kolibri_dec_utf8(p, cp);
+                    }
+                }
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '\\') {
+                p->kolibri_esc = true;
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '"') {
+                p->parse_pos++;
+                agent_kolibri_commit_string_value(p);
+                continue;
+            }
+            agent_kolibri_dec_put(p, c);
+            p->parse_pos++;
+            continue;
+
+        case KOLIBRI_NESTED_VALUE:
+            if (p->kolibri_nested_str) {
+                if (p->kolibri_nested_esc) p->kolibri_nested_esc = false;
+                else if (c == '\\') p->kolibri_nested_esc = true;
+                else if (c == '"') p->kolibri_nested_str = false;
+            } else if (c == '"') {
+                p->kolibri_nested_str = true;
+            } else if (c == '{' || c == '[') {
+                p->kolibri_nested_depth++;
+            } else if (c == '}' || c == ']') {
+                if (--p->kolibri_nested_depth == 0) {
+                    size_t len = p->parse_pos - p->kolibri_value_start + 1;
+                    if (p->kolibri_frame == 1)
+                        agent_tool_call_add_arg(&p->current, p->kolibri_key,
+                                                p->raw + p->kolibri_value_start,
+                                                len, false, "");
+                    agent_kolibri_end_param_viz(p);
+                    if (p->state == AGENT_DSML_ERROR) return;
+                    p->kolibri_step = KOLIBRI_AFTER_VALUE;
+                }
+            }
+            p->parse_pos++;
+            continue;
+
+        case KOLIBRI_LITERAL_VALUE:
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') || c == '.' || c == '+' || c == '-') {
+                p->parse_pos++;
+                continue;
+            }
+            {
+                size_t len = p->parse_pos - p->kolibri_value_start;
+                if (p->kolibri_frame == 1 && len)
+                    agent_tool_call_add_arg(&p->current, p->kolibri_key,
+                                            p->raw + p->kolibri_value_start,
+                                            len, false, "");
+                agent_kolibri_end_param_viz(p);
+                if (p->state == AGENT_DSML_ERROR) return;
+                p->kolibri_step = KOLIBRI_AFTER_VALUE;
+            }
+            continue; /* do not consume: AFTER_VALUE re-examines this byte */
+
+        case KOLIBRI_AFTER_VALUE:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (c == ',') {
+                p->parse_pos++;
+                p->kolibri_key_full = false;
+                p->kolibri_step = KOLIBRI_WANT_KEY;
+                continue;
+            }
+            if (c == '}') {
+                p->parse_pos++;
+                if (p->kolibri_frame == 1) {
+                    p->kolibri_frame = 0;
+                    p->kolibri_args_complete = true;
+                    /* the top level continues after the arguments value */
+                    p->kolibri_step = KOLIBRI_AFTER_VALUE;
+                } else {
+                    p->kolibri_step = KOLIBRI_WANT_CLOSE;
+                }
+                continue;
+            }
+            agent_dsml_set_error(p, "expected ',' or '}' in tool call");
+            return;
+
+        case KOLIBRI_WANT_CLOSE:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (rest_len < sizeof(close) - 1) {
+                if (memcmp(close, rest, rest_len) == 0) return; /* wait */
+                agent_dsml_set_error(p, "expected tool-call close marker");
+                return;
+            }
+            if (memcmp(close, rest, sizeof(close) - 1) != 0) {
+                agent_dsml_set_error(p, "expected tool-call close marker");
+                return;
+            }
+            p->parse_pos += sizeof(close) - 1;
+            if (!p->current.name) {
+                agent_dsml_set_error(p, "tool call without name");
+                return;
+            }
+            agent_tool_calls_push(&p->calls, &p->current);
+            p->glm_after_call = true;
+            p->kolibri_step = KOLIBRI_AFTER_CALL;
+            continue;
+
+        case KOLIBRI_AFTER_CALL:
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                p->parse_pos++;
+                continue;
+            }
+            if (c == '<') {
+                size_t open_len = sizeof(open) - 1;
+                if (rest_len < open_len) {
+                    if (memcmp(open, rest, rest_len) == 0) return; /* wait */
+                    p->state = AGENT_DSML_DONE;
+                    return;
+                }
+                if (memcmp(open, rest, open_len) == 0) {
+                    p->parse_pos += open_len;
+                    agent_tool_call_free(&p->current);
+                    agent_kolibri_reset_call_state(p);
+                    continue;
+                }
+                p->state = AGENT_DSML_DONE;
+                return;
+            }
+            p->state = AGENT_DSML_DONE;
+            return;
+        }
+    }
 }
 
 static void agent_dsml_parser_reset(agent_dsml_parser *p) {
@@ -2006,6 +2799,12 @@ static bool agent_tool_value_close_tail(agent_tool_syntax syntax,
         return agent_qwen_param_close_tail(tail, len, complete);
     if (syntax == AGENT_TOOL_SYNTAX_GLM)
         return agent_glm_arg_value_close_tail(tail, len, complete);
+    if (syntax == AGENT_TOOL_SYNTAX_KOLIBRI) {
+        /* Kolibri values are JSON: string ends are quote-driven and the
+         * parser itself leaves PARAM_VALUE, so no tag tail to detect. */
+        *complete = false;
+        return false;
+    }
     return agent_dsml_parameter_close_tail(syntax, tail, len, complete);
 }
 
@@ -2343,6 +3142,10 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
         agent_glm_tool_parse(p);
         return;
     }
+    if (p->syntax == AGENT_TOOL_SYNTAX_KOLIBRI) {
+        agent_kolibri_tool_parse(p);
+        return;
+    }
 
     const char *calls = agent_dsml_tag_name(p->syntax, "tool_calls");
     const char *invoke = agent_dsml_tag_name(p->syntax, "invoke");
@@ -2428,6 +3231,8 @@ static void agent_dsml_start(agent_dsml_parser *p) {
     const char *start = agent_tool_start(p->syntax);
     p->state = AGENT_DSML_STRUCTURAL;
     p->search_len = 0;
+    if (p->syntax == AGENT_TOOL_SYNTAX_KOLIBRI)
+        agent_kolibri_reset_call_state(p);
     agent_dsml_raw_append(p, start, strlen(start));
     p->parse_pos = strlen(start);
 }
@@ -4167,6 +4972,34 @@ static void agent_stream_tool_events(agent_stream_renderer *sr) {
         agent_tool_viz_param_begin(sr, p->param_name);
 }
 
+/* Record a failed edit old preflight: the caller stops the block and the model
+ * gets a retryable tool error instead of a full new-text generation. */
+static void agent_stream_preflight_fail(agent_stream_renderer *sr, const char *err) {
+    sr->tool_preflight_error = true;
+    snprintf(sr->tool_preflight_error_msg, sizeof(sr->tool_preflight_error_msg),
+             "edit old selector failed before new was generated: %s",
+             err[0] ? err : "old text is not a unique match");
+    agent_trace(sr->renderer->worker, "edit old preflight failed: %s",
+                sr->tool_preflight_error_msg);
+}
+
+/* Check the committed call directly.  This is the earliest point for models
+ * that wrap arguments in a JSON string or emit old before path; the param
+ * close path below catches the common path-then-old order even earlier. */
+static void agent_stream_preflight_edit_call(agent_stream_renderer *sr) {
+    if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
+        return;
+    agent_dsml_parser *p = sr->parser;
+    if (!p || !p->current.name || strcmp(p->current.name, "edit") != 0)
+        return;
+
+    char err[256] = {0};
+    if (agent_preflight_edit_old(sr->renderer->worker, &p->current,
+                                 err, sizeof(err)))
+        return;
+    agent_stream_preflight_fail(sr, err);
+}
+
 static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
     if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
         return;
@@ -4176,18 +5009,7 @@ static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
         return;
     if (!p->current.name || strcmp(p->current.name, "edit") != 0)
         return;
-
-    char err[256] = {0};
-    if (agent_preflight_edit_old(sr->renderer->worker, &p->current,
-                                 err, sizeof(err)))
-        return;
-
-    sr->tool_preflight_error = true;
-    snprintf(sr->tool_preflight_error_msg, sizeof(sr->tool_preflight_error_msg),
-             "edit old selector failed before new was generated: %s",
-             err[0] ? err : "old text is not a unique match");
-    agent_trace(sr->renderer->worker, "edit old preflight failed: %s",
-                sr->tool_preflight_error_msg);
+    agent_stream_preflight_edit_call(sr);
 }
 
 static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
@@ -4201,6 +5023,12 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
         {
             agent_stream_preflight_closed_param(sr);
             agent_tool_viz_param_end(sr);
+        }
+        if (sr->parser->syntax == AGENT_TOOL_SYNTAX_KOLIBRI &&
+            sr->parser->kolibri_args_complete)
+        {
+            sr->parser->kolibri_args_complete = false;
+            agent_stream_preflight_edit_call(sr);
         }
     }
     if (sr->parser->state == AGENT_DSML_DONE) {
@@ -4601,51 +5429,7 @@ static bool worker_cancel_session_cb(void *ud) {
     return worker_should_interrupt(ud);
 }
 
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-    size_t limit;
-    bool truncated;
-} agent_buf;
-
 #define AGENT_TOOL_MAX_BYTES (128 * 1024)
-
-static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
-    if (!n || b->truncated) return;
-    const size_t max = b->limit ? b->limit : SIZE_MAX - 1;
-    if (n > max - b->len) {
-        n = max > b->len ? max - b->len : 0;
-        while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--;
-        b->truncated = true;
-    }
-    if (!n) return;
-    if (b->len + n + 1 > b->cap) {
-        size_t cap = b->cap ? b->cap * 2 : 4096;
-        while (cap < b->len + n + 1) cap *= 2;
-        b->ptr = xrealloc(b->ptr, cap);
-        b->cap = cap;
-    }
-    memcpy(b->ptr + b->len, s, n);
-    b->len += n;
-    b->ptr[b->len] = '\0';
-}
-
-static void agent_buf_puts(agent_buf *b, const char *s) {
-    agent_buf_append(b, s, strlen(s));
-}
-
-static char *agent_buf_take(agent_buf *b) {
-    if (b->truncated) {
-        b->truncated = false;
-        b->limit = 0;
-        agent_buf_puts(b, "\n[Output truncated at the tool byte limit. Narrow the request.]\n");
-    }
-    if (!b->ptr) return xstrdup("");
-    char *p = b->ptr;
-    memset(b, 0, sizeof(*b));
-    return p;
-}
 
 /* Adapt only our trusted examples, including their escaped closing tags.
  * Never translate sampled text or user/tool payloads between model formats. */
@@ -5123,6 +5907,30 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
 static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     ds4_chat_begin(w->engine, out);
     ds4_think_mode think_mode = effective_think_mode(w->cfg);
+    if (agent_tool_syntax_for_engine(w->engine) == AGENT_TOOL_SYNTAX_KOLIBRI) {
+        /* Kolibri-1 folds system text, the effort sentence and the tool
+         * definitions into ONE system block, in the released template's
+         * order: content (including ds4's coding-agent rules), then
+         * "# Reasoning effort", then the template-shaped tools section. */
+        char *tools = agent_kolibri_tools_section(ds4_engine_has_vision(w->engine));
+        char *rules = agent_kolibri_rules_text(w->cfg->edit_upto);
+        const char *sys = w->cfg->gen.system;
+        char *content = NULL;
+        if (sys && sys[0] && rules[0]) {
+            size_t n = strlen(sys) + strlen(rules) + 1;
+            content = xmalloc(n);
+            snprintf(content, n, "%s%s", sys, rules);
+        } else {
+            content = xstrdup(sys && sys[0] ? sys : rules);
+        }
+        ds4_chat_append_system_effort_tools(w->engine, out, content,
+                                            think_mode, tools);
+        free(content);
+        free(rules);
+        free(tools);
+        ds4_prompt_prefix_append(w->engine, out, &w->cfg->gen.prefix);
+        return;
+    }
     if (ds4_engine_is_qwen4(w->engine)) {
         const char *effort = ds4_qwen4_reasoning_effort_text(think_mode);
         if (effort) ds4_chat_append_message(w->engine, out, "system", effort);
@@ -8155,6 +8963,289 @@ static void test_agent_hints_state(void) {
     free(glm);
 }
 
+static void test_agent_kolibri_tool_parser_single_arg(void) {
+    const char *text =
+        "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"x\"}}\n</tool_call>";
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_dsml_feed(&p, text, strlen(text));
+    agent_dsml_finish(&p);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "read"));
+    AGENT_TEST_ASSERT(p.calls.v[0].argc == 1);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "path"), "x"));
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_kolibri_tool_parser_escapes_and_scalars(void) {
+    const char *text =
+        "<tool_call>\n{\"name\": \"bash\", \"arguments\": "
+        "{\"command\": \"printf \\\"hi\\\"\\nbye\\\\\", \"timeout_sec\": 42, "
+        "\"whole\": true, \"none\": null, \"opts\": {\"a\": [1, 2]}}}\n</tool_call>";
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_dsml_feed(&p, text, strlen(text));
+    agent_dsml_finish(&p);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(p.calls.v[0].name && !strcmp(p.calls.v[0].name, "bash"));
+    AGENT_TEST_ASSERT(p.calls.v[0].argc == 5);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "command"),
+                              "printf \"hi\"\nbye\\"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "timeout_sec"), "42"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "whole"), "true"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "none"), "null"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "opts"), "{\"a\": [1, 2]}"));
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_kolibri_tool_parser_two_calls_and_string_args(void) {
+    const char *text =
+        "<tool_call>\n{\"name\": \"list\", \"arguments\": {\"path\": \".\"}}\n</tool_call>\n"
+        "<tool_call>\n{\"name\": \"read\", \"arguments\": "
+        "{\"path\": \"/tmp/a b\", \"arguments\": \"{\\\"x\\\": 1}\"}}\n</tool_call>";
+    agent_dsml_parser p = {
+        .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_dsml_feed(&p, text, strlen(text));
+    agent_dsml_finish(&p);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 2);
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[0].name, "list"));
+    AGENT_TEST_ASSERT(!strcmp(p.calls.v[1].name, "read"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "path"), "/tmp/a b"));
+    /* an argument literally named "arguments" carrying a JSON string value */
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "arguments"), "{\"x\": 1}"));
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_kolibri_tool_parser_errors(void) {
+    struct {
+        const char *text;
+        const char *why;
+    } cases[] = {
+        {"<tool_call>\n{\"name\": 5, \"arguments\": {}}\n</tool_call>",
+         "tool name must be a string"},
+        {"<tool_call>\n{\"name\": \"list\", \"arguments\": {\"path\": }}\n</tool_call>",
+         "invalid tool-call value"},
+        {"<tool_call>\n{\"name\": \"list\", \"arguments\": {\"path\": \".\"}}\nX",
+         "expected tool-call close marker"},
+        {"<tool_call>\n{\"arguments\": {\"path\": \".\"}}\n</tool_call>",
+         "tool call without name"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        agent_dsml_parser p = {
+            .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+            .state = AGENT_DSML_SEARCH,
+        };
+        agent_dsml_feed(&p, cases[i].text, strlen(cases[i].text));
+        agent_dsml_finish(&p);
+        if (p.state != AGENT_DSML_ERROR)
+            fprintf(stderr, "kolibri error case %zu (%s): state=%d\n",
+                    i, cases[i].why, p.state);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_ERROR);
+        agent_dsml_parser_free(&p);
+    }
+    /* A call with no arguments member is a valid zero-arg call. */
+    const char *no_args =
+        "<tool_call>\n{\"name\": \"list\"}\n</tool_call>";
+    agent_dsml_parser z = {
+        .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_dsml_feed(&z, no_args, strlen(no_args));
+    agent_dsml_finish(&z);
+    AGENT_TEST_ASSERT(z.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(z.calls.len == 1 && z.calls.v[0].argc == 0 &&
+                      !strcmp(z.calls.v[0].name, "list"));
+    agent_dsml_parser_free(&z);
+    /* Incomplete (still waiting) input must not error, just stay structural. */
+    const char *partial =
+        "<tool_call>\n{\"name\": \"list\", \"arguments\": {\"path\": \".\"}}\n";
+    agent_dsml_parser q = {
+        .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        .state = AGENT_DSML_SEARCH,
+    };
+    agent_dsml_feed(&q, partial, strlen(partial));
+    AGENT_TEST_ASSERT(q.state == AGENT_DSML_STRUCTURAL && q.calls.len == 0);
+    agent_dsml_feed(&q, "</tool_call>", strlen("</tool_call>"));
+    agent_dsml_finish(&q);
+    AGENT_TEST_ASSERT(q.state == AGENT_DSML_DONE && q.calls.len == 1);
+    agent_dsml_parser_free(&q);
+}
+
+static void test_agent_kolibri_stream_tool_call_chunked(void) {
+    const char *chunks[] = {
+        "Working on it. ",
+        "<to",
+        "ol_call>\n{\"name\": \"bash\", \"arg",
+        "uments\": {\"command\": \"printf hi\", \"refresh_sec\": 1}}\n</tool_call>",
+    };
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_KOLIBRI, chunks,
+                                          sizeof(chunks)/sizeof(chunks[0]), &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "command"), "printf hi"));
+    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "refresh_sec"), "1"));
+    AGENT_TEST_ASSERT(strstr(out, "Working on it. ") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "\"arguments\"") == NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+/* The edit old selector must be preflighted the moment the old string closes:
+ * generation can then stop before the model spends tokens on new text.  A
+ * matching old stays silent, a missing one sets the early-stop error.  The
+ * same check must fire at the earliest point the committed call allows when
+ * the model wraps arguments in a JSON string or emits old before path. */
+static void test_agent_kolibri_stream_edit_old_preflight(void) {
+    char path[] = "/tmp/ds4-kolibri-preflight-XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    const char body[] = "alpha\nbeta\ngamma\n";
+    AGENT_TEST_ASSERT(write(fd, body, sizeof(body) - 1) ==
+                      (ssize_t)(sizeof(body) - 1));
+    close(fd);
+
+    char head_path_old[512], head_old_first[512], head_str_args[512];
+    snprintf(head_path_old, sizeof(head_path_old),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "{\"path\": \"%s\", \"old\": \"beta\"", path);
+    snprintf(head_old_first, sizeof(head_old_first),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "{\"old\": \"zzz-missing\"");
+    snprintf(head_str_args, sizeof(head_str_args),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "\"{\\\"path\\\": \\\"%s\\\", \\\"old\\\": \\\"zzz-missing\\\"}\"", path);
+
+    const char *match[] = {
+        head_path_old, ", \"new\": \"B\"}}\n</tool_call>",
+    };
+    const char *old_first[] = {
+        head_old_first, ", \"path\": \"", path, "\"}}", "\n</tool_call>",
+    };
+    const char *str_args[] = {
+        head_str_args, "}\n</tool_call>",
+    };
+    char missing_head[512];
+    snprintf(missing_head, sizeof(missing_head),
+             "<tool_call>\n{\"name\": \"edit\", \"arguments\": "
+             "{\"path\": \"%s\", \"old\": \"zzz-missing\"", path);
+    const char *missing[] = {
+        missing_head, ", \"new\": \"B\"}}\n</tool_call>",
+    };
+
+    struct {
+        const char **chunks;
+        size_t count;
+        size_t check_after; /* 1-based chunk index to inspect the flag at */
+        bool expect_error;
+    } cases[] = {
+        { match, 2, 1, false },
+        { missing, 2, 1, true },
+        { old_first, 5, 4, true },
+        { str_args, 2, 1, true },
+    };
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        agent_tail_capture out = { .cap = 4096 };
+        agent_token_renderer renderer = {
+            .format_thinking = true,
+            .format_markdown = false,
+            .last_output_newline = true,
+            .capture = &out,
+        };
+        agent_dsml_parser p = {
+            .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+            .state = AGENT_DSML_SEARCH,
+        };
+        agent_stream_renderer stream = {
+            .renderer = &renderer,
+            .parser = &p,
+            .syntax = AGENT_TOOL_SYNTAX_KOLIBRI,
+        };
+
+        bool early = false;
+        for (size_t i = 0; i < cases[c].count; i++) {
+            agent_stream_text(&stream, cases[c].chunks[i],
+                              strlen(cases[c].chunks[i]), false);
+            if (i + 1 == cases[c].check_after) early = stream.tool_preflight_error;
+        }
+        agent_stream_text(&stream, NULL, 0, true);
+        if (early != cases[c].expect_error)
+            fprintf(stderr, "edit preflight case %zu: early=%d want=%d\n",
+                    c, (int)early, (int)cases[c].expect_error);
+        AGENT_TEST_ASSERT(early == cases[c].expect_error);
+        AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 1 &&
+                          !strcmp(agent_tool_arg_value(&p.calls.v[0], "old"),
+                                  c == 0 ? "beta" : "zzz-missing"));
+        agent_dsml_parser_free(&p);
+        char *captured = agent_tail_capture_take(&out, NULL);
+        free(captured);
+    }
+    unlink(path);
+}
+
+static void test_agent_kolibri_stream_ignores_tool_inside_think(void) {
+    const char *inside[] = {
+        "<think>plan</think>\n<tool_call>\n{\"name\": \"list\", "
+        "\"arguments\": {\"path\": \".\"}}\n</tool_call>done",
+    };
+    /* Outside think the call executes; inside think it is suppressed. */
+    agent_dsml_parser p;
+    char *out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_KOLIBRI, inside, 1, &p, NULL);
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE && p.calls.len == 1);
+    AGENT_TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    free(out);
+    agent_dsml_parser_free(&p);
+
+    const char *wrapped[] = {
+        "<think>plan\n<tool_call>\n{\"name\": \"list\", "
+        "\"arguments\": {\"path\": \".\"}}\n</tool_call>\n</think>Done",
+    };
+    bool early = false;
+    out = agent_test_stream_capture(AGENT_TOOL_SYNTAX_KOLIBRI, wrapped, 1, &p, &early);
+    AGENT_TEST_ASSERT(early && p.calls.len == 0 && strstr(out, "tool call ignored"));
+    free(out);
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_kolibri_tools_prompt(void) {
+    for (int vision = 0; vision < 2; vision++) {
+        char *section = agent_kolibri_tools_section(vision);
+        AGENT_TEST_ASSERT(strstr(section, "# Tools\n\n") == section);
+        AGENT_TEST_ASSERT(strstr(section, "within <tool_call></tool_call> XML tags"));
+        AGENT_TEST_ASSERT(strstr(section, "{\"function\": {\"description\": "
+                                          "\"Run a shell command.\", \"name\": \"bash\""));
+        AGENT_TEST_ASSERT((strstr(section, "view_image") != NULL) == vision);
+        /* The template-shaped section must end at the call instructions. */
+        size_t len = strlen(section);
+        AGENT_TEST_ASSERT(len > 12 && !strcmp(section + len - 12, "</tool_call>"));
+        /* json.dumps formatting: no characters jinja's htmlsafe filter escapes. */
+        AGENT_TEST_ASSERT(!strpbrk(section, "<>&'") || strstr(section, "<tools>"));
+        for (const char *q = strstr(section, "<tools>\n"); q && *q; q++) {
+            if (*q == '\n' && q != section && q[-1] != '}') break;
+        }
+        free(section);
+        char *rules = agent_kolibri_rules_text(false);
+        AGENT_TEST_ASSERT(strstr(rules, "# Rules\n\n"));
+        AGENT_TEST_ASSERT(strstr(rules, "not allowed inside <think>"));
+        free(rules);
+        char *blob = agent_build_kolibri_tools_prompt(false, vision);
+        AGENT_TEST_ASSERT(strstr(blob, "# Rules") && strstr(blob, "# Tools"));
+        free(blob);
+    }
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_hints_state();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -8176,6 +9267,14 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_qwen_tool_parser_two_calls_and_error();
     test_agent_qwen_stream_tool_call_chunked();
     test_agent_qwen_argument_markers_bytewise();
+    test_agent_kolibri_tool_parser_single_arg();
+    test_agent_kolibri_tool_parser_escapes_and_scalars();
+    test_agent_kolibri_tool_parser_two_calls_and_string_args();
+    test_agent_kolibri_tool_parser_errors();
+    test_agent_kolibri_stream_tool_call_chunked();
+    test_agent_kolibri_stream_edit_old_preflight();
+    test_agent_kolibri_stream_ignores_tool_inside_think();
+    test_agent_kolibri_tools_prompt();
     test_agent_glm_stream_ignores_tool_inside_think();
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
@@ -10270,7 +11369,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return ds4_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
-                              0,
+                              greedy ? 0 : cfg->gen.top_k,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
                               rng);
@@ -10500,7 +11599,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 ntok = ds4_session_eval_speculative(
                     w->session, token, max_tokens - generated,
                     ds4_token_eos(w->engine),
-                    greedy_sampling ? 0.0f : cfg->gen.temperature, 0,
+                    greedy_sampling ? 0.0f : cfg->gen.temperature, cfg->gen.top_k,
                     greedy_sampling ? 1.0f : cfg->gen.top_p,
                     greedy_sampling ? 0.0f : cfg->gen.min_p,
                     &rng, toks, (int)(sizeof(toks) / sizeof(toks[0])),
@@ -10705,6 +11804,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             snprintf(dsml.error, sizeof(dsml.error),
                      tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? "incomplete Qwen tool call" :
                      tool_syntax == AGENT_TOOL_SYNTAX_GLM ? "incomplete GLM tool call" :
+                     tool_syntax == AGENT_TOOL_SYNTAX_KOLIBRI ? "incomplete Kolibri tool call" :
                      "incomplete DSML tool call");
         }
 
@@ -10730,6 +11830,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 &observation,
                 tool_syntax == AGENT_TOOL_SYNTAX_QWEN ? "Tool error: invalid Qwen tool call: " :
                 tool_syntax == AGENT_TOOL_SYNTAX_GLM ? "Tool error: invalid GLM tool call: " :
+                tool_syntax == AGENT_TOOL_SYNTAX_KOLIBRI ? "Tool error: invalid Kolibri tool call: " :
                 "Tool error: invalid DSML tool call: ");
             agent_tool_observation_puts(
                 &observation, dsml.error[0] ? dsml.error : "parse error");
@@ -10737,7 +11838,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_tool_observation_puts(
                 &observation, tool_syntax == AGENT_TOOL_SYNTAX_QWEN ?
                 agent_qwen_syntax_reminder : tool_syntax == AGENT_TOOL_SYNTAX_GLM ?
-                agent_glm_syntax_reminder : tool_syntax == AGENT_TOOL_SYNTAX_DSML41 ?
+                agent_glm_syntax_reminder : tool_syntax == AGENT_TOOL_SYNTAX_KOLIBRI ?
+                agent_kolibri_syntax_reminder : tool_syntax == AGENT_TOOL_SYNTAX_DSML41 ?
                 agent_dsml41_syntax_reminder : agent_dsml_syntax_reminder);
         } else {
             agent_tool_observation_free(&observation);
@@ -10887,7 +11989,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
     while (generated < max_tokens && !worker_should_interrupt(w)) {
         int token = ds4_session_sample(w->session,
                                        cfg->gen.temperature,
-                                       0,
+                                       cfg->gen.top_k,
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
@@ -10900,7 +12002,7 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative(
                 w->session, token, max_tokens - generated,
-                ds4_token_eos(w->engine), cfg->gen.temperature, 0,
+                ds4_token_eos(w->engine), cfg->gen.temperature, cfg->gen.top_k,
                 cfg->gen.top_p, cfg->gen.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
@@ -13566,8 +14668,9 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &cfg.engine) != 0) {
         return 1;
     }
-    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 && !ds4_engine_is_deepseek41(engine)) {
-        fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 model\n");
+    if (ds4_think_mode_level(cfg.gen.think_mode) >= 0 &&
+        !ds4_engine_is_deepseek41(engine) && !ds4_engine_is_kolibri1(engine)) {
+        fprintf(stderr, "ds4-agent: --think-level requires a DeepSeek V4.1 or Kolibri-1 model\n");
         ds4_engine_close(engine);
         return 2;
     }

@@ -661,6 +661,309 @@ static bool json_content_replace(const char **p, char **dst) {
     return true;
 }
 
+/* ==== Jinja2 tojson-fidelity serialization ====
+ *
+ * The Kolibri-1 template renders tool schemas and re-serializes assistant
+ * tool_calls arguments with jinja2's `tojson` filter (§12.4 item 1): keys
+ * sorted recursively, ", " / ": " separators, ensure_ascii unicode escapes,
+ * plus the htmlsafe filter's \u003c/\u003e/\u0026/\u0027 replacements. The
+ * functions below re-emit a parsed JSON value in exactly that spelling, so
+ * server-rendered Kolibri prompts byte-match the released template.
+ *
+ * Floats follow Python repr() rules (json.dumps passes floats to repr):
+ * shortest round-trip digits, fixed notation for decimal exponents in
+ * [-4, 16), otherwise `d.dddde±XX` with at least two exponent digits, and a
+ * bare ".0" suffix on integral values in fixed notation. Integers pass
+ * through verbatim (Python ints re-emit as their decimal digits).
+ * Object keys compare as UTF-8 bytes, which equals code-point order. */
+
+static void json_tojson_escape_string(buf *b, const char *s, size_t len) {
+    buf_putc(b, '"');
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+        case '"':  buf_puts(b, "\\\""); break;
+        case '\\': buf_puts(b, "\\\\"); break;
+        case '\n': buf_puts(b, "\\n"); break;
+        case '\r': buf_puts(b, "\\r"); break;
+        case '\t': buf_puts(b, "\\t"); break;
+        case '\b': buf_puts(b, "\\b"); break;
+        case '\f': buf_puts(b, "\\f"); break;
+        case '<':  buf_puts(b, "\\u003c"); break;
+        case '>':  buf_puts(b, "\\u003e"); break;
+        case '&':  buf_puts(b, "\\u0026"); break;
+        case '\'': buf_puts(b, "\\u0027"); break;
+        default:
+            if (c < 0x20) {
+                char esc[8];
+                snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                buf_puts(b, esc);
+            } else if (c < 0x80) {
+                buf_putc(b, (char)c);
+            } else {
+                /* Decode one UTF-8 sequence and re-emit as \uXXXX escapes
+                 * (ensure_ascii). Invalid bytes fall back to U+FFFD, like
+                 * the decoder's lone-surrogate handling. */
+                uint32_t cp = 0xfffd;
+                int n = 0;
+                if ((c & 0xe0) == 0xc0 && i + 1 < len &&
+                    (s[i + 1] & 0xc0) == 0x80) {
+                    cp = ((c & 0x1fu) << 6) | (s[i + 1] & 0x3fu);
+                    n = 1;
+                } else if ((c & 0xf0) == 0xe0 && i + 2 < len &&
+                           (s[i + 1] & 0xc0) == 0x80 &&
+                           (s[i + 2] & 0xc0) == 0x80) {
+                    cp = ((c & 0x0fu) << 12) | ((s[i + 1] & 0x3fu) << 6) |
+                         (s[i + 2] & 0x3fu);
+                    n = 2;
+                } else if ((c & 0xf8) == 0xf0 && i + 3 < len &&
+                           (s[i + 1] & 0xc0) == 0x80 &&
+                           (s[i + 2] & 0xc0) == 0x80 &&
+                           (s[i + 3] & 0xc0) == 0x80) {
+                    cp = ((c & 0x07u) << 18) | ((s[i + 1] & 0x3fu) << 12) |
+                         ((s[i + 2] & 0x3fu) << 6) | (s[i + 3] & 0x3fu);
+                    n = 3;
+                }
+                if (cp > 0xffff) {
+                    cp -= 0x10000u;
+                    char esc[16];
+                    snprintf(esc, sizeof(esc), "\\u%04x\\u%04x",
+                             0xd800u + (cp >> 10), 0xdc00u + (cp & 0x3ffu));
+                    buf_puts(b, esc);
+                } else {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)cp);
+                    buf_puts(b, esc);
+                }
+                i += (size_t)n;
+            }
+        }
+    }
+    buf_putc(b, '"');
+}
+
+/* Shortest round-trip digits for a double: the smallest precision in
+ * 1..17 whose %e form parses back to the exact same double, formatted per
+ * Python repr() rules (see the block comment above). */
+static void json_tojson_number(buf *b, double v) {
+    char digits[32];
+    int exp10 = 0;
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(digits, sizeof(digits), "%.*e", prec - 1, v);
+        if (strtod(digits, NULL) == v) break;
+    }
+    /* digits is "d.dddde±XX" (or "-d.dddde±XX"); pull out mantissa and
+     * decimal exponent. */
+    char mant[32];
+    const char *e = strchr(digits, 'e');
+    size_t mant_len = e ? (size_t)(e - digits) : strlen(digits);
+    snprintf(mant, sizeof(mant), "%.*s", (int)mant_len, digits);
+    exp10 = e ? atoi(e + 1) : 0;
+    /* Strip the sign from the mantissa; track it separately. */
+    bool neg = false;
+    if (mant[0] == '-') {
+        neg = true;
+        memmove(mant, mant + 1, strlen(mant));
+    }
+    /* mant is "d.ddd" (precision 1 gives "d"); drop the '.' so digits are
+     * contiguous. */
+    char num[32];
+    size_t num_len = 0;
+    for (const char *m = mant; *m; m++) {
+        if (*m != '.') num[num_len++] = *m;
+    }
+    num[num_len] = '\0';
+
+    buf out = {0};
+    if (neg) buf_putc(&out, '-');
+    if (exp10 >= -4 && exp10 < 16) {
+        /* Fixed notation. */
+        if (exp10 < 0) {
+            buf_puts(&out, "0.");
+            for (int i = 0; i < -exp10 - 1; i++) buf_putc(&out, '0');
+            buf_puts(&out, num);
+        } else {
+            size_t point = (size_t)exp10 + 1; /* digits before the point */
+            if (num_len < point) {
+                /* All digits land before the point: integral value. */
+                buf_puts(&out, num);
+                for (size_t i = num_len; i < point; i++) buf_putc(&out, '0');
+                buf_puts(&out, ".0");
+            } else if (num_len == point) {
+                buf_append(&out, num, point);
+                buf_puts(&out, ".0");
+            } else {
+                buf_append(&out, num, point);
+                buf_putc(&out, '.');
+                buf_puts(&out, num + point);
+            }
+        }
+    } else {
+        /* Scientific notation: d[.ddd]e±XX, at least two exponent digits. */
+        buf_putc(&out, num[0]);
+        if (num_len > 1) {
+            buf_putc(&out, '.');
+            buf_puts(&out, num + 1);
+        }
+        char exps[16];
+        snprintf(exps, sizeof(exps), "e%+03d", exp10);
+        buf_puts(&out, exps);
+    }
+    buf_puts(b, out.ptr ? out.ptr : "0");
+    buf_free(&out);
+}
+
+typedef struct {
+    char *key;
+    char *raw;
+} json_tojson_member;
+
+static int json_tojson_member_cmp(const void *a, const void *b) {
+    const json_tojson_member *ma = a, *mb = b;
+    return strcmp(ma->key, mb->key);
+}
+
+static bool json_tojson_sorted_value(const char **p, buf *b, int depth);
+
+static bool json_tojson_sorted_object(const char **p, buf *b, int depth) {
+    (*p)++; /* '{' */
+    json_tojson_member *members = NULL;
+    int len = 0, cap = 0;
+    bool ok = true;
+    json_ws(p);
+    if (**p != '}') {
+        while (**p && **p != '}') {
+            char *key = NULL, *raw = NULL;
+            if (!json_string(p, &key)) {
+                ok = false;
+                goto done;
+            }
+            json_ws(p);
+            if (**p != ':') {
+                free(key);
+                ok = false;
+                goto done;
+            }
+            (*p)++;
+            if (!json_raw_value(p, &raw)) {
+                free(key);
+                ok = false;
+                goto done;
+            }
+            if (len == cap) {
+                cap = cap ? cap * 2 : 8;
+                members = xrealloc(members, (size_t)cap * sizeof(*members));
+            }
+            members[len++] = (json_tojson_member){key, raw};
+            json_ws(p);
+            if (**p == ',') {
+                (*p)++;
+                json_ws(p);
+            }
+        }
+    }
+    if (**p != '}') ok = false;
+    if (ok) (*p)++; /* '}' */
+    if (!ok) goto done;
+    qsort(members, (size_t)len, sizeof(*members), json_tojson_member_cmp);
+    buf_putc(b, '{');
+    for (int i = 0; i < len; i++) {
+        if (ok) {
+            if (i) buf_puts(b, ", ");
+            json_tojson_escape_string(b, members[i].key, strlen(members[i].key));
+            buf_puts(b, ": ");
+            const char *vp = members[i].raw;
+            if (!json_tojson_sorted_value(&vp, b, depth + 1)) ok = false;
+        }
+        free(members[i].key);
+        free(members[i].raw);
+    }
+    if (ok) buf_putc(b, '}');
+done:
+    free(members);
+    return ok;
+}
+
+static bool json_tojson_sorted_array(const char **p, buf *b, int depth) {
+    (*p)++; /* '[' */
+    buf_putc(b, '[');
+    json_ws(p);
+    int index = 0;
+    while (**p && **p != ']') {
+        if (index++) buf_puts(b, ", ");
+        if (!json_tojson_sorted_value(p, b, depth + 1)) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    buf_putc(b, ']');
+    return true;
+}
+
+static bool json_tojson_sorted_value(const char **p, buf *b, int depth) {
+    if (depth > 64) return false;
+    json_ws(p);
+    if (json_lit(p, "null")) { buf_puts(b, "null"); return true; }
+    if (json_lit(p, "true")) { buf_puts(b, "true"); return true; }
+    if (json_lit(p, "false")) { buf_puts(b, "false"); return true; }
+    if (**p == '"') {
+        char *s = NULL;
+        if (!json_string(p, &s)) return false;
+        json_tojson_escape_string(b, s, strlen(s));
+        free(s);
+        return true;
+    }
+    if (**p == '[') return json_tojson_sorted_array(p, b, depth);
+    if (**p == '{') return json_tojson_sorted_object(p, b, depth);
+    /* Number: integers pass through as digits; anything with a fraction or
+     * exponent re-renders through Python repr() rules. */
+    const char *start = *p;
+    if (!json_skip_value(p)) return false;
+    size_t n = (size_t)(*p - start);
+    bool integral = true;
+    for (size_t i = 0; i < n; i++) {
+        if (start[i] == '.' || start[i] == 'e' || start[i] == 'E') {
+            integral = false;
+            break;
+        }
+    }
+    if (integral) {
+        /* Normalize through strtoll so Python-int spellings match ("-0" →
+         * "0"); oversized digit strings pass through, since re-emitting a
+         * big decimal integer changes nothing. */
+        errno = 0;
+        char *end = NULL;
+        long long iv = strtoll(start, &end, 10);
+        if (end == start + (ptrdiff_t)n && errno != ERANGE) {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", iv);
+            buf_puts(b, tmp);
+        } else {
+            buf_append(b, start, n);
+        }
+    } else {
+        char *span = xstrndup(start, n);
+        json_tojson_number(b, strtod(span, NULL));
+        free(span);
+    }
+    return true;
+}
+
+/* Re-emit one raw JSON value in jinja2 `tool | tojson` spelling. The value
+ * must be a complete JSON value at *json; trailing content is ignored.
+ * Returns a malloc'd string, or NULL on malformed input. */
+static DS4_SERVER_MAYBE_UNUSED char *json_tojson_sorted(const char *json) {
+    const char *p = json ? json : "";
+    buf b = {0};
+    if (!json_tojson_sorted_value(&p, &b, 0)) {
+        buf_free(&b);
+        return NULL;
+    }
+    return buf_take(&b);
+}
+
 typedef enum {
     REQ_CHAT,
     REQ_COMPLETION,
@@ -677,6 +980,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_KOLIBRI,
 } server_model_syntax;
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
@@ -999,6 +1303,18 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = DS4_THINK_HIGH;
 }
 
+/* Model-level sampling defaults for request knobs the client left unset.
+ * Mirrors cli_apply_model_sampling_defaults so an OpenAI request that sets
+ * nothing samples like the CLI.  Explicit client values always win. */
+static void request_apply_model_sampling_defaults(ds4_engine *e, request *r) {
+    if (!e || !r || !ds4_engine_is_kolibri1(e)) return;
+    /* released sampling defaults: temp 1.0, top_p 0.97, top_k 128, min_p 0 */
+    if (!r->temperature_set) r->temperature = 1.0f;
+    if (!r->top_p_set) r->top_p = 0.97f;
+    if (!r->top_k_set) r->top_k = 128;
+    if (!r->min_p_set) r->min_p = 0.0f;
+}
+
 static bool parse_ignore_eos_value(const char **p, request *r) {
     return p && r && json_bool(p, &r->ignore_eos);
 }
@@ -1217,6 +1533,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_kolibri1(engine)) return SERVER_MODEL_SYNTAX_KOLIBRI;
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
@@ -1224,6 +1541,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_kolibri1(engine)) return "kolibri-1";
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
@@ -1234,7 +1552,8 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
+           (!strcmp(id, "kolibri-1") ||
+            !strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
             !strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
@@ -3056,6 +3375,29 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls, bool ha
     }
 }
 
+/* One stanza per call, in the shape the released template defines:
+ * <tool_call>\n{"name": <name>, "arguments": <args>}\n</tool_call>.
+ * Sampled call text is replayed verbatim when known so the live KV prefix
+ * survives; otherwise `body_before` supplies the template's single newline
+ * between a non-empty assistant body and the first stanza. */
+static void append_kolibri_tool_calls_text(buf *b, const tool_calls *calls,
+                                           bool body_before) {
+    if (!b || !calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        buf_puts(b, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        if ((i == 0 && body_before) || i > 0) buf_puts(b, "\n");
+        buf_puts(b, "<tool" "_call>\n{\"name\": \"");
+        buf_puts(b, tc->name ? tc->name : "");
+        buf_puts(b, "\", \"arguments\": ");
+        buf_puts(b, tc->arguments ? tc->arguments : "");
+        buf_puts(b, "}\n</tool" "_call>");
+    }
+}
+
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
@@ -3064,6 +3406,8 @@ static void append_tool_calls_text_for_syntax(buf *b,
         append_glm_tool_calls_text(b, calls, tool_orders);
     } else if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         append_qwen_tool_calls_text(b, calls, b->len > 0, tool_orders);
+    } else if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        append_kolibri_tool_calls_text(b, calls, b->len > 0);
     } else {
         append_dsml_tool_calls_text(b, calls, syntax == SERVER_MODEL_SYNTAX_DEEPSEEK41);
     }
@@ -3617,6 +3961,264 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+/* Kolibri-1 server renderer. Semantics come from the released template in
+ * the GGUF metadata and are gated by tests/test_kolibri1_chat.py; the marker
+ * spellings are plain text that ds4_tokenize_rendered_chat maps back to the
+ * added-token ids. The tool-call tag literals are split across string
+ * literals so this source never carries the contiguous marker sequences
+ * (handover §12.4 item 4: agent tool channels garble them). */
+
+static void append_kolibri_tool_response(buf *b, const char *text, size_t len) {
+    buf_puts(b, "\n<tool_response>\n");
+    buf_append(b, text ? text : "", len);
+    buf_puts(b, "\n</tool_response>");
+}
+
+static void append_kolibri_tool_result_message(buf *b, const chat_msg *m) {
+    const char *content = m && m->content ? m->content : "";
+    if (m && m->role && !strcmp(m->role, "user") && m->tool_call_ids_len > 0) {
+        static const char open[] = "<tool_result>";
+        static const char close[] = "</tool_result>";
+        const char *p = content;
+        bool found = false;
+        while ((p = strstr(p, open)) != NULL) {
+            const char *body = p + sizeof(open) - 1;
+            const char *end = strstr(body, close);
+            if (!end) break;
+            append_kolibri_tool_response(b, body, (size_t)(end - body));
+            found = true;
+            p = end + sizeof(close) - 1;
+        }
+        if (found) return;
+    }
+    append_kolibri_tool_response(b, content, strlen(content));
+}
+
+static void append_kolibri_tools_section(buf *b, const char *tool_schemas) {
+    buf_puts(b,
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>");
+    const char *p = tool_schemas ? tool_schemas : "";
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        /* parse_tools_value stores the inner function object; the released
+         * template renders the full OpenAI tool object through `tojson`. */
+        const char *prefix = "{\"function\": ";
+        const char *suffix = ", \"type\": \"function\"}";
+        size_t n = strlen(raw) + strlen(prefix) + strlen(suffix) + 1;
+        char *wrapped = xmalloc(n);
+        snprintf(wrapped, n, "%s%s%s", prefix, raw, suffix);
+        char *sorted = json_tojson_sorted(wrapped);
+        if (sorted) {
+            buf_puts(b, "\n");
+            buf_puts(b, sorted);
+        }
+        free(sorted);
+        free(wrapped);
+        free(raw);
+        json_ws(&p);
+    }
+    buf_puts(b,
+        "\n</tools>\n\n"
+        "For each function call, return a json object with function name and arguments within "
+        "<tool" "_call></tool" "_call> XML tags:\n"
+        "<tool" "_call>\n"
+        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+        "</tool" "_call>");
+}
+
+static const char *kolibri_last_strstr(const char *s, const char *needle) {
+    const char *last = NULL;
+    for (const char *p = strstr(s, needle); p; p = strstr(p + 1, needle)) last = p;
+    return last;
+}
+
+/* Assistant replay. `index0` is the message's index in the conversation and
+ * `last_query_index` the template's backward walk for the last real user
+ * query: think blocks render only after that query (or under
+ * preserve_thinking, which the server does not thread yet). */
+static void append_kolibri_assistant_message(buf *out, const chat_msg *m,
+                                             int index0, int last_query_index,
+                                             bool thinking) {
+    const char *content = m && m->content ? m->content : "";
+    const char *reasoning = m && m->reasoning ? m->reasoning : NULL;
+    size_t reasoning_len = reasoning ? strlen(reasoning) : 0;
+    /* Template fallback: without a structured reasoning field, an embedded
+     * think block in the content splits into reasoning plus content (first
+     * closing tag wins for the prefix, last one for the remainder). */
+    if (!reasoning && strstr(content, "</think>")) {
+        const char *first_close = strstr(content, "</think>");
+        const char *last_close = kolibri_last_strstr(content, "</think>");
+        const char *rbegin = content;
+        for (const char *p = strstr(content, "<think>");
+             p && p < first_close;
+             p = strstr(p + 1, "<think>"))
+            rbegin = p + strlen("<think>");
+        const char *rend = first_close;
+        while (rbegin < rend && *rbegin == '\n') rbegin++;
+        while (rend > rbegin && rend[-1] == '\n') rend--;
+        reasoning = rbegin;
+        reasoning_len = (size_t)(rend - rbegin);
+        content = last_close + strlen("</think>");
+    }
+    const bool sampled_tail = m && m->calls.len > 0 &&
+        m->calls.raw_tool_text && m->calls.raw_tool_text[0];
+    const char *content_begin = content;
+    while (*content_begin == '\n') content_begin++;
+    const char *content_end = content + strlen(content);
+    while (content_end > content_begin &&
+           isspace((unsigned char)content_end[-1]))
+        content_end--;
+    const bool content_truthy = content[0] != '\0';
+    const bool content_visible = content_begin < content_end;
+    buf_puts(out, "<|im_start|>assistant\n");
+    if (index0 > last_query_index) {
+        buf_puts(out, "<think>\n");
+        if (reasoning) {
+            const char *rs = reasoning;
+            const char *re = reasoning + reasoning_len;
+            while (rs < re && isspace((unsigned char)*rs)) rs++;
+            while (re > rs && isspace((unsigned char)re[-1])) re--;
+            if (rs < re) {
+                while (reasoning_len && *reasoning == '\n') {
+                    reasoning++;
+                    reasoning_len--;
+                }
+                while (reasoning_len && reasoning[reasoning_len - 1] == '\n')
+                    reasoning_len--;
+                buf_append(out, reasoning, reasoning_len);
+            }
+        }
+        /* In thinking mode the model opened the think block and emitted the
+         * separator itself; the sampled tail already carries those newlines.
+         * With thinking disabled the empty block (and its separator) came
+         * from the generation prompt, so the separator always belongs here. */
+        const bool sampled_after_think =
+            thinking && sampled_tail && !content_visible;
+        buf_puts(out, sampled_after_think ? "\n</think>" : "\n</think>\n\n");
+    }
+    if (sampled_tail) {
+        buf_append(out, content_begin, (size_t)(content_end - content_begin));
+    } else {
+        buf_puts(out, content_begin);
+    }
+    if (m && m->calls.len > 0) {
+        /* the template emits string arguments verbatim; sampled text must
+         * survive replay byte-for-byte, so never re-serialize here */
+        append_kolibri_tool_calls_text(out, &m->calls, content_truthy);
+    }
+    buf_puts(out, "<|im_end|>\n");
+}
+
+static int kolibri_last_query_index(const chat_msgs *msgs) {
+    int last = msgs ? msgs->len - 1 : -1;
+    for (int i = msgs ? msgs->len - 1 : -1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role || strcmp(m->role, "user") || !m->content) continue;
+        static const char open[] = "<tool_response>";
+        static const char close[] = "</tool_response>";
+        const size_t n = strlen(m->content);
+        if (n >= sizeof(close) - 1 &&
+            !strncmp(m->content, open, sizeof(open) - 1) &&
+            !strcmp(m->content + n - (sizeof(close) - 1), close))
+            continue;
+        return i;
+    }
+    return last;
+}
+
+/* Append the turn bodies from `start` to the end of the conversation.  Used
+ * both by the full renderer and by the live tool tail, where the preceding
+ * sampled bytes (through the assistant's tool call) are already in the KV. */
+static void append_kolibri_conversation(buf *out, const chat_msgs *msgs, int start,
+                                        int last_query_index, bool thinking) {
+    bool tool_open = false;
+    bool pending_assistant = false;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (i == 0 && role_is_system(m->role)) continue;
+        if (role_is_system(m->role)) {
+            if (tool_open) {
+                buf_puts(out, "<|im_end|>\n");
+                tool_open = false;
+            }
+            buf_puts(out, "<|im_start|>system\n");
+            buf_puts(out, m->content ? m->content : "");
+            buf_puts(out, "<|im_end|>\n");
+            pending_assistant = true;
+            continue;
+        }
+        if (chat_msg_is_glm_tool_result(m)) {
+            if (!tool_open) buf_puts(out, "<|im_start|>user");
+            append_kolibri_tool_result_message(out, m);
+            tool_open = true;
+            pending_assistant = true;
+            continue;
+        }
+        if (tool_open) {
+            buf_puts(out, "<|im_end|>\n");
+            tool_open = false;
+        }
+        if (!strcmp(m->role, "user")) {
+            buf_puts(out, "<|im_start|>user\n");
+            buf_puts(out, m->content ? m->content : "");
+            buf_puts(out, "<|im_end|>\n");
+            pending_assistant = true;
+        } else if (!strcmp(m->role, "assistant")) {
+            append_kolibri_assistant_message(out, m, i, last_query_index, thinking);
+            pending_assistant = false;
+        }
+    }
+    if (tool_open) buf_puts(out, "<|im_end|>\n");
+    if (pending_assistant) {
+        buf_puts(out, "<|im_start|>assistant\n");
+        if (!thinking) buf_puts(out, "<think>\n\n</think>\n\n");
+    }
+}
+
+/* Continue a live session after the model's tool-call turn: its <|im_end|>
+ * was the stop token and is not in the KV yet. */
+static char *render_kolibri_live_tool_tail(const chat_msgs *msgs, int start,
+                                           ds4_think_mode think_mode) {
+    buf out = {0};
+    buf_puts(&out, "<|im_end|>\n");
+    append_kolibri_conversation(&out, msgs, start,
+                                kolibri_last_query_index(msgs),
+                                ds4_think_mode_enabled(think_mode));
+    return buf_take(&out);
+}
+
+static char *render_kolibri_chat_prompt_text(const chat_msgs *msgs,
+                                             const char *tool_schemas,
+                                             ds4_think_mode think_mode) {
+    const char *effort = ds4_kolibri_reasoning_effort_text(think_mode);
+    const bool have_tools = tool_schemas && tool_schemas[0];
+    const bool has_system = msgs && msgs->len > 0 && role_is_system(msgs->v[0].role);
+    buf out = {0};
+    /* The effort sentence is never absent, so the system block is always
+     * emitted; messages[0] is the only system message folded into it. */
+    buf_puts(&out, "<|im_start|>system\n");
+    if (has_system) {
+        buf_puts(&out, msgs->v[0].content ? msgs->v[0].content : "");
+        buf_puts(&out, "\n\n");
+    }
+    buf_puts(&out, "# Reasoning effort\n\n");
+    buf_puts(&out, effort);
+    if (have_tools) {
+        buf_puts(&out, "\n\n");
+        append_kolibri_tools_section(&out, tool_schemas);
+    }
+    buf_puts(&out, "<|im_end|>\n");
+
+    append_kolibri_conversation(&out, msgs, 0, kolibri_last_query_index(msgs),
+                                ds4_think_mode_enabled(think_mode));
+    return buf_take(&out);
+}
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
@@ -3630,6 +4232,9 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
         return render_deepseek41_chat(msgs, 0, tool_schemas, think_mode, false);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return render_kolibri_chat_prompt_text(msgs, tool_schemas, think_mode);
     }
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
@@ -3855,6 +4460,9 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
         return render_deepseek41_chat(msgs, start, NULL, think_mode, true);
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return render_qwen_live_tool_tail(msgs, start, tool_orders, think_mode);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return render_kolibri_live_tool_tail(msgs, start, think_mode);
     }
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
@@ -4272,6 +4880,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -4488,6 +5097,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -5517,6 +6127,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -5723,6 +6334,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    request_apply_model_sampling_defaults(e, r);
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -6542,6 +7154,181 @@ static bool qwen_param_declared_string(const tool_schema_orders *orders,
     return false;
 }
 
+/* Parse a Kolibri-1 JSON call object starting at '{'. Interpreted keys:
+ * "name" (string) and "arguments" (an object literal kept as raw text, or a
+ * JSON-encoded string decoded to its inner text). Unknown keys are skipped.
+ * Returns the position after '}' via *pp, or false on malformed input. */
+static bool parse_kolibri_call_object(const char **pp,
+                                      char **name_out,
+                                      char **args_out,
+                                      bool *have_args_out) {
+    const char *p = *pp;
+    *name_out = NULL;
+    *args_out = NULL;
+    *have_args_out = false;
+    if (*p != '{') return false;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        json_ws(&p);
+        if (!strcmp(key, "name")) {
+            char *name = NULL;
+            if (!json_string(&p, &name)) {
+                free(key);
+                return false;
+            }
+            free(*name_out);
+            *name_out = name;
+        } else if (!strcmp(key, "arguments")) {
+            if (*p == '"') {
+                char *decoded = NULL;
+                if (!json_string(&p, &decoded)) {
+                    free(key);
+                    return false;
+                }
+                free(*args_out);
+                *args_out = decoded;
+            } else {
+                char *raw = NULL;
+                if (!json_raw_value(&p, &raw)) {
+                    free(key);
+                    return false;
+                }
+                free(*args_out);
+                *args_out = raw;
+            }
+            *have_args_out = true;
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') {
+            p++;
+            json_ws(&p);
+        }
+    }
+    if (*p != '}') return false;
+    p++;
+    *pp = p;
+    return true;
+}
+
+/* Generated-text parser for the released Kolibri template. The server works
+ * on whole text here (no incremental parsing): split the think block, then
+ * parse back-to-back JSON call stanzas after it. Calls inside reasoning are
+ * model text and never executable, mirroring the other families. */
+
+/* The template puts "\n</think>\n\n" between reasoning and answer and strips
+ * newlines from both sides of the reasoning. */
+static void kolibri_trim_split(char **content_out, char **reasoning_out) {
+    qwen_trim_split(content_out, reasoning_out);
+    if (reasoning_out && *reasoning_out) {
+        const char *r = *reasoning_out;
+        while (*r == '\n') r++;
+        if (r != *reasoning_out) {
+            char *trimmed = xstrdup(r);
+            free(*reasoning_out);
+            *reasoning_out = trimmed;
+        }
+    }
+}
+
+static bool parse_kolibri_generated_message_ex(const char *text,
+                                               bool require_thinking_closed,
+                                               char **content_out,
+                                               char **reasoning_out,
+                                               tool_calls *calls) {
+    static const char tool_start[] = "<tool" "_call>";
+    static const char tool_end[] = "</tool" "_call>";
+    text = text ? text : "";
+    const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
+    if (require_thinking_closed) {
+        const char *think_end = find_tool_structural_text(text, "</think>", true);
+        if (!think_end) {
+            const char *candidate = strstr(text, tool_start);
+            if (!candidate || !strstr(candidate, tool_end)) {
+                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete Kolibri tool calls in reasoning\n");
+                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + 8;
+        }
+    }
+
+    const char *start = strstr(tool_search, tool_start);
+    if (!start) {
+        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+        kolibri_trim_split(content_out, reasoning_out);
+        return true;
+    }
+    const char *raw_block_start = start;
+    while (raw_block_start > text &&
+           (raw_block_start[-1] == '\n' || raw_block_start[-1] == ' '))
+        raw_block_start--;
+    size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(raw_block_start - text));
+
+    const char *p = start;
+    for (;;) {
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
+        p += strlen(tool_start);
+        p = skip_ascii_ws(p);
+        char *name = NULL, *args = NULL;
+        bool have_args = false;
+        if (!parse_kolibri_call_object(&p, &name, &args, &have_args)) {
+            free(name);
+            free(args);
+            tool_calls_free(calls);
+            return false;
+        }
+        p = skip_ascii_ws(p);
+        if (strncmp(p, tool_end, strlen(tool_end)) != 0) {
+            free(name);
+            free(args);
+            tool_calls_free(calls);
+            return false;
+        }
+        p += strlen(tool_end);
+        tool_call tc = {0};
+        tc.name = name ? name : xstrdup("");
+        tc.arguments = have_args && args ? args : xstrdup("{}");
+        tool_calls_push(calls, tc);
+
+        const char *next = skip_ascii_ws(p);
+        if (strncmp(next, tool_start, strlen(tool_start)) != 0) {
+            p = next;
+            break;
+        }
+        p = next;
+    }
+
+    if (calls->len == 0) return false;
+    free(calls->raw_tool_text);
+    calls->raw_tool_text = xstrndup(raw_block_start, (size_t)(p - raw_block_start));
+    if (recovered_unclosed_tool) {
+        ds4_unterminated_reasoning_before_tool(text, content_len, content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
+    /* The template puts "\n</think>\n\n" between reasoning and answer. */
+    kolibri_trim_split(content_out, reasoning_out);
+    return true;
+}
+
 static bool parse_qwen_generated_message_ex(const char *text,
                                             bool require_thinking_closed,
                                             char **content_out,
@@ -6698,6 +7485,10 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out, calls, NULL);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return parse_kolibri_generated_message_ex(text, require_thinking_closed,
+                                                  content_out, reasoning_out, calls);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -7362,6 +8153,7 @@ typedef enum {
     DSML_TRACK_STRUCTURAL,
     DSML_TRACK_STRING_BODY,
     DSML_TRACK_JSON_PARAM,
+    DSML_TRACK_JSON_BODY,
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
@@ -7405,6 +8197,14 @@ static const dsml_syntax glm_tool_syntax = {
 static const dsml_syntax qwen_tool_syntax = {
     "<tool_call>", "</tool_call>",
     "<function=", "</function>", "<parameter=", "</parameter>",
+};
+
+/* Kolibri/JSON calls have no inner tags: the whole body between the call
+ * tags is one JSON object.  The tracker scans it with JSON string state so a
+ * literal end tag inside an argument string cannot close the call. */
+static const dsml_syntax kolibri_tool_syntax = {
+    "<tool_call>", "</tool_call>",
+    NULL, NULL, NULL, NULL,
 };
 
 typedef struct {
@@ -7615,9 +8415,12 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             const dsml_syntax *syn = NULL;
             bool found;
             if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
-                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+                dt->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
                 syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
-                    &qwen_tool_syntax : &glm_tool_syntax;
+                    &qwen_tool_syntax :
+                    (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ?
+                     &glm_tool_syntax : &kolibri_tool_syntax);
                 const char *start = find_lit_bounded(raw + dt->pos,
                     raw_len - dt->pos, syn->tool_calls_start);
                 found = start != NULL;
@@ -7635,8 +8438,16 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             }
             dt->syn = syn;
             dt->pos = pos;
-            dt->mode = DSML_TRACK_STRUCTURAL;
-            dt->decode = DSML_DECODE_STRUCTURAL;
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+                /* nothing but JSON between the call tags */
+                dt->mode = DSML_TRACK_JSON_BODY;
+                dt->json_in_string = false;
+                dt->json_escaped = false;
+                dt->decode = DSML_DECODE_JSON_STRUCTURAL;
+            } else {
+                dt->mode = DSML_TRACK_STRUCTURAL;
+                dt->decode = DSML_DECODE_STRUCTURAL;
+            }
         }
 
         if (dt->mode == DSML_TRACK_STRING_BODY) {
@@ -7670,6 +8481,42 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                         goto structural;
                     }
                     if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                        dt->decode = raw_len - dt->pos >= 2 ?
+                            DSML_DECODE_STRUCTURAL : DSML_DECODE_JSON_STRUCTURAL;
+                        return;
+                    }
+                }
+
+                unsigned char c = (unsigned char)raw[dt->pos++];
+                if (dt->json_in_string) {
+                    if (dt->json_escaped) {
+                        dt->json_escaped = false;
+                    } else if (c == '\\') {
+                        dt->json_escaped = true;
+                    } else if (c == '"') {
+                        dt->json_in_string = false;
+                    }
+                } else if (c == '"') {
+                    dt->json_in_string = true;
+                }
+            }
+            dt->decode = dt->json_in_string ?
+                DSML_DECODE_JSON_STRING : DSML_DECODE_JSON_STRUCTURAL;
+            return;
+        }
+
+        if (dt->mode == DSML_TRACK_JSON_BODY) {
+            /* Kolibri: the call body is one JSON object; </tool_call> outside
+             * a JSON string ends it and the tracker is done. */
+            while (dt->pos < raw_len) {
+                if (!dt->json_in_string) {
+                    if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
+                        dt->pos += strlen(dt->syn->tool_calls_end);
+                        dt->mode = DSML_TRACK_DONE;
+                        dt->decode = DSML_DECODE_OUTSIDE;
+                        return;
+                    }
+                    if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
                         dt->decode = raw_len - dt->pos >= 2 ?
                             DSML_DECODE_STRUCTURAL : DSML_DECODE_JSON_STRUCTURAL;
                         return;
@@ -12769,6 +13616,33 @@ static char *build_invalid_qwen_tool_error_suffix(const request *r,
     return buf_take(&suffix);
 }
 
+static char *build_invalid_kolibri_tool_error_suffix(const request *r,
+                                                     const thinking_state *thinking,
+                                                     const char *detail) {
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid Kolibri tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(&tool_error,
+             "\nThe previous assistant output was not executed because the JSON "
+             "tool-call syntax was malformed. Emit a new valid tool call, or "
+             "answer normally if no tool is needed.");
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
+        buf_puts(&suffix, "\n</think>");
+    }
+    buf_puts(&suffix, "<|im_end|>\n<|im_start|>user");
+    append_kolibri_tool_response(&suffix, tool_error.ptr ? tool_error.ptr : "",
+                                 tool_error.len);
+    buf_puts(&suffix, "<|im_end|>\n<|im_start|>assistant\n");
+    if (!r || !ds4_think_mode_enabled(r->think_mode))
+        buf_puts(&suffix, "<think>\n\n</think>\n\n");
+    buf_free(&tool_error);
+    return buf_take(&suffix);
+}
+
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
@@ -12777,6 +13651,9 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     }
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_invalid_qwen_tool_error_suffix(r, thinking, detail);
+    }
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return build_invalid_kolibri_tool_error_suffix(r, thinking, detail);
     }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
@@ -13048,12 +13925,16 @@ static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
     if (!r || r->kind != REQ_CHAT) return false;
-    /* Qwen Chat Completions clients may omit reasoning even with tools.
-     * Remember an alternative visible key without changing exact replay.
-     * Actual tool calls have their own checkpoint path at the call site. */
-    const bool qwen_chat = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
-                           r->api != API_RESPONSES && r->api != API_ANTHROPIC;
-    if ((r->has_tools || r->prompt_preserves_reasoning) && !qwen_chat) return false;
+    /* Qwen and Kolibri Chat Completions clients may omit reasoning even with
+     * tools.  Remember an alternative visible key without changing exact
+     * replay.  Actual tool calls have their own checkpoint path at the call
+     * site. */
+    const bool omits_reasoning_client =
+        (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+         r->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) &&
+        r->api != API_RESPONSES && r->api != API_ANTHROPIC;
+    if ((r->has_tools || r->prompt_preserves_reasoning) && !omits_reasoning_client)
+        return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
@@ -13213,12 +14094,44 @@ static char *build_qwen_assistant_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+/* The bytes append_kolibri_assistant_message() emits after this turn's
+ * generation prompt, through <|im_end|> (exclusive of the trailing newline).
+ * `with_reasoning` decides whether a stored reasoning field is replayed. */
+static char *build_kolibri_assistant_suffix(const request *r, const char *content,
+                                            const char *reasoning, bool with_reasoning,
+                                            const tool_calls *calls) {
+    const bool sampled_tail = calls && calls->raw_tool_text && calls->raw_tool_text[0];
+    const char *body = content ? content : "";
+    const char *body_begin = body;
+    while (*body_begin == '\n') body_begin++;
+    const char *body_end = body + strlen(body);
+    if (sampled_tail) {
+        while (body_end > body_begin && isspace((unsigned char)body_end[-1]))
+            body_end--;
+    }
+    const bool content_visible = body_begin < body_end;
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode)) {
+        buf_puts(&suffix, "<think>\n");
+        if (with_reasoning) append_trimmed_text(&suffix, reasoning);
+        const bool sampled_after_think = sampled_tail && !content_visible;
+        buf_puts(&suffix, sampled_after_think ? "\n</think>" : "\n</think>\n\n");
+    }
+    buf_append(&suffix, body_begin, (size_t)(body_end - body_begin));
+    append_kolibri_tool_calls_text(&suffix, calls, content_visible);
+    buf_puts(&suffix, "<|im_end|>");
+    return buf_take(&suffix);
+}
+
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     const server_model_syntax syntax =
         r ? r->model_syntax : SERVER_MODEL_SYNTAX_DEEPSEEK;
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_qwen_assistant_suffix(r, content, reasoning, true, calls);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return build_kolibri_assistant_suffix(r, content, reasoning, true, calls);
     }
     buf suffix = {0};
     if (r && ds4_think_mode_enabled(r->think_mode)) {
@@ -13243,6 +14156,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_qwen_assistant_suffix(r, content, reasoning,
                                            r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
+    }
+    if (syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        return build_kolibri_assistant_suffix(r, content, reasoning,
+                                              r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
     }
     buf suffix = {0};
     /* This suffix mirrors what a Responses client can replay, not necessarily
@@ -13287,6 +14204,21 @@ static char *build_thinking_visible_text(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
+        /* The next request renders a prior assistant turn without its think
+         * block (the template drops old reasoning), so the visible key is the
+         * generation prompt plus the trimmed answer, closed by <|im_end|>. */
+        const char *gen = "<|im_start|>assistant\n";
+        const size_t gen_len = strlen(gen);
+        if (pt_len < gen_len ||
+            memcmp(r->prompt_text + pt_len - gen_len, gen, gen_len) != 0)
+            return NULL;
+        buf visible = {0};
+        buf_append(&visible, r->prompt_text, pt_len);
+        append_trimmed_text(&visible, content ? content : "");
+        buf_puts(&visible, "<|im_end|>\n");
+        return buf_take(&visible);
+    }
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         /* the next request renders this turn as an empty think block plus the
          * trimmed content, closed by <|im_end|> */
@@ -13344,21 +14276,25 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
 /* Match clients that omit reasoning, while keeping the exact sampled KV.
  * Tool decoding stops at </tool_call>, BEFORE the assistant end token. Leave
  * <|im_end|> out of the visible key so the next suffix actually evaluates it. */
-static char *build_qwen_tool_turn_visible_text(const request *r,
-                                               const char *finish,
-                                               bool inside_thinking,
-                                               const char *content,
-                                               const tool_calls *calls) {
+static char *build_tool_turn_visible_text(const request *r,
+                                          const char *finish,
+                                          bool inside_thinking,
+                                          const char *content,
+                                          const tool_calls *calls) {
     if (!r || !calls || calls->len == 0) return NULL;
     if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
     if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
-    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN) return NULL;
+    const bool qwen = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN;
+    const bool kolibri = r->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI;
+    if (!qwen && !kolibri) return NULL;
     if (!r->prompt_text || !r->prompt_text[0]) return NULL;
     if (!calls->raw_tool_text || !calls->raw_tool_text[0]) return NULL;
     /* Use the decode finish, not the parser's promoted tool_calls status:
      * repaired/truncated output and unclosed reasoning are not this frontier. */
     if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return NULL;
-    char *suffix = build_qwen_assistant_suffix(r, content, NULL, false, calls);
+    char *suffix = qwen ?
+        build_qwen_assistant_suffix(r, content, NULL, false, calls) :
+        build_kolibri_assistant_suffix(r, content, NULL, false, calls);
     buf visible = {0};
     buf_puts(&visible, r->prompt_text);
     buf_append(&visible, suffix, strlen(suffix) - strlen("<|im_end|>"));
@@ -13366,18 +14302,18 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     return buf_take(&visible);
 }
 
-static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
-                                                       job *j, const char *ctx,
-                                                       const char *finish,
-                                                       bool inside_thinking,
-                                                       const char *content,
-                                                       const tool_calls *calls) {
-    char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
-                                                     inside_thinking, content, calls);
+static bool remember_tool_turn_visible_checkpoint(server *s, server_slot *slot,
+                                                  job *j, const char *ctx,
+                                                  const char *finish,
+                                                  bool inside_thinking,
+                                                  const char *content,
+                                                  const tool_calls *calls) {
+    char *visible = build_tool_turn_visible_text(&j->req, finish,
+                                                 inside_thinking, content, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               "ds4-server: tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session),
                strlen(visible));
     free(visible);
@@ -14781,11 +15717,14 @@ decode_again:
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
+        if (ds4_think_mode_enabled(j->req.think_mode) &&
+            !ds4_engine_is_kolibri1(s->engine)) {
             /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
              * only for knobs the client left out: an explicit request value
              * (e.g. temperature 0 from a benchmark harness) must win, or the
-             * same greedy request returns different text on every call. */
+             * same greedy request returns different text on every call.
+             * Kolibri-1 uses its own released defaults, already resolved by
+             * request_apply_model_sampling_defaults. */
             if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
             if (!j->req.top_k_set) top_k = 0;
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
@@ -15467,7 +16406,7 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        if (!remember_qwen_tool_turn_visible_checkpoint(
+        if (!remember_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
                 &parsed_calls))
@@ -16048,6 +16987,8 @@ static bool send_models(server *s, int fd) {
         buf_putc(&b, ',');
         snprintf(variant, sizeof(variant), "%s-reasoner", base);
         append_model_json(&b, s, variant);
+    } else if (ds4_engine_is_kolibri1(s->engine)) {
+        append_model_json(&b, s, "kolibri-1");
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
@@ -19301,6 +20242,8 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(server_model_alias_known("kolibri-1"));
+    TEST_ASSERT(!server_model_alias_known("kolibri-1-nope"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -19467,6 +20410,643 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_render_kolibri_chat_prompt_text(void) {
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+
+    /* Jinja expectations below were rendered with the same
+     * ImmutableSandboxedEnvironment as tests/test_kolibri1_chat.py. */
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|im_start|>system\nYou are terse.\n\n# Reasoning effort\n\n"
+        "Reasoning effort is set to high. Think carefully through the task in the user's language, "
+        "validate key assumptions, consider plausible alternatives, and prioritize correctness and clarity."
+        "<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"));
+    free(prompt);
+
+    /* thinking disabled: the "disabled" sentence plus the empty think block */
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|im_start|>system\nYou are terse.\n\n# Reasoning effort\n\n"
+        "Reasoning is disabled. Proceed straight to answering according to the user's instructions."
+        "<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    /* tools + assistant calls + grouped tool results + trailing user */
+    chat_msgs conv = {0};
+    chat_msg c_user = {0};
+    c_user.role = xstrdup("user");
+    c_user.content = xstrdup("check both");
+    chat_msgs_push(&conv, c_user);
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.content = xstrdup("");
+    {
+        tool_call tc1 = {.name = xstrdup("ls"), .arguments = xstrdup("{\"path\": \".\"}")};
+        tool_call tc2 = {.name = xstrdup("cat"), .arguments = xstrdup("{\"path\": \"a b/c\"}")};
+        tool_calls_push(&asst.calls, tc1);
+        tool_calls_push(&asst.calls, tc2);
+    }
+    chat_msgs_push(&conv, asst);
+    chat_msg t1 = {0};
+    t1.role = xstrdup("tool");
+    t1.content = xstrdup("a\nb");
+    chat_msgs_push(&conv, t1);
+    chat_msg t2 = {0};
+    t2.role = xstrdup("tool");
+    t2.content = xstrdup("line1");
+    chat_msgs_push(&conv, t2);
+    chat_msg c_user2 = {0};
+    c_user2.role = xstrdup("user");
+    c_user2.content = xstrdup("summarize");
+    chat_msgs_push(&conv, c_user2);
+
+    const char *tool_schemas =
+        "{\"name\":\"ls\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"}}}}";
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &conv, tool_schemas, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    /* no system message: the effort sentence opens the system block */
+    TEST_ASSERT(!strncmp(prompt,
+        "<|im_start|>system\n# Reasoning effort\n\nReasoning effort is set to high.", 69));
+    /* schemas come out in jinja tojson spelling */
+    TEST_ASSERT(strstr(prompt,
+        "\n{\"function\": {\"name\": \"ls\", \"parameters\": {\"properties\": "
+        "{\"path\": {\"type\": \"string\"}}, \"type\": \"object\"}}, \"type\": \"function\"}\n"
+        "</tools>") != NULL);
+    /* assistant stanzas: empty content, two calls, one newline between */
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n"
+        "<tool_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n</tool_call>\n"
+        "<tool_call>\n{\"name\": \"cat\", \"arguments\": {\"path\": \"a b/c\"}}\n</tool_call>"
+        "<|im_end|>\n") != NULL);
+    /* consecutive tool results group into one user turn with a deferred close */
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\n"
+        "<tool_response>\na\nb\n</tool_response>\n"
+        "<tool_response>\nline1\n</tool_response>"
+        "<|im_end|>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\nsummarize<|im_end|>\n<|im_start|>assistant\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&conv);
+
+    /* reasoning replay: dropped before the last query, rendered after it */
+    chat_msgs replay = {0};
+    chat_msg r1 = {0};
+    r1.role = xstrdup("user");
+    r1.content = xstrdup("one");
+    chat_msgs_push(&replay, r1);
+    chat_msg r2 = {0};
+    r2.role = xstrdup("assistant");
+    r2.content = xstrdup("answer one");
+    r2.reasoning = xstrdup("because 2+2=4");
+    chat_msgs_push(&replay, r2);
+    chat_msg r3 = {0};
+    r3.role = xstrdup("user");
+    r3.content = xstrdup("two");
+    chat_msgs_push(&replay, r3);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &replay, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "because") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\nanswer one<|im_end|>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&replay);
+
+    chat_msgs tail = {0};
+    chat_msg q1 = {0};
+    q1.role = xstrdup("user");
+    q1.content = xstrdup("one");
+    chat_msgs_push(&tail, q1);
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.content = xstrdup("answer one");
+    a1.reasoning = xstrdup("because 2+2=4");
+    chat_msgs_push(&tail, a1);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &tail, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\nbecause 2+2=4\n</think>\n\n"
+        "answer one<|im_end|>\n") != NULL);
+    /* assistant-final replay stops at the replayed turn (no fresh prefix) */
+    TEST_ASSERT(strstr(prompt, "answer one<|im_end|>\n<|im_start|>assistant\n") == NULL);
+    free(prompt);
+    chat_msgs_free(&tail);
+
+    /* embedded think block splits into reasoning + content (reasoning then
+     * dropped because the turn sits before the last query) */
+    chat_msgs embedded = {0};
+    chat_msg e1 = {0};
+    e1.role = xstrdup("user");
+    e1.content = xstrdup("one");
+    chat_msgs_push(&embedded, e1);
+    chat_msg e2 = {0};
+    e2.role = xstrdup("assistant");
+    e2.content = xstrdup("<think>\nbecause\n</think>\nanswer one");
+    chat_msgs_push(&embedded, e2);
+    chat_msg e3 = {0};
+    e3.role = xstrdup("user");
+    e3.content = xstrdup("two");
+    chat_msgs_push(&embedded, e3);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &embedded, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "because") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\nanswer one<|im_end|>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&embedded);
+}
+
+static void test_parse_kolibri_generated_message_ex(void) {
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+
+    /* Closed think block: reasoning and content split at the template's
+     * "\n</think>\n\n" separator. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "<think>\n2+2\n</think>\n\nThe answer is 4.", true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "2+2"));
+    TEST_ASSERT(content && !strcmp(content, "The answer is 4."));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+
+    /* One call with an object-literal arguments value, kept raw. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "checking\n<tool" "_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n"
+        "</tool" "_call>", false, &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "checking"));
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 1);
+    if (calls.len == 1) {
+        TEST_ASSERT(!strcmp(calls.v[0].name, "ls"));
+        TEST_ASSERT(!strcmp(calls.v[0].arguments, "{\"path\": \".\"}"));
+    }
+    TEST_ASSERT(calls.raw_tool_text != NULL &&
+                strstr(calls.raw_tool_text, "\"name\": \"ls\"") != NULL);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* Arguments as a JSON-encoded string decode to the inner text; key order
+     * does not matter and unknown keys are skipped. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "<tool" "_call>\n{\"note\": 1, \"arguments\": \"{\\\"path\\\": \\\".\\\"}\", "
+        "\"name\": \"read\"}\n</tool" "_call>", false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    if (calls.len == 1) {
+        TEST_ASSERT(!strcmp(calls.v[0].name, "read"));
+        TEST_ASSERT(!strcmp(calls.v[0].arguments, "{\"path\": \".\"}"));
+    }
+    TEST_ASSERT(content && !strcmp(content, ""));
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* Back-to-back stanzas; a missing arguments member is an empty call. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "go\n<tool" "_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool" "_call>"
+        "\n<tool" "_call>\n{\"name\": \"b\"}\n</tool" "_call>", false,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "go"));
+    TEST_ASSERT(calls.len == 2);
+    if (calls.len == 2) {
+        TEST_ASSERT(!strcmp(calls.v[0].name, "a"));
+        TEST_ASSERT(!strcmp(calls.v[1].name, "b"));
+        TEST_ASSERT(!strcmp(calls.v[1].arguments, "{}"));
+    }
+    TEST_ASSERT(calls.raw_tool_text != NULL &&
+                strstr(calls.raw_tool_text, "\"name\": \"b\"") != NULL);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* A complete call inside a closed think block is quoted protocol text,
+     * not executable; the answer after the block parses normally. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "<think>\ntry <tool" "_call>\n{\"name\":\"x\",\"arguments\":{}}\n</tool" "_call>"
+        "\n</think>\nfinal", true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 0);
+    TEST_ASSERT(content && !strcmp(content, "final"));
+    TEST_ASSERT(reasoning && strstr(reasoning, "\"name\":\"x\"") != NULL);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+
+    /* Unterminated reasoning followed by a complete call recovers per the
+     * shared rule: reasoning holds the prefix, content is empty. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "thinking...\n\n<tool" "_call>\n{\"name\": \"a\", \"arguments\": {}}\n</tool" "_call>",
+        true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(content && !strcmp(content, ""));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "thinking..."));
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+    tool_calls_free(&calls);
+
+    /* Plain answer without thinking: content only, no calls. */
+    TEST_ASSERT(parse_kolibri_generated_message_ex(
+        "plain answer", false, &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, "plain answer"));
+    TEST_ASSERT(reasoning == NULL);
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    content = reasoning = NULL;
+
+    /* Malformed stanza: parse fails, partial calls are dropped. */
+    TEST_ASSERT(!parse_kolibri_generated_message_ex(
+        "x<tool" "_call>\n{\"name\": \"a\", \"arguments\": }\n</tool" "_call>", false,
+        &content, &reasoning, &calls));
+    free(content);
+    free(reasoning);
+}
+
+/* Parse -> render must reproduce the model's raw bytes, including the
+ * whitespace between think close, content and the call stanza. */
+static void test_kolibri_tool_checkpoint_round_trip(void) {
+    static const char raw_tail[] =
+        "\n<tool" "_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n"
+        "</tool" "_call>";
+    buf generated = {0};
+    buf_puts(&generated, "<think>\nneed the listing\n</think>\n\nchecking");
+    buf_puts(&generated, raw_tail);
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, generated.ptr, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.raw_tool_text && !strcmp(calls.raw_tool_text, raw_tail));
+
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.content = content;
+    content = NULL;
+    asst.reasoning = reasoning;
+    reasoning = NULL;
+    asst.calls = calls;
+    memset(&calls, 0, sizeof(calls));
+    buf rendered = {0};
+    append_kolibri_assistant_message(&rendered, &asst, 1, 0, true);
+    buf expected = {0};
+    buf_puts(&expected, "<|im_start|>assistant\n");
+    buf_puts(&expected, generated.ptr);
+    buf_puts(&expected, "<|im_end|>\n");
+    TEST_ASSERT(rendered.ptr && !strcmp(rendered.ptr, expected.ptr));
+
+    /* the syntax helper prefers the sampled text too */
+    buf calls_only = {0};
+    buf_puts(&calls_only, "OK");
+    append_tool_calls_text_for_syntax(&calls_only, SERVER_MODEL_SYNTAX_KOLIBRI,
+                                      &asst.calls, NULL);
+    TEST_ASSERT(calls_only.ptr && !strcmp(calls_only.ptr + 2, raw_tail));
+
+    /* empty content: the raw text owns the post-think whitespace too */
+    buf no_content = {0};
+    buf_puts(&no_content, "<think>\ncheck\n</think>\n\n");
+    buf_puts(&no_content, raw_tail);
+    char *c2 = NULL, *r2 = NULL;
+    tool_calls calls2 = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, no_content.ptr, true, &c2, &r2, &calls2));
+    chat_msg asst2 = {0};
+    asst2.role = xstrdup("assistant");
+    asst2.content = c2;
+    c2 = NULL;
+    asst2.reasoning = r2;
+    r2 = NULL;
+    asst2.calls = calls2;
+    memset(&calls2, 0, sizeof(calls2));
+    buf rendered2 = {0};
+    append_kolibri_assistant_message(&rendered2, &asst2, 1, 0, true);
+    buf expected2 = {0};
+    buf_puts(&expected2, "<|im_start|>assistant\n");
+    buf_puts(&expected2, no_content.ptr);
+    buf_puts(&expected2, "<|im_end|>\n");
+    TEST_ASSERT(rendered2.ptr && !strcmp(rendered2.ptr, expected2.ptr));
+
+    buf_free(&calls_only);
+    buf_free(&rendered2);
+    buf_free(&expected2);
+    buf_free(&no_content);
+    buf_free(&rendered);
+    buf_free(&expected);
+    buf_free(&generated);
+    chat_msg_free(&asst);
+    chat_msg_free(&asst2);
+    free(content);
+    free(reasoning);
+    free(c2);
+    free(r2);
+    tool_calls_free(&calls);
+    tool_calls_free(&calls2);
+}
+
+/* prompt_text + checkpoint suffix must equal what the next request renders. */
+static void test_kolibri_checkpoint_suffix_matches_render(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 64);
+    r.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    r.think_mode = DS4_THINK_HIGH;
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.name = xstrdup("ls");
+    tc.arguments = xstrdup("{\"path\": \".\"}");
+    tool_calls_push(&calls, tc);
+    char *suffix = build_tool_checkpoint_suffix(&r, "checking", "think first", &calls);
+    buf live = {0};
+    buf_puts(&live, prompt);
+    buf_puts(&live, suffix);
+
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    asst.content = xstrdup("checking");
+    asst.reasoning = xstrdup("think first");
+    tool_call tc2 = {0};
+    tc2.name = xstrdup("ls");
+    tc2.arguments = xstrdup("{\"path\": \".\"}");
+    tool_calls_push(&asst.calls, tc2);
+    chat_msgs_push(&msgs, asst);
+    chat_msg res = {0};
+    res.role = xstrdup("tool");
+    res.content = xstrdup("a.txt");
+    chat_msgs_push(&msgs, res);
+    char *next = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(next && live.ptr && !strncmp(next, live.ptr, live.len));
+    TEST_ASSERT(!strcmp(next + live.len,
+        "\n<|im_start|>user\n<tool_response>\na.txt\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n"));
+    buf_free(&live);
+    free(next);
+    free(suffix);
+    free(prompt);
+    tool_calls_free(&calls);
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+/* Live tool tail: the sampled assistant bytes are already in KV, so the tail
+ * must be exactly the rest of the next request's render. */
+static void test_kolibri_live_tool_tail_round_trip(void) {
+    for (int thinking = 0; thinking < 2; thinking++) {
+        ds4_think_mode mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+        chat_msgs msgs = {0};
+        chat_msg user = {0};
+        user.role = xstrdup("user");
+        user.content = xstrdup("run it");
+        chat_msgs_push(&msgs, user);
+        chat_msg asst = {0};
+        asst.role = xstrdup("assistant");
+        asst.content = xstrdup("Running.");
+        if (thinking) asst.reasoning = xstrdup("need ls");
+        tool_call tc = {0};
+        tc.name = xstrdup("ls");
+        tc.arguments = xstrdup("{\"path\": \".\"}");
+        tool_calls_push(&asst.calls, tc);
+        chat_msgs_push(&msgs, asst);
+        chat_msg first = {0};
+        first.role = xstrdup("tool");
+        first.content = xstrdup("a.txt");
+        chat_msgs_push(&msgs, first);
+        chat_msg second = {0};
+        second.role = xstrdup("tool");
+        second.content = xstrdup("b.txt");
+        chat_msgs_push(&msgs, second);
+
+        /* The prompt the tool-call turn was generated from: user only. */
+        chat_msgs prompt_msgs = {0};
+        chat_msg p_user = {0};
+        p_user.role = xstrdup("user");
+        p_user.content = xstrdup("run it");
+        chat_msgs_push(&prompt_msgs, p_user);
+        char *prompt = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_KOLIBRI, &prompt_msgs, NULL, NULL, mode);
+
+        /* The live KV contains the sampled assistant body (through
+         * </tool_call>), so prompt + tail must equal the full render. */
+        buf live = {0};
+        buf_puts(&live, prompt);
+        if (thinking) buf_puts(&live, "<think>\nneed ls\n</think>\n\n");
+        buf_puts(&live, "Running.\n");
+        buf_puts(&live,
+            "<tool" "_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n"
+            "</tool" "_call>");
+        char *tail = render_live_tool_tail_for_syntax(
+            SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, 2, NULL, mode);
+        TEST_ASSERT(tail != NULL);
+        const char *expected_tail =
+            "<|im_end|>\n"
+            "<|im_start|>user\n<tool_response>\na.txt\n</tool_response>\n"
+            "<tool_response>\nb.txt\n</tool_response><|im_end|>\n"
+            "<|im_start|>assistant\n";
+        if (!thinking) {
+            TEST_ASSERT(!strcmp(tail,
+                "<|im_end|>\n"
+                "<|im_start|>user\n<tool_response>\na.txt\n</tool_response>\n"
+                "<tool_response>\nb.txt\n</tool_response><|im_end|>\n"
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        } else {
+            TEST_ASSERT(!strcmp(tail, expected_tail));
+        }
+
+        char *full = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, NULL, NULL, mode);
+        TEST_ASSERT(full && !strncmp(full, live.ptr, live.len));
+        TEST_ASSERT(!strcmp(full + live.len, tail));
+
+        buf_free(&live);
+        free(tail);
+        free(full);
+        free(prompt);
+        chat_msgs_free(&prompt_msgs);
+        chat_msgs_free(&msgs);
+    }
+}
+
+/* Visible replay key when the client drops reasoning from a tool-call turn:
+ * the key must be a strict prefix of the next request's render, ending right
+ * before the assistant end token. */
+static void test_kolibri_tool_visible_checkpoint_boundary(void) {
+    for (int thinking = 0; thinking < 2; thinking++) {
+        for (int with_content = 0; with_content < 2; with_content++) {
+            chat_msgs msgs = {0};
+            chat_msg user = {0};
+            user.role = xstrdup("user");
+            user.content = xstrdup("run it");
+            chat_msgs_push(&msgs, user);
+            request r = {0};
+            r.kind = REQ_CHAT;
+            r.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+            r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+            r.prompt_text = render_kolibri_chat_prompt_text(&msgs, NULL, r.think_mode);
+            chat_msg assistant = {0};
+            assistant.role = xstrdup("assistant");
+            const char *raw_tail =
+                "<tool" "_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \".\"}}\n"
+                "</tool" "_call>";
+            buf sampled = {0};
+            if (thinking) buf_puts(&sampled, "<think>\nneed ls\n</think>\n\n");
+            if (with_content) buf_puts(&sampled, "Running.\n");
+            buf_puts(&sampled, raw_tail);
+            char *content = NULL, *reasoning = NULL;
+            tool_calls parsed = {0};
+            TEST_ASSERT(parse_generated_message_ex_for_syntax(
+                SERVER_MODEL_SYNTAX_KOLIBRI, sampled.ptr, thinking,
+                &content, &reasoning, &parsed));
+            assistant.content = content;
+            assistant.reasoning = reasoning;
+            assistant.calls = parsed;
+            memset(&parsed, 0, sizeof(parsed));
+            char *visible = build_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls);
+            TEST_ASSERT(visible != NULL);
+            TEST_ASSERT(build_tool_turn_visible_text(
+                &r, "length", false, assistant.content, &assistant.calls) == NULL);
+            TEST_ASSERT(build_tool_turn_visible_text(
+                &r, "tool_calls", true, assistant.content, &assistant.calls) == NULL);
+            chat_msgs_push(&msgs, assistant);
+            /* the visible tier is for clients that drop reasoning */
+            free(msgs.v[1].reasoning);
+            msgs.v[1].reasoning = NULL;
+            chat_msg tool = {0};
+            tool.role = xstrdup("tool");
+            tool.content = xstrdup("a.txt");
+            chat_msgs_push(&msgs, tool);
+            char *next = render_kolibri_chat_prompt_text(&msgs, NULL, r.think_mode);
+            TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+            if (visible && !strncmp(next, visible, strlen(visible))) {
+                /* the live frontier ends at the sampled tool block; the new
+                 * suffix supplies exactly the missing assistant boundary */
+                const char *tail = next + strlen(visible);
+                const char *boundary = "<|im_end|>\n<|im_start|>user\n<tool_response>";
+                TEST_ASSERT(!strncmp(tail, boundary, strlen(boundary)));
+            }
+            /* a client that replays reasoning renders different bytes */
+            if (thinking) {
+                msgs.v[1].reasoning = xstrdup("need ls");
+                char *with_reasoning = render_kolibri_chat_prompt_text(
+                    &msgs, NULL, r.think_mode);
+                TEST_ASSERT(visible &&
+                            strncmp(with_reasoning, visible, strlen(visible)) != 0);
+                free(with_reasoning);
+            }
+            free(next);
+            free(visible);
+            free(r.prompt_text);
+            buf_free(&sampled);
+            chat_msgs_free(&msgs);
+        }
+    }
+}
+
+/* A tool-less thinking answer replayed without reasoning: the visible key is
+ * the next request's render through the assistant end token. */
+static void test_kolibri_thinking_visible_text_matches_render(void) {
+    const char *schemas[] = {NULL, "{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}"};
+    for (size_t i = 0; i < sizeof(schemas) / sizeof(schemas[0]); i++) {
+        chat_msgs msgs = {0};
+        chat_msg user1 = {0};
+        user1.role = xstrdup("user");
+        user1.content = xstrdup("What is 2+2?");
+        chat_msgs_push(&msgs, user1);
+        char *prompt_text = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_KOLIBRI, &msgs, schemas[i], NULL, DS4_THINK_HIGH);
+        const char *gen = "<|im_start|>assistant\n";
+        TEST_ASSERT(strlen(prompt_text) > strlen(gen));
+        TEST_ASSERT(!strcmp(prompt_text + strlen(prompt_text) - strlen(gen), gen));
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.think_mode = DS4_THINK_HIGH;
+        r.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+        r.prompt_text = xstrdup(prompt_text);
+        char *visible = build_thinking_visible_text(&r, "The answer is 4.\n");
+        TEST_ASSERT(visible != NULL);
+        chat_msgs history = {0};
+        chat_msg h_user1 = {0};
+        h_user1.role = xstrdup("user");
+        h_user1.content = xstrdup("What is 2+2?");
+        chat_msgs_push(&history, h_user1);
+        chat_msg h_asst = {0};
+        h_asst.role = xstrdup("assistant");
+        h_asst.content = xstrdup("The answer is 4.");
+        chat_msgs_push(&history, h_asst);
+        chat_msg h_user2 = {0};
+        h_user2.role = xstrdup("user");
+        h_user2.content = xstrdup("thanks");
+        chat_msgs_push(&history, h_user2);
+        char *next = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_KOLIBRI, &history, schemas[i], NULL, DS4_THINK_HIGH);
+        TEST_ASSERT(next && !strncmp(next, visible, strlen(visible)));
+        free(next);
+        free(visible);
+        chat_msgs_free(&history);
+        free(prompt_text);
+        chat_msgs_free(&msgs);
+        request_free(&r);
+    }
+}
+
+/* The invalid-call recovery suffix must close the sampled turn and open a
+ * template-shaped tool result plus the next generation prefix. */
+static void test_kolibri_invalid_tool_error_suffix(void) {
+    for (int thinking = 0; thinking < 2; thinking++) {
+        request r;
+        request_init(&r, REQ_CHAT, 64);
+        r.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+        r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+        thinking_state st = {0};
+        char *suffix = build_invalid_tool_call_error_suffix(&r, &st, "bad json");
+        TEST_ASSERT(suffix != NULL);
+        TEST_ASSERT(!strncmp(suffix, "<|im_end|>\n<|im_start|>user\n<tool_response>\n",
+                             strlen("<|im_end|>\n<|im_start|>user\n<tool_response>\n")));
+        TEST_ASSERT(strstr(suffix, "bad json") != NULL);
+        TEST_ASSERT(strstr(suffix,
+            "</tool_response><|im_end|>\n<|im_start|>assistant\n") != NULL);
+        if (thinking) {
+            TEST_ASSERT(strstr(suffix, "<|im_start|>assistant\n<think>\n\n</think>\n\n") == NULL);
+        } else {
+            TEST_ASSERT(strstr(suffix, "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+        }
+        free(suffix);
+        request_free(&r);
+    }
+}
+
 static void test_render_qwen_chat_prompt_text(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -19560,19 +21140,19 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
             tool_calls_push(&assistant.calls, call);
             assistant.calls.raw_tool_text = xstrdup(
                 "\n\n<tool_call>\n<function=bash>\n</function>\n</tool_call>");
-            char *visible = build_qwen_tool_turn_visible_text(
+            char *visible = build_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls);
             TEST_ASSERT(visible != NULL);
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_tool_turn_visible_text(
                 &r, "length", false, assistant.content, &assistant.calls) == NULL);
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_tool_turn_visible_text(
                 &r, "tool_calls", true, assistant.content, &assistant.calls) == NULL);
             r.image_count = 1;
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
             r.image_count = 0;
             r.api = API_RESPONSES;
-            TEST_ASSERT(build_qwen_tool_turn_visible_text(
+            TEST_ASSERT(build_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
             chat_msgs_push(&msgs, assistant);
             chat_msg tool = {0};
@@ -21757,6 +23337,57 @@ static void test_qwen_decode_tracker_markers(void) {
     TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
 }
 
+static void test_kolibri_decode_tracker_markers(void) {
+    /* The JSON body is scanned as payload: a literal end tag inside an
+     * argument string must not close the call. */
+    const char *raw =
+        "<tool_call>\n{\"name\": \"write\", \"arguments\": "
+        "{\"content\": \"literal </tool_call> text\", \"path\": \"/tmp/x\"}}\n"
+        "</tool_call>";
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    bool start = false, end = false, orphan = false;
+    size_t len = strlen(raw);
+    for (size_t n = 1; n <= len; n++) {
+        dsml_decode_tracker_update(&tracker, raw, n);
+        char *prefix = xstrndup(raw, n);
+        bool s = false, e = false, o = false;
+        observe_tool_markers(&tracker, prefix, &s, &e, &o);
+        free(prefix);
+        if (s) start = true;
+        if (e) end = true;
+        if (o) orphan = true;
+        TEST_ASSERT(!e || n == len);
+    }
+    TEST_ASSERT(start && end);
+    TEST_ASSERT(!orphan);
+    TEST_ASSERT(tracker.mode == DSML_TRACK_DONE);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+
+    /* payload sampling follows JSON string state */
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    const char *struct_part = "<tool_call>\n{\"name\": \"ls\", \"arguments\": ";
+    dsml_decode_tracker_update(&tracker, struct_part, strlen(struct_part));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRUCTURAL);
+    TEST_ASSERT(!dsml_decode_state_uses_payload_sampling(tracker.decode));
+    const char *str_part =
+        "<tool_call>\n{\"name\": \"ls\", \"arguments\": {\"path\": \"/tmp/a";
+    dsml_decode_tracker_update(&tracker, str_part, strlen(str_part));
+    TEST_ASSERT(tracker.decode == DSML_DECODE_JSON_STRING);
+    TEST_ASSERT(dsml_decode_state_uses_payload_sampling(tracker.decode));
+
+    /* whitespace before a partial closing tag stays a structural hold */
+    const char *tail =
+        "<tool_call>\n{\"name\": \"ls\", \"arguments\": {}}\n</tool_call";
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
+    dsml_decode_tracker_update(&tracker, tail, strlen(tail));
+    TEST_ASSERT(tracker.mode == DSML_TRACK_JSON_BODY);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_STRUCTURAL);
+}
+
 static void test_tool_body_escape_round_trip(void) {
     const char *ends[] = {DS4_PARAM_END, "</arg_key>", "</arg_value>",
                          "</tool_result>", "</tool_response>"};
@@ -22068,6 +23699,62 @@ static void append_tool_heavy_messages(buf *b) {
         }
     }
     buf_putc(b, ']');
+}
+
+static void test_json_tojson_sorted(void) {
+    /* Expected spellings were rendered with the same
+     * ImmutableSandboxedEnvironment the Kolibri parity gate uses
+     * (tests/test_kolibri1_chat.py); see §12.4 item 1. */
+    struct {
+        const char *in;
+        const char *out;
+    } cases[] = {
+        /* Recursive key sort, ", " / ": " separators, htmlsafe escapes. */
+        {"{\"strict\":true,\"name\":\"get\",\"description\":\"a<b>&c'd\","
+         "\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":"
+         "{\"type\":\"string\",\"default\":\"x<y\"},\"n\":{\"type\":\"integer\"}}}}",
+         "{\"description\": \"a\\u003cb\\u003e\\u0026c\\u0027d\", \"name\": \"get\", "
+         "\"parameters\": {\"properties\": {\"n\": {\"type\": \"integer\"}, "
+         "\"path\": {\"default\": \"x\\u003cy\", \"type\": \"string\"}}, "
+         "\"type\": \"object\"}, \"strict\": true}"},
+        /* "-0" normalizes like a Python int; oversized ints pass through. */
+        {"{\"a\":-0,\"b\":1,\"c\":-1,\"big\":18446744073709551616}",
+         "{\"a\": 0, \"b\": 1, \"big\": 18446744073709551616, \"c\": -1}"},
+        /* Floats re-render through Python repr rules. */
+        {"{\"f1\":0.1,\"f2\":100000.0,\"f3\":1.0,\"f4\":1e16,\"f5\":1e15,"
+         "\"f6\":1.23e-08,\"f7\":0.0001,\"f8\":-2.5}",
+         "{\"f1\": 0.1, \"f2\": 100000.0, \"f3\": 1.0, \"f4\": 1e+16, "
+         "\"f5\": 1000000000000000.0, \"f6\": 1.23e-08, \"f7\": 0.0001, "
+         "\"f8\": -2.5}"},
+        /* String escapes: standard JSON plus control chars and non-ASCII. */
+        {"{\"s\":\"tab\there\\\"q\\\\\",\"ctl\":\"\\u0001\",\"u\":\"h\\u00e9llo\\u4e2d\"}",
+         "{\"ctl\": \"\\u0001\", \"s\": \"tab\\there\\\"q\\\\\", "
+         "\"u\": \"h\\u00e9llo\\u4e2d\"}"},
+        /* Nested containers, literals, empty containers. */
+        {"{\"nested\":{\"b\":[1,{\"y\":[true,false,null]},\"x\"],\"a\":{\"z\":1.5}}}",
+         "{\"nested\": {\"a\": {\"z\": 1.5}, \"b\": [1, {\"y\": [true, false, null]}, \"x\"]}}"},
+        {"[]", "[]"},
+        {"{}", "{}"},
+        /* Source key order must not survive. */
+        {"{\"z\":1,\"a\":2}", "{\"a\": 2, \"z\": 1}"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *out = json_tojson_sorted(cases[i].in);
+        TEST_ASSERT(out != NULL);
+        if (out) {
+            if (strcmp(out, cases[i].out) != 0) {
+                fprintf(stderr, "ds4-server: tojson case %zu mismatch\n"
+                                "  in:  %s\n  got: %s\n  want:%s\n",
+                        i, cases[i].in, out, cases[i].out);
+            }
+            TEST_ASSERT(!strcmp(out, cases[i].out));
+            free(out);
+        }
+    }
+    /* Malformed values produce NULL, not partial output. */
+    TEST_ASSERT(json_tojson_sorted("{\"a\":}") == NULL);
+    TEST_ASSERT(json_tojson_sorted("[1,") == NULL);
+    TEST_ASSERT(json_tojson_sorted("{\"a\" 1}") == NULL);
 }
 
 static void test_json_parser_handles_tool_heavy_requests(void) {
@@ -24069,9 +25756,18 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
+    test_render_kolibri_chat_prompt_text();
+    test_parse_kolibri_generated_message_ex();
+    test_kolibri_tool_checkpoint_round_trip();
+    test_kolibri_checkpoint_suffix_matches_render();
+    test_kolibri_live_tool_tail_round_trip();
+    test_kolibri_tool_visible_checkpoint_boundary();
+    test_kolibri_thinking_visible_text_matches_render();
+    test_kolibri_invalid_tool_error_suffix();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
     test_qwen_decode_tracker_markers();
+    test_kolibri_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
     test_qwen_string_arguments_follow_schema();
@@ -24171,6 +25867,7 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_request_parsers_reject_malformed_duplicate_owned_fields();
+    test_json_tojson_sorted();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_json_int_handles_non_finite_values();

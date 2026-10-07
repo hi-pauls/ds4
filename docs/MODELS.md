@@ -144,6 +144,46 @@ llama.cpp's Q8_0 mmproj from
 [ggml-org/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/ggml-org/Qwen3.8-Flash-Next-GGUF);
 pass it at runtime with `--vision`.
 
+## Kolibri-1
+
+Kolibri-1 is Aleph Alpha's 78.10B-parameter mixture-of-experts model with
+3.46B active parameters (Apache 2.0). Prebuilt Q8, Q4 and Q2 GGUFs with
+published SHA-256 checksums are on
+[aparusel/ds4-kolibri-1-gguf](https://huggingface.co/aparusel/ds4-kolibri-1-gguf);
+`download_model.sh` fetches them into `gguf/` and verifies size and checksum.
+The `--quant` flag selects the routed-expert format when building locally:
+
+| Recipe | Routed experts | File size | Download target |
+| --- | --- | ---: | --- |
+| `--quant f16` | F16 | about 146 GiB | build locally |
+| `--quant q8` | Q8_0 | 77.4 GiB | `./download_model.sh kolibri1-q8` |
+| `--quant q4` | Q4_K | about 43 GiB | `./download_model.sh kolibri1-q4` |
+| `--quant q2` | IQ2_XXS gate/up, Q2_K down | about 23 GiB | `./download_model.sh kolibri1-q2` |
+
+To build f16 or reproduce a conversion from the released
+`Aleph-Alpha/Kolibri-1` checkpoint (the FP8 snapshot or `Kolibri-1-BF16`),
+use the [Kolibri converter](../gguf-tools/README.md#convert-kolibri-1):
+
+```sh
+make -C gguf-tools libds4quants.dylib
+python3 gguf-tools/kolibri1_quantize.py \
+  --hf models/Kolibri-1-BF16 \
+  --source-revision <40-hex HF commit> \
+  --out gguf/Kolibri-1-Q8.gguf --quant q8 --dry-run
+```
+
+Remove `--dry-run` to write the file (resume with `--resume`). Audit a
+finished artifact with `python3 gguf-tools/kolibri1_validate_gguf.py
+--payload`; the [conversion section](../gguf-tools/README.md#convert-kolibri-1)
+has the full commands.
+
+Kolibri-1 runs on Metal and the CPU reference backend; CUDA, ROCm, tensor and
+pipeline parallelism, SSD streaming, speculation and vision are not supported.
+Thinking is enabled by default, and `--think-level` selects the released low,
+medium or high effort wording. Native context is 262,144 tokens, with the 40
+sliding-attention layers in a windowed KV ring: about 12 GiB of KV at full
+context. `ds4-server` serves the model as `kolibri-1`.
+
 ## GLM 5.3 Flash
 
 | Target | Approximate file size | Use |

@@ -4887,6 +4887,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
+        @[@"DS4_METAL_KOLIBRI1_SOURCE",   @"metal/kolibri1.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -51543,4 +51544,211 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     }
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* ---- Kolibri-1 ---------------------------------------------------------- */
+
+typedef struct {
+    id<MTLBuffer> buf;
+    NSUInteger    off;
+} kolibri_bind;
+
+static bool kolibri_bind_tensor(kolibri_bind *b, const ds4_gpu_tensor *t, uint64_t min_bytes, const char *what) {
+    if (!t || !ds4_gpu_tensor_buffer(t) || ds4_gpu_tensor_bytes(t) < min_bytes) {
+        fprintf(stderr, "ds4: Kolibri-1 %s buffer is missing or undersized (%" PRIu64 " < %" PRIu64 ")\n",
+                what, t ? ds4_gpu_tensor_bytes(t) : 0, min_bytes);
+        return false;
+    }
+    b->buf = ds4_gpu_tensor_buffer(t);
+    b->off = ds4_gpu_tensor_offset(t);
+    return true;
+}
+
+static bool kolibri_bind_weight(kolibri_bind *b, const void *map, uint64_t size,
+                                uint64_t offset, uint64_t bytes, const char *what) {
+    uint64_t inner = 0;
+    if (!map || offset > size || bytes > size - offset) {
+        fprintf(stderr, "ds4: Kolibri-1 %s range is outside the mapped model\n", what);
+        return false;
+    }
+    b->buf = ds4_gpu_wrap_model_range(map, size, offset, bytes, &inner);
+    b->off = (NSUInteger)inner;
+    return b->buf != nil;
+}
+
+enum {
+    KOLIBRI_K_ATTN_PREP = 0,
+    KOLIBRI_K_ATTN_DECODE,
+    KOLIBRI_K_ATTN_MERGE,
+    KOLIBRI_K_ROUTER,
+    KOLIBRI_K_MOE_SUM,
+    KOLIBRI_K_COUNT,
+};
+
+static id<MTLComputePipelineState> g_kolibri_pipelines[KOLIBRI_K_COUNT];
+static const char *const kolibri_kernel_names[KOLIBRI_K_COUNT] = {
+    "kernel_kolibri_attn_prep",
+    "kernel_kolibri_attn_decode",
+    "kernel_kolibri_attn_merge",
+    "kernel_kolibri_router_topk",
+    "kernel_kolibri_moe_sum",
+};
+
+static int kolibri_dispatch(int kernel, const void *args, size_t args_len,
+                            const kolibri_bind *binds, int n_binds,
+                            MTLSize grid, MTLSize tg, NSUInteger tg_mem) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        if (!g_kolibri_pipelines[kernel]) {
+            g_kolibri_pipelines[kernel] = ds4_gpu_get_pipeline(kolibri_kernel_names[kernel]);
+            if (!g_kolibri_pipelines[kernel]) return 0;
+        }
+        id<MTLComputePipelineState> pipeline = g_kolibri_pipelines[kernel];
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:args_len atIndex:0];
+        for (int i = 0; i < n_binds; i++) {
+            [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:(NSUInteger)(i + 1)];
+        }
+        if (tg_mem) [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, kolibri_kernel_names[kernel]);
+    }
+}
+
+int ds4_gpu_kolibri_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *qproj, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, uint32_t cache_rows, uint32_t use_rope,
+        float rope_base, float eps) {
+    struct {
+        uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, cache_rows, use_rope;
+        float eps; float rope_freq[64];
+    } args = { n_tokens, n_head, n_head_kv, head_dim, pos0, cache_rows, use_rope, eps, { 0 } };
+    for (uint32_t i = 0; i < head_dim / 2u; i++)
+        args.rope_freq[i] = powf(rope_base, -2.0f * (float)i / (float)head_dim);
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
+    /* cache_rows != 0 is a ring holding max(pos)+1 slots; 0 means one row
+     * per absolute position up to the batch end. */
+    const uint64_t cache_bytes = (uint64_t)(cache_rows ? cache_rows : pos0 + n_tokens) *
+                                 n_head_kv * head_dim * sizeof(float);
+    kolibri_bind b[8];
+    if (n_tokens == 0 || head_dim == 0 || head_dim > 128u || (head_dim % 4u) != 0 ||
+        head_dim > sizeof(args.rope_freq) / sizeof(args.rope_freq[0]) * 2u ||
+        (cache_rows != 0 && n_tokens > cache_rows) ||
+        n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        !kolibri_bind_tensor(&b[0], qproj, q_bytes, "attn q projection") ||
+        !kolibri_bind_tensor(&b[1], kproj, kv_bytes, "attn k projection") ||
+        !kolibri_bind_tensor(&b[2], vproj, kv_bytes, "attn v projection") ||
+        !kolibri_bind_weight(&b[3], model_map, model_size, g_q_offset,
+                             (uint64_t)head_dim * sizeof(float), "attn q_norm") ||
+        !kolibri_bind_weight(&b[4], model_map, model_size, g_k_offset,
+                             (uint64_t)head_dim * sizeof(float), "attn k_norm") ||
+        !kolibri_bind_tensor(&b[5], q_out, q_bytes, "attn q") ||
+        !kolibri_bind_tensor(&b[6], k_cache, cache_bytes, "k cache") ||
+        !kolibri_bind_tensor(&b[7], v_cache, cache_bytes, "v cache")) {
+        return 0;
+    }
+    return kolibri_dispatch(KOLIBRI_K_ATTN_PREP, &args, sizeof(args), b, 8,
+                            MTLSizeMake(n_head + n_head_kv + 1u, n_tokens, 1),
+                            MTLSizeMake(32, 1, 1), 0);
+}
+
+#define KOLIBRI_ATTN_MAX_SPLITS 64
+
+uint64_t ds4_gpu_kolibri_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
+    return (uint64_t)n_tokens * n_head * KOLIBRI_ATTN_MAX_SPLITS * (2u + head_dim);
+}
+
+int ds4_gpu_kolibri_attn_decode_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, uint32_t window, uint32_t cache_rows, float scale) {
+    const uint32_t n_keys = pos0 + n_tokens;
+    uint32_t n_splits = 1;
+    if (part) {
+        n_splits = (n_keys + 31u) / 32u;
+        if (n_splits < 1) n_splits = 1;
+        if (n_splits > KOLIBRI_ATTN_MAX_SPLITS) n_splits = KOLIBRI_ATTN_MAX_SPLITS;
+    }
+    const uint32_t keys_per_split = (n_keys + n_splits - 1) / n_splits;
+    struct { uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0, window, cache_rows, n_splits, keys_per_split;
+             float scale; } args =
+        { n_tokens, n_head, n_head_kv, head_dim, pos0, window, cache_rows, n_splits, keys_per_split, scale };
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)(cache_rows ? cache_rows : n_keys) *
+                                 n_head_kv * head_dim * sizeof(float);
+    const uint64_t part_bytes = ds4_gpu_kolibri_attn_part_floats(n_tokens, n_head, head_dim) * sizeof(float);
+    kolibri_bind b[5];
+    if (n_tokens == 0 || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
+        n_head / n_head_kv > 12u || head_dim == 0 || head_dim > 128u || (head_dim % 4u) != 0 ||
+        (cache_rows != 0 && n_tokens > cache_rows) ||
+        !kolibri_bind_tensor(&b[0], q, q_bytes, "attn q") ||
+        !kolibri_bind_tensor(&b[1], k_cache, cache_bytes, "k cache") ||
+        !kolibri_bind_tensor(&b[2], v_cache, cache_bytes, "v cache") ||
+        !kolibri_bind_tensor(&b[3], out, q_bytes, "attn out")) {
+        return 0;
+    }
+    if (n_splits > 1) {
+        if (!kolibri_bind_tensor(&b[4], part, part_bytes, "attn partials")) return 0;
+    } else {
+        b[4] = b[3];
+    }
+    if (!kolibri_dispatch(KOLIBRI_K_ATTN_DECODE, &args, sizeof(args), b, 5,
+                          MTLSizeMake(n_splits, n_head_kv, n_tokens),
+                          MTLSizeMake(32 * 4, 1, 1), 0)) {
+        return 0;
+    }
+    if (n_splits == 1) return 1;
+    kolibri_bind mb[2] = { b[4], b[3] };
+    return kolibri_dispatch(KOLIBRI_K_ATTN_MERGE, &args, sizeof(args), mb, 2,
+                            MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+int ds4_gpu_kolibri_router_topk_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, uint64_t bias_offset,
+        const void *model_map, uint64_t model_size,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used, float weight_scale) {
+    struct { uint32_t n_tokens, n_expert, n_used; float weight_scale; } args =
+        { n_tokens, n_expert, n_used, weight_scale };
+    kolibri_bind b[4];
+    if (n_tokens == 0 || n_expert == 0 || n_expert > 512u || n_used == 0 || n_used > 8u || n_used > n_expert ||
+        !kolibri_bind_tensor(&b[0], logits, (uint64_t)n_tokens * n_expert * sizeof(float), "router logits") ||
+        !kolibri_bind_weight(&b[1], model_map, model_size, bias_offset,
+                             (uint64_t)n_expert * sizeof(float), "expert bias") ||
+        !kolibri_bind_tensor(&b[2], selected, (uint64_t)n_tokens * n_used * sizeof(int32_t), "router selected") ||
+        !kolibri_bind_tensor(&b[3], weights, (uint64_t)n_tokens * n_used * sizeof(float), "router weights")) {
+        return 0;
+    }
+    return kolibri_dispatch(KOLIBRI_K_ROUTER, &args, sizeof(args), b, 4,
+                            MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(128, 1, 1), 0);
+}
+
+int ds4_gpu_kolibri_moe_sum_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t dim) {
+    struct { uint32_t n_tokens, n_slots, dim, pad0; } args = { n_tokens, n_slots, dim, 0 };
+    kolibri_bind b[3];
+    if (n_tokens == 0 || n_slots == 0 || dim == 0 ||
+        !kolibri_bind_tensor(&b[0], part, (uint64_t)n_tokens * (n_slots + 1u) * dim * sizeof(float),
+                             "moe partial") ||
+        !kolibri_bind_tensor(&b[1], weights, (uint64_t)n_tokens * n_slots * sizeof(float),
+                             "moe weights") ||
+        !kolibri_bind_tensor(&b[2], out, (uint64_t)n_tokens * dim * sizeof(float), "moe out")) {
+        return 0;
+    }
+    return kolibri_dispatch(KOLIBRI_K_MOE_SUM, &args, sizeof(args), b, 3,
+                            MTLSizeMake((dim + 255u) / 256u, n_tokens, 1),
+                            MTLSizeMake(256, 1, 1), 0);
 }

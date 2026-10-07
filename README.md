@@ -9,7 +9,12 @@ a small native inference engine optimized first for
 **DeepSeek V4 Flash** (including the experimental vision model),
 **DeepSeek V4.1 Flash** (Metal, and text inference on CUDA),
 and additionally **GLM 5.2 and 5.3**, **GLM 5.3 Flash** and
-**DeepSeek V4 PRO**, and **Qwen3.8 Flash Next** (Metal and CUDA). The code is self-contained and
+**DeepSeek V4 PRO**, **Qwen3.8 Flash Next** (Metal and CUDA), and
+**Kolibri-1** (Metal and CPU), Aleph Alpha's German/English mixture-of-experts
+model. Kolibri-1 is the smallest model in the family, so it is the most
+accessible entry point: prebuilt Q8, Q4, and Q2 GGUFs are on
+[Hugging Face](https://huggingface.co/aparusel/ds4-kolibri-1-gguf). The code is
+self-contained and
 deliberately narrow, not a general GGUF runner: you need to use the
 GGUF files the project produces, that are part of the project
 itself.
@@ -21,8 +26,9 @@ The repository also includes tools and data for GGUF, imatrix, quality, and spee
 ## Supported hardware
 
 * **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
-  can use SSD streaming. SSD streaming is also needed in order to run very
-  large models such as full GLM 5.x (not Flash) on 128GB systems.
+  can use SSD streaming, or run Kolibri-1 Q2/Q4 (about 23/43 GiB) without it.
+  SSD streaming is also needed in order to run very large models such as full
+  GLM 5.x (not Flash) on 128GB systems.
 * **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards.
 * **ROCm** on Strix Halo systems such as the Framework Desktop.
 
@@ -108,6 +114,16 @@ Leave memory for the context and runtime buffers as well as the model.
 See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
 on a smaller Mac.
 
+With less RAM, start from Kolibri-1: its Q2 file is about 23 GiB.
+
+```sh
+./download_model.sh kolibri1-q2
+./ds4 -m gguf/Kolibri-1-Q2.gguf
+```
+
+See [Kolibri-1](#kolibri-1) for the Q4 and Q8 builds, and for building other
+recipes from the released checkpoint.
+
 ## Everyday Use
 
 Once built and with a model downloaded:
@@ -134,7 +150,8 @@ Run each binary with `--help` for its full options.
 
 `ds4-agent` runs inference directly, without a separate HTTP server. It keeps
 the token history and live model state together, shows prefill progress, and
-uses the model's native tool format. DeepSeek and GLM have their own templates.
+uses the model's native tool format. DeepSeek, GLM, Qwen, and Kolibri-1 have
+their own templates.
 
 Use `/hints on` for occasional, brief explanations of the programming choices
 behind the work, and `/hints off` to stop them. Changes take effect at the next
@@ -197,6 +214,50 @@ support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
 difference between default opportunistic sampling and `--mtp-exact-sampling`.
 
+### Kolibri-1
+
+Kolibri-1 is Aleph Alpha's 78.10B-parameter mixture-of-experts model with
+3.46B active parameters (Apache 2.0), tuned for German and English. It is the
+smallest model DwarfStar supports, which makes it a good starting point on
+smaller machines.
+
+| Recipe | Routed experts | File size |
+| --- | --- | ---: |
+| `f16` | F16 | about 146 GiB |
+| `q8` | Q8_0 | 77.4 GiB |
+| `q4` | Q4_K | about 43 GiB |
+| `q2` | IQ2_XXS gate/up, Q2_K down | about 23 GiB |
+
+Norms, routers, and the shared expert stay in higher precision in every
+recipe. The Q2 build is the entry point for small machines (32-48 GB) at
+moderate context, Q4 suits 64 GB systems, Q8 suits 96/128 GB, and f16 is for
+192 GB or more; leave room for the context and runtime buffers as well as the
+weights.
+
+Prebuilt Q8, Q4, and Q2 GGUFs, converted from the FP8 release with a pinned
+source revision and SHA-256 checksums, are on
+[Hugging Face](https://huggingface.co/aparusel/ds4-kolibri-1-gguf); the
+`download_model.sh` targets fetch them into `gguf/` and verify the checksums:
+
+```sh
+./download_model.sh kolibri1-q4
+./ds4 -m gguf/Kolibri-1-Q4.gguf
+```
+
+The files use DwarfStar's GGUF schema and load in `ds4`, not in other GGUF
+runners. To build f16 or to reproduce the conversion from the released
+`Aleph-Alpha/Kolibri-1` checkpoint (FP8 or `Kolibri-1-BF16`), follow the
+[Kolibri converter](gguf-tools/README.md#convert-kolibri-1) guide.
+
+Kolibri-1 runs on Metal and the CPU reference backend; CUDA, ROCm, tensor and
+pipeline parallelism, SSD streaming, speculation, and vision are not
+supported. Thinking is enabled by default, and `--think-level` selects the
+released low, medium, or high effort wording. The native agent and HTTP server
+speak the released tool-call format, and the server lists the model as
+`kolibri-1`. Native context is 262,144 tokens, and the 40 sliding-attention
+layers use a windowed KV ring: about 12 GiB of KV at full context instead of
+54 GiB.
+
 ### Output and power
 
 Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
@@ -204,9 +265,13 @@ answers, and `--think` or `/think` to enable it again.
 For V4.1, `ds4` and `ds4-agent` also accept
 `--think-level 25` or `/think 25`: 1 to 100 sets the reasoning effort, and
 0 disables thinking. `--think` selects 75, `--think-max` selects 100.
+Kolibri-1 accepts `--think-level N` at startup and maps it to its released
+low, medium, and high effort sentences.
 Changing the level in a conversation rebuilds its cached prefix.
 The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
-`--temp 0` selects greedy output.
+`--temp 0` selects greedy output. Kolibri-1 instead applies its released
+defaults: temperature 1, top-p 0.97, and top-k 128, with min-p off
+(`--top-k` overrides the cut).
 
 For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
 The default is 100. V4.1 and GLM currently require `--power 100`.
@@ -250,7 +315,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 ## Detailed Guides
 
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
+- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, Kolibri-1, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.

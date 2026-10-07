@@ -9,6 +9,7 @@ QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
+KOLIBRI_REPO="aparusel/ds4-kolibri-1-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
@@ -39,6 +40,9 @@ GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
 QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+KOLIBRI_Q8_FILE="Kolibri-1-Q8.gguf"
+KOLIBRI_Q4_FILE="Kolibri-1-Q4.gguf"
+KOLIBRI_Q2_FILE="Kolibri-1-Q2.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -82,6 +86,9 @@ Usage:
   ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
+  ./download_model.sh kolibri1-q8 [--token TOKEN]
+  ./download_model.sh kolibri1-q4 [--token TOKEN]
+  ./download_model.sh kolibri1-q2 [--token TOKEN]
 
 Targets:
 
@@ -216,6 +223,23 @@ Targets:
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
        with --vision; this target does not update ./ds4flash.gguf.
 
+  kolibri1-q8
+       Kolibri-1 Q8_0 routed experts, 77.42 GiB on disk. Closest to the
+       released FP8 weights; best on 96/128 GB Macs.
+
+  kolibri1-q4
+       Kolibri-1 Q4_K routed experts, 42.56 GiB on disk. Good quality/size
+       trade-off for 64 GB systems.
+
+  kolibri1-q2
+       Kolibri-1 IQ2_XXS gate/up and Q2_K down routed experts, 22.78 GiB
+       on disk. Entry point for 32-48 GB machines at moderate context.
+
+  Kolibri-1 runs on Metal and the CPU reference backend; CUDA, ROCm, tensor
+  and pipeline parallelism, SSD streaming, speculation and vision are not
+  supported. Thinking is enabled by default. These targets verify the
+  published file sizes and SHA-256 checksums.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -237,9 +261,9 @@ Qwen3.8 includes its n-grams and MTP; add --mtp to enable speculation:
 After downloading DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
-PRO, V4.1, GLM and Qwen files use the official Hugging Face downloader
-because they are too large, sharded, or nested for the curl path used by the
-smaller DeepSeek Flash GGUF files.
+PRO, V4.1, GLM, Qwen and Kolibri-1 files use the official Hugging Face
+downloader because they are too large, sharded, nested, or need checksum
+verification; the curl path stays for the smaller DeepSeek Flash GGUF files.
 EOF
 }
 
@@ -377,6 +401,21 @@ case "$MODEL" in
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
+    kolibri1-q8)
+        REPO=$KOLIBRI_REPO
+        MODEL_FILE=$KOLIBRI_Q8_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    kolibri1-q4)
+        REPO=$KOLIBRI_REPO
+        MODEL_FILE=$KOLIBRI_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    kolibri1-q2)
+        REPO=$KOLIBRI_REPO
+        MODEL_FILE=$KOLIBRI_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -476,6 +515,18 @@ artifact_identity() {
         "$DS41_VISION_FILE")
             expected_bytes=970555552
             expected_sha=cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15
+            ;;
+        "$KOLIBRI_Q8_FILE")
+            expected_bytes=83135396224
+            expected_sha=e33fb57c3ea7dfba7692e9a7055632cebf96625e1753d1b900e73db0ee6a03d8
+            ;;
+        "$KOLIBRI_Q4_FILE")
+            expected_bytes=45693860224
+            expected_sha=0b3d5bf9ae13b467be4fa4c8f63208a2fd837577d6ec2e1c636cbf185aa26930
+            ;;
+        "$KOLIBRI_Q2_FILE")
+            expected_bytes=24460196256
+            expected_sha=5aa002fc9c852a91fc47b3aaa04717dfb6d30001fcc1b85a33bbfe9cfa19cdb5
             ;;
         *) return 1 ;;
     esac
@@ -707,6 +758,8 @@ if [ "$MODEL" = qwen38-q2 ] || [ "$MODEL" = qwen38-iq2 ]; then
     echo "Add --mtp to enable speculation."
 elif [ "$MODEL" = qwen38-q4k ]; then
     echo "Run ./ds4. Add --mtp to enable speculation."
+elif [ "$MODEL" = kolibri1-q8 ] || [ "$MODEL" = kolibri1-q4 ] || [ "$MODEL" = kolibri1-q2 ]; then
+    echo "Kolibri-1 runs on Metal and on the CPU reference backend (./ds4 --cpu)."
 fi
 if [ "$MODEL" = qwen38-vision ]; then
     echo

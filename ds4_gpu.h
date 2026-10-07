@@ -3586,6 +3586,37 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+/* ---- Kolibri-1 (Metal only) ---- */
+/* cache_rows selects the K/V row layout: 0 = rows are absolute token
+ * positions (full-attention layers), nonzero = a ring of that many rows
+ * indexed by pos % cache_rows (sliding layers; must hold the window plus
+ * the in-flight prefill chunk so a batch never aliases itself). */
+int ds4_gpu_kolibri_attn_prep_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *qproj, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, uint32_t cache_rows, uint32_t use_rope,
+        float rope_base, float eps);
+/* part (optional, decode-sized batches): partial-softmax scratch of
+ * ds4_gpu_kolibri_attn_part_floats() floats enabling key-split parallelism */
+uint64_t ds4_gpu_kolibri_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
+int ds4_gpu_kolibri_attn_decode_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, uint32_t window, uint32_t cache_rows, float scale);
+int ds4_gpu_kolibri_router_topk_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *logits, uint64_t bias_offset,
+        const void *model_map, uint64_t model_size,
+        uint32_t n_tokens, uint32_t n_expert, uint32_t n_used, float weight_scale);
+int ds4_gpu_kolibri_moe_sum_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t dim);
+
 #ifdef __cplusplus
 }
 #endif
