@@ -34,6 +34,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #endif
@@ -7720,6 +7722,16 @@ static void qwen4_vision_weights_bind(ds4_qwen4_vision_weights *w, const ds4_mod
     }
 }
 
+/* DS4_QWEN4_VISION_CPU=1 encodes Qwen3.8 images on the CPU and keeps the mmproj out of GPU memory. */
+static DS4_MAYBE_UNUSED bool qwen4_vision_on_cpu(void) {
+#ifdef __APPLE__
+    const char *env = getenv("DS4_QWEN4_VISION_CPU");
+    return env && env[0] && strcmp(env, "0") != 0;
+#else
+    return false;
+#endif
+}
+
 #ifdef DS4_HAS_QWEN4_GPU
 /* Learned 2D position table (side x side) resampled to the patch grid with
  * bilinear, align_corners interpolation; rows in 2x2 window order. */
@@ -7757,6 +7769,166 @@ static uint32_t qwen4_vision_max_tokens(void) {
     return v >= 64 && v <= 16383 ? (uint32_t)v : 1024u;   /* 4 patches per token, < 65536 patches */
 }
 
+#ifdef __APPLE__
+/* The vision tower on the CPU, step for step the Metal one (metal/qwen4_vision.metal), for servers whose
+ * language model fills the GPU's wired budget: the mmproj then never enters GPU memory. Matrix products
+ * run through Accelerate; row loops through GCD, not the ds4 thread pool, because an image may be
+ * encoded while another thread decodes. */
+
+/* A [rows][cols] f32/f16/q8_0 vision weight as f32 */
+static float *qwen4_vision_cpu_weight(const ds4_model *vm, uint64_t offset, uint32_t type, uint64_t rows, uint64_t cols) {
+    const uint64_t n = rows * cols;
+    const uint8_t *src = (const uint8_t *)vm->map + offset;
+    float *out = malloc((size_t)n * sizeof(float));
+    if (out && type == DS4_TENSOR_F32) {
+        memcpy(out, src, (size_t)n * sizeof(float));
+    } else if (out && type == DS4_TENSOR_F16) {
+        for (uint64_t i = 0; i < n; i++) out[i] = f16_to_f32(((const uint16_t *)src)[i]);
+    } else if (out) {
+        for (uint64_t b = 0; b < n / 32u; b++) {
+            const uint8_t *blk = src + b * 34u;
+            const float d = f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            for (uint32_t j = 0; j < 32u; j++) out[b * 32u + j] = d * (float)((const int8_t *)(blk + 2))[j];
+        }
+    }
+    return out;
+}
+
+/* out[n][out_dim] = in[n][in_dim] . W^T (+ bias) */
+static bool qwen4_vision_cpu_dense(float *out, const float *in, uint64_t n, const ds4_model *vm, uint64_t w_off,
+                                   uint32_t type, uint64_t in_dim, uint64_t out_dim, uint64_t bias_off) {
+    float *w = qwen4_vision_cpu_weight(vm, w_off, type, out_dim, in_dim);
+    if (w) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)n, (int)out_dim, (int)in_dim, 1.0f, in, (int)in_dim,
+                    w, (int)in_dim, 0.0f, out, (int)out_dim);
+        free(w);
+        if (bias_off) {
+            const float *bias = (const float *)((const char *)vm->map + bias_off);
+            dispatch_apply((size_t)n, DISPATCH_APPLY_AUTO, ^(size_t r) {
+                vDSP_vadd(out + r * out_dim, 1, bias, 1, out + r * out_dim, 1, (vDSP_Length)out_dim);
+            });
+        }
+    }
+    return w != NULL;
+}
+
+static void qwen4_vision_cpu_layernorm(float *out, const float *x, uint64_t rows, uint32_t width,
+                                       const float *w, const float *b, float eps) {
+    dispatch_apply((size_t)rows, DISPATCH_APPLY_AUTO, ^(size_t r) {
+        const float *src = x + r * width;
+        float *dst = out + r * width;
+        float mean = 0.0f, var = 0.0f;
+        for (uint32_t i = 0; i < width; i++) mean += src[i];
+        mean /= (float)width;
+        for (uint32_t i = 0; i < width; i++) var += (src[i] - mean) * (src[i] - mean);
+        const float inv = 1.0f / sqrtf(var / (float)width + eps);
+        for (uint32_t i = 0; i < width; i++) dst[i] = (src[i] - mean) * inv * w[i] + b[i];
+    });
+}
+
+/* mode 0 tanh gelu, 1 erf gelu, in place */
+static void qwen4_vision_cpu_gelu(float *x, uint64_t n, int mode) {
+    dispatch_apply((size_t)((n + 4095u) / 4096u), DISPATCH_APPLY_AUTO, ^(size_t c) {
+        const uint64_t end = (c + 1u) * 4096u < n ? (c + 1u) * 4096u : n;
+        for (uint64_t i = c * 4096u; i < end; i++) {
+            const float t = x[i];
+            if (mode == 0) {
+                const float u = fminf(fmaxf(0.7978845608f * (t + 0.044715f * t * t * t), -30.0f), 30.0f);
+                x[i] = 0.5f * t * (1.0f + tanhf(u));
+            } else {
+                x[i] = 0.5f * t * (1.0f + erff(t * 0.70710678f));
+            }
+        }
+    });
+}
+
+static bool qwen4_vision_cpu_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
+                                    uint32_t grid_w, const ds4_model *vm, const ds4_qwen4_vision_weights *w) {
+    const uint32_t E = w->n_embd, FF = w->n_ff, H = w->n_head, D = H ? E / H : 0, P = w->n_patch, M = w->n_merge;
+    const uint32_t in_patch = 3u * P * P, mm = M * M, ME = E * mm, O = w->n_out;
+    if (n_patches == 0 || mm == 0 || (n_patches % mm) != 0 || grid_w < 2 || (grid_w % M) != 0 ||
+        D == 0 || (D % 4u) != 0 || H * D != E || FF == 0 || O == 0) {
+        fprintf(stderr, "ds4: invalid Qwen3.8 vision encoder input\n");
+        return false;
+    }
+    const uint64_t N = n_patches, merged = n_patches / mm;
+#define QWEN4_VIS_F32(off_) ((const float *)((const char *)vm->map + (off_)))
+    float *a0 = malloc(N * E * sizeof(float)), *a1 = malloc(N * E * sizeof(float));
+    float *x = malloc(N * E * sizeof(float)), *tmp = malloc(N * E * sizeof(float));
+    float *qkv = malloc(N * 3u * E * sizeof(float)), *attn = malloc(N * E * sizeof(float));
+    float *ffn = malloc(N * FF * sizeof(float)), *m0 = malloc(merged * ME * sizeof(float));
+    float *scores = malloc(N * N * sizeof(float));
+    bool ok = a0 && a1 && x && tmp && qkv && attn && ffn && m0 && scores &&
+              qwen4_vision_cpu_dense(a0, patches, N, vm, w->patch_w0, w->patch_type, in_patch, E, 0) &&
+              qwen4_vision_cpu_dense(a1, patches, N, vm, w->patch_w1, w->patch_type, in_patch, E, 0);
+    if (ok) {
+        const float *patch_b = QWEN4_VIS_F32(w->patch_b);
+        for (uint64_t i = 0; i < N * E; i++) x[i] = a0[i] + a1[i] + patch_b[i % E] + pos_embed[i];
+    }
+    const float scale = 1.0f / sqrtf((float)D);
+    const uint32_t hd = D / 2u, qd = D / 4u, w2 = grid_w / 2u;
+    for (uint32_t il = 0; ok && il < DS4_QWEN4_VISION_LAYERS; il++) {
+        const ds4_qwen4_vision_layer_weights *l = &w->layer[il];
+        qwen4_vision_cpu_layernorm(tmp, x, N, E, QWEN4_VIS_F32(l->ln1_w), QWEN4_VIS_F32(l->ln1_b), w->eps);
+        ok = qwen4_vision_cpu_dense(qkv, tmp, N, vm, l->qkv_w, l->qkv_type, E, 3u * E, l->qkv_b);
+        if (!ok) break;
+        /* 2D rope on q and k in place: rows are patches in 2x2 window order */
+        dispatch_apply((size_t)N, DISPATCH_APPLY_AUTO, ^(size_t row) {
+            const uint32_t blk = (uint32_t)row / 4u, within = (uint32_t)row % 4u;
+            const float hpos = (float)((blk / w2) * 2u + within / 2u);
+            const float wpos = (float)((blk % w2) * 2u + within % 2u);
+            for (uint32_t part = 0; part < 2u; part++) {
+                for (uint32_t h = 0; h < H; h++) {
+                    float *v = qkv + row * 3u * E + part * E + h * D;
+                    for (uint32_t i = 0; i < hd; i++) {
+                        const uint32_t j = i < qd ? i : i - qd;
+                        const float theta = (i < qd ? hpos : wpos) * powf(10000.0f, -2.0f * (float)j / (float)hd);
+                        const float c = cosf(theta), s = sinf(theta), x0 = v[i], x1 = v[i + hd];
+                        v[i] = x0 * c - x1 * s;
+                        v[i + hd] = x0 * s + x1 * c;
+                    }
+                }
+            }
+        });
+        /* bidirectional attention over the whole image, one head at a time */
+        for (uint32_t h = 0; h < H; h++) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int)N, (int)N, (int)D, scale,
+                        qkv + h * D, (int)(3u * E), qkv + E + h * D, (int)(3u * E), 0.0f, scores, (int)N);
+            dispatch_apply((size_t)N, DISPATCH_APPLY_AUTO, ^(size_t r) {
+                float *row = scores + r * N, peak = 0.0f, total = 0.0f;
+                const int count = (int)N;
+                vDSP_maxv(row, 1, &peak, (vDSP_Length)N);
+                peak = -peak;
+                vDSP_vsadd(row, 1, &peak, row, 1, (vDSP_Length)N);
+                vvexpf(row, row, &count);
+                vDSP_sve(row, 1, &total, (vDSP_Length)N);
+                total = 1.0f / total;
+                vDSP_vsmul(row, 1, &total, row, 1, (vDSP_Length)N);
+            });
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)N, (int)D, (int)N, 1.0f,
+                        scores, (int)N, qkv + 2u * E + h * D, (int)(3u * E), 0.0f, attn + h * D, (int)E);
+        }
+        ok = qwen4_vision_cpu_dense(tmp, attn, N, vm, l->out_w, l->out_type, E, E, l->out_b);
+        if (ok) vDSP_vadd(x, 1, tmp, 1, x, 1, (vDSP_Length)(N * E));
+        if (ok) qwen4_vision_cpu_layernorm(tmp, x, N, E, QWEN4_VIS_F32(l->ln2_w), QWEN4_VIS_F32(l->ln2_b), w->eps);
+        ok = ok && qwen4_vision_cpu_dense(ffn, tmp, N, vm, l->up_w, l->up_type, E, FF, l->up_b);
+        if (ok) qwen4_vision_cpu_gelu(ffn, N * FF, 0);
+        ok = ok && qwen4_vision_cpu_dense(tmp, ffn, N, vm, l->down_w, l->down_type, FF, E, l->down_b);
+        if (ok) vDSP_vadd(x, 1, tmp, 1, x, 1, (vDSP_Length)(N * E));
+    }
+    if (ok) {
+        /* rows already sit in merge-window order, so the merger input is a plain reshape */
+        qwen4_vision_cpu_layernorm(tmp, x, N, E, QWEN4_VIS_F32(w->post_ln_w), QWEN4_VIS_F32(w->post_ln_b), w->eps);
+        ok = qwen4_vision_cpu_dense(m0, tmp, merged, vm, w->mm0_w, w->mm0_type, ME, ME, w->mm0_b);
+        if (ok) qwen4_vision_cpu_gelu(m0, merged * ME, 1);
+        ok = ok && qwen4_vision_cpu_dense(out, m0, merged, vm, w->mm2_w, w->mm2_type, ME, O, w->mm2_b);
+    }
+#undef QWEN4_VIS_F32
+    free(scores); free(m0); free(ffn); free(attn); free(qkv); free(tmp); free(x); free(a1); free(a0);
+    return ok;
+}
+#endif
+
 /* preprocess + encode one image with the bound mmproj; out gets malloc'd
  * [tokens][n_out] embeddings */
 static int qwen4_vision_encode_image(const ds4_model *vm, const ds4_qwen4_vision_weights *w, const ds4_image *image,
@@ -7771,8 +7943,15 @@ static int qwen4_vision_encode_image(const ds4_model *vm, const ds4_qwen4_vision
     if (ok) {
         qwen4_vision_pos_embed((const float *)((const char *)vm->map + w->pos_embd), w->n_pos_side, w->n_embd,
                                patches->grid_height, patches->grid_width, pos);
+#ifdef __APPLE__
+        ok = qwen4_vision_on_cpu() ?
+             qwen4_vision_cpu_encode(emb, patches->patches, pos, patches->patch_count, patches->grid_width, vm, w) :
+             ds4_gpu_qwen4_vision_encode(emb, patches->patches, pos, patches->patch_count, patches->grid_width,
+                                         vm->map, vm->size, w);
+#else
         ok = ds4_gpu_qwen4_vision_encode(emb, patches->patches, pos, patches->patch_count, patches->grid_width,
                                          vm->map, vm->size, w);
+#endif
     }
     free(pos);
     if (!ok) {
@@ -72845,7 +73024,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
-        if (e->vision_ready) {
+        if (e->vision_ready && e->vision_kind == DS4_VISION_QWEN4 && qwen4_vision_on_cpu()) {
+            e->vision_map_ready = true;   /* encoded on the CPU straight from the mmap */
+        } else if (e->vision_ready) {
 #if defined(__APPLE__)
             e->vision_map_ready = ds4_gpu_set_model_map_range(
                     e->vision_model.map,
@@ -73395,7 +73576,9 @@ static int ds4_engine_vision_encode_image(
     if (!e->metal_ready) {
         e->metal_ready = ds4_gpu_init() != 0;
     }
-    if (e->metal_ready && !e->vision_map_ready) {
+    if (e->vision_kind == DS4_VISION_QWEN4 && qwen4_vision_on_cpu()) {
+        e->vision_map_ready = true;
+    } else if (e->metal_ready && !e->vision_map_ready) {
 #if defined(__APPLE__)
         e->vision_map_ready = ds4_gpu_set_model_map_range(
                 e->vision_model.map,
@@ -73526,8 +73709,9 @@ int ds4_qwen4_vision_dump(const char *vision_path, const char *image_path, const
         fprintf(stderr, "ds4: %s\n", err);
         return 0;
     }
-    int ok = ds4_gpu_init() && ds4_gpu_set_model_map_range(vm.map, vm.size, vm.tensor_data_pos,
-                                                          vm.size - vm.tensor_data_pos, vm.max_tensor_bytes);
+    int ok = qwen4_vision_on_cpu() ||
+             (ds4_gpu_init() && ds4_gpu_set_model_map_range(vm.map, vm.size, vm.tensor_data_pos,
+                                                            vm.size - vm.tensor_data_pos, vm.max_tensor_bytes));
     float *emb = NULL;
     ds4_image_patches patches = {0};
     if (ok) ok = qwen4_vision_encode_image(&vm, &w, &image, min_image_tokens, max_image_tokens, &emb, &patches,

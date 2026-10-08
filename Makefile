@@ -38,7 +38,7 @@ CFLAGS += $(ZSTD_CFLAGS)
 LDLIBS += $(ZSTD_LDLIBS)
 
 ifeq ($(UNAME_S),Darwin)
-METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal -framework Accelerate
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
