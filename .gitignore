@@ -78,6 +78,7 @@
 /tests/test_engram
 /tests/test_prompt_prefix
 *.o
+/build/
 *.dSYM/
 __pycache__/
 *.pyc
