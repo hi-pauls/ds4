@@ -43,11 +43,13 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
         const float *iq, const float *ik, const uint32_t *pos3,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
-        unsigned pos0, float eps, rope_args rp) {
+        unsigned pos0, unsigned ik_ring, float eps, rope_args rp) {
     const unsigned slot = blockIdx.x, t = blockIdx.y, pos = pos0 + t, lane = threadIdx.x;
     __shared__ float row[256];
     if (slot == H + Hkv + Hi) {
-        for (unsigned i = lane; i < Di; i += 32) ikc[(uint64_t)pos * Di + i] = ik[(uint64_t)t * Di + i];
+        /* raw indexer keys live at pos % ik_ring; 0 keeps one row per position */
+        const uint64_t key_row = ik_ring ? pos % ik_ring : pos;
+        for (unsigned i = lane; i < Di; i += 32) ikc[key_row * Di + i] = ik[(uint64_t)t * Di + i];
         return;
     }
     const bool isq = slot < H, isk = !isq && slot < H + Hkv;
@@ -75,13 +77,16 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
 }
 
 __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
-        const float *gamma, unsigned block0, unsigned ratio, unsigned D, float eps, rope_args rp) {
+        const float *gamma, unsigned block0, unsigned ratio, unsigned D, unsigned ik_ring, float eps, rope_args rp) {
     const unsigned b = block0 + blockIdx.x, lane = threadIdx.x, npt = D / 32;
     __shared__ float row[128];
     float ss = 0, v[4];
     for (unsigned i = 0; i < npt; i++) {
         float a = 0;
-        for (unsigned t = 0; t < ratio; t++) a += ik[((uint64_t)b * ratio + t) * D + lane * npt + i];
+        for (unsigned t = 0; t < ratio; t++) {
+            const uint64_t pos = (uint64_t)b * ratio + t;
+            a += ik[(ik_ring ? pos % ik_ring : pos) * D + lane * npt + i];
+        }
         v[i] = a / ratio;
         ss += v[i] * v[i];
     }
@@ -612,7 +617,7 @@ template<unsigned TYPE, bool DOWN>
 __global__ void moe_mv(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
         unsigned shared_type, unsigned NE, unsigned NS, unsigned K, unsigned M,
-        uint64_t rb, uint64_t srb) {
+        uint64_t rb, uint64_t srb, uint64_t estride) {
     const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z;
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
@@ -636,7 +641,7 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
     } else {
         const int e = selected[(uint64_t)t * NS + slot];
         if (e >= 0 && (unsigned)e < NE) {
-            const uint64_t off = ((uint64_t)e * M + row) * rb;
+            const uint64_t off = (uint64_t)e * estride + row * rb;
             if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
                 for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
                     const float4 xv = *(const float4 *)(xt+i);
@@ -659,12 +664,17 @@ __global__ void moe_mv(float *out, const float *x, const int *selected,
 
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
-        unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
+        unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down,
+        uint64_t expert_stride = 0) {
+    /* expert_stride is the distance between two experts' first rows where it
+     * is not one expert's rows: the streaming arena keeps gate, up and down
+     * of an expert together. */
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
+    const uint64_t es = expert_stride ? expert_stride : (uint64_t)M * rb;
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
 #define QWEN_MOE(TYPE) case TYPE: \
-    if (down) moe_mv<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
-    else moe_mv<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); break
+    if (down) moe_mv<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb,es); \
+    else moe_mv<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb,es); break
     switch (type) {
     QWEN_MOE(0); QWEN_MOE(1); QWEN_MOE(2); QWEN_MOE(8); QWEN_MOE(10);
     QWEN_MOE(12); QWEN_MOE(16); QWEN_MOE(30); QWEN_MOE(39);
@@ -1026,13 +1036,17 @@ __global__ void matrix_half_tile(float *out, const float *x, const char *w0, con
 
 static int matrix_dispatch(float *out, const float *x, const char *w0, const char *w1,
         const int *lists, const int *counts, unsigned type, unsigned NE, unsigned T,
-        unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, bool down) {
+        unsigned NS, unsigned NO, unsigned K, unsigned M, unsigned cap, bool down,
+        unsigned *own_tiles = NULL) {
+    /* own_tiles: NE+1 words on the current device, for callers that run on a
+     * device other than the one the shared temporary belongs to. */
     const dim3 grid((M + 15) / 16, lists ? NE : 1, std::min(8u, (T + 15) / 16));
     const uint64_t rb = expert_row_bytes(type, K);
     if (ds4_cuda_attn_tokentile_arch_ok() && !getenv("DS4_CUDA_NO_TF32")) {
         if (lists && !g_quality_mode && (type == 16 || type == 10 || type == 12 || type == 39)) {
             const unsigned nt = T >= 2048 ? 64 : 32;
-            unsigned *tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
+            unsigned *tiles = own_tiles ? own_tiles :
+                              (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tiles");
             if (!tiles) return 0;
             expert_tiles<<<1,1,0,cuda_decode_stream()>>>(tiles,counts,NE,nt);
             if (!launched()) return 0;
@@ -1052,7 +1066,8 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         unsigned *tiles = NULL;
         dim3 tcgrid((M+63)/64,1,std::min(8u,(T+15)/16));
         if (lists) {
-            tiles = (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tile schedule");
+            tiles = own_tiles ? own_tiles :
+                    (unsigned *)cuda_tmp_alloc(((uint64_t)NE+1)*4,"Qwen expert tile schedule");
             if (!tiles) return 0;
             expert_tiles<<<1,1,0,cuda_decode_stream()>>>(tiles,counts,NE,32);
             if (!launched()) return 0;
@@ -1944,14 +1959,16 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
         const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
-        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, float base, float eps) {
+        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, uint32_t ik_ring, float base, float eps) {
     using namespace qwen4_cuda;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
+    /* A ring must hold the chunk and the block its first row may complete. */
     if (!T || !H || !Hkv || H % Hkv || !Hi || D < 32 || D > 256 || D % 32 ||
         Di < 32 || Di > 128 || Di % 32 || nrot > 64 || nrot > D || nrot > Di || nrot % 2 ||
-        (uint64_t)pos0 + T > cap || !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
+        (uint64_t)pos0 + T > cap || (ik_ring && T + 3u > ik_ring) ||
+        !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
         !tensor(kp, kb) || !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) ||
-        !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)cap * Di * 4) ||
+        !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)(ik_ring ? ik_ring : cap) * Di * 4) ||
         !tensor(kc, (uint64_t)cap * Hkv * D * 2) || !tensor(vc, (uint64_t)cap * Hkv * D * 2) ||
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
     const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
@@ -1960,22 +1977,23 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr,
         (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
         (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq,
-        H, Hkv, D, Hi, Di, pos0, eps, rope(nrot, base));
+        H, Hkv, D, Hi, Di, pos0, ik_ring, eps, rope(nrot, base));
     return launched();
 }
 
 extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
         const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3, const void *map, uint64_t size,
         uint64_t off, uint32_t b0, uint32_t N, uint32_t ratio, uint32_t D, uint32_t nrot,
-        float base, float eps) {
+        uint32_t ik_ring, float base, float eps) {
     using namespace qwen4_cuda;
     const uint64_t rows = (uint64_t)b0 + N;
     if (!N || !ratio || D < 32 || D > 128 || D % 32 || nrot > D || nrot > 64 || nrot % 2 ||
-        !tensor(out, rows * D * 2) || !tensor(ik, rows * ratio * D * 4) || !tensor(pos3, rows * ratio * 16)) return 0;
+        !tensor(out, rows * D * 2) || !tensor(ik, (ik_ring ? ik_ring : rows * ratio) * D * 4) ||
+        !tensor(pos3, rows * ratio * 16)) return 0;
     const char *w = weight(map, size, off, D * 4);
     if (!w) return 0;
     block_key<<<N, 32, 0, cuda_decode_stream()>>>((__half *)out->ptr, (const float *)ik->ptr,
-        (const uint32_t *)pos3->ptr, (const float *)w, b0, ratio, D, eps, rope(nrot, base));
+        (const uint32_t *)pos3->ptr, (const float *)w, b0, ratio, D, ik_ring, eps, rope(nrot, base));
     return launched();
 }
 
@@ -2083,6 +2101,1439 @@ extern "C" int ds4_gpu_qwen4_router_topk_tensor(ds4_gpu_tensor *sel, ds4_gpu_ten
     return launched();
 }
 
+/* SSD streaming for the per-token MoE kernels (Kolibri-1): the routed experts
+ * are not resident.  Each CUDA device keeps an arena of expert slots, one
+ * expert's gate, up and down weights per slot, filled from the host mapping
+ * on demand and reused least recently used first.  The kernels address an
+ * expert as base + id * expert bytes, so between _begin and _end the mid and
+ * down wrappers pass the arena as the base and slot numbers as the ids: the
+ * kernels themselves are the resident ones. */
+namespace qwen4_cuda {
+
+struct moe_stream_cache {
+    /* One arena; a slot is an expert's gate, up and down back to back, so a
+     * load or a save is one copy.  up and down point into the first slot. */
+    char *gate = NULL, *up = NULL, *down = NULL;
+    int *selected = NULL;                 /* slot of every (token, slot) in the open batch */
+    uint64_t selected_cap = 0;
+    uint64_t gate_bytes = 0, down_bytes = 0, slot_bytes = 0;   /* per expert */
+    uint32_t slots = 0, filled = 0;
+    std::vector<uint32_t> heat;           /* uses per slot; travels with the expert between tiers */    std::unordered_map<uint64_t, uint32_t> slot_of;   /* layer << 32 | expert */
+    std::vector<uint64_t> key, stamp;
+    bool provisional = false;             /* sized for the first forward only */
+    bool resized = false;
+    uint32_t last_layer = 0;
+    char *stage = NULL;                   /* page-locked ring of experts read from the file */
+    uint32_t stage_used = 0;
+    uint64_t uses = 0, misses = 0;        /* since the last DS4_CUDA_MOE_STREAM_STATS line */
+    uint64_t helped = 0, from_ram = 0;
+    double host_s = 0.0, device_s = 0.0;
+    /* Only used while this device helps another one (see g_moe_stream.helper):
+     * the inputs and outputs of its share of a batch, here and page-locked. */
+    float *hx = NULL, *hmid = NULL, *hpart = NULL, *host_x = NULL, *host_part = NULL;
+    uint64_t hx_cap = 0, hmid_cap = 0, hpart_cap = 0, host_x_cap = 0, host_part_cap = 0;
+    uint64_t hops = 0;
+    double hop_s[4] = {0.0, 0.0, 0.0, 0.0};   /* down launch, wait + read, write back, mid */
+};
+
+static const uint64_t moe_stream_no_key = UINT64_MAX;
+static const uint32_t moe_stream_stage_slots = 64;
+static std::unordered_map<int, moe_stream_cache> g_moe_stream_caches;   /* by CUDA device */
+static uint64_t g_moe_stream_clock;       /* one clock, so stamps compare across devices */
+static bool g_moe_stream_by_use;          /* the open batch replaces by use count */
+/* With DS4_CUDA_MOE_STREAM_HELPER set, a second CUDA device that runs none of
+ * the graph holds experts too and evaluates the ones it holds: the layer's
+ * input goes over, its expert outputs come back.  That costs two small
+ * copies per layer where a miss costs an expert upload. */
+static struct {
+    const moe_stream_cache *cache;        /* NULL outside _begin .. _end */
+    uint64_t gate_off, up_off, down_off;
+    moe_stream_cache *helper;             /* NULL when it has no share of this batch */
+    int device, helper_device;
+    std::vector<uint64_t> helper_pairs;
+    /* The CPU's share: pairs whose expert stays in the RAM tier, and where. */
+    std::vector<uint64_t> cpu_pairs;
+    std::vector<uint32_t> cpu_slots;
+    bool cpu_done;
+    unsigned mid_type, mid_K, mid_M;      /* of the open batch, for the CPU's gate and up */
+    float *host_x;                        /* the layer input, page-locked */
+    uint64_t host_x_cap;
+    /* Page-locked, so the selection comes back and the slot numbers go out as
+     * queued copies: one wait per layer instead of three blocking calls. */
+    int *host_ids, *host_helper_ids;
+    uint64_t host_ids_cap, host_helper_ids_cap;
+    const ds4_gpu_tensor *input;          /* announced for the next _begin, see _stream_input */
+    uint32_t input_width;
+    bool input_ready;                     /* host_x holds the open batch's input */
+    double wait_s;                        /* in _begin's wait, since the last stats line */
+    uint64_t waits;
+} g_moe_stream;
+
+typedef void (*moe_cpu_quantize_fn)(const float *x, void *xq, uint32_t n);
+typedef void (*moe_cpu_rows_fn)(uint32_t type, const void *rows, uint64_t row_bytes, uint32_t in_dim,
+                                uint32_t first_row, uint32_t end_row, const void *xq, float *out);
+/* With DS4_CUDA_MOE_STREAM_CPU set, once every device slot is taken an
+ * expert that no device holds is evaluated from the RAM tier by the CPU
+ * rather than swapped in: a swap moves two experts over the bus, which costs
+ * more than the arithmetic. */
+static struct {
+    moe_cpu_quantize_fn quantize;
+    moe_cpu_rows_fn rows;
+    uint32_t xq_block_bytes;
+    std::vector<char> xq, midq;
+    std::vector<float> gate, up, mid;
+    float *out;                           /* page-locked, cpu pair major */
+    uint64_t out_cap;
+    uint64_t pairs;                       /* since the last stats line */
+    double seconds;
+} g_moe_cpu;
+
+/* Runs job(0 .. count-1) on every hardware thread but a few, the caller's
+ * included, and returns when all are done. */
+struct moe_cpu_pool {
+    std::vector<std::thread> workers;
+    std::mutex lock;
+    std::condition_variable wake, idle;
+    const std::function<void(uint32_t)> *job = NULL;
+    std::atomic<uint32_t> next{0};
+    uint32_t count = 0, running = 0;
+    uint64_t round = 0;
+
+    void work() {
+        for (uint32_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) (*job)(i);
+    }
+    void loop() {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> held(lock);
+        for (;;) {
+            wake.wait(held, [&] { return round != seen; });
+            seen = round;
+            held.unlock();
+            work();
+            held.lock();
+            if (--running == 0) idle.notify_one();
+        }
+    }
+    void run(uint32_t n, const std::function<void(uint32_t)> &fn) {
+        if (workers.empty()) {
+            const unsigned hardware = std::thread::hardware_concurrency();
+            for (unsigned i = 0; i + 4 < (hardware ? hardware : 8u); i++) {
+                workers.emplace_back([this] { loop(); });
+                workers.back().detach();
+            }
+        }
+        {
+            std::lock_guard<std::mutex> held(lock);
+            job = &fn;
+            count = n;
+            next = 0;
+            running = (uint32_t)workers.size();
+            round++;
+        }
+        wake.notify_all();
+        work();
+        std::unique_lock<std::mutex> held(lock);
+        idle.wait(held, [&] { return running == 0; });
+    }
+};
+static moe_cpu_pool g_moe_cpu_pool;
+
+template<typename TValue>
+static bool moe_stream_grow(TValue *&p, uint64_t &cap, uint64_t bytes, bool host, const char *what) {
+    if (cap >= bytes) return true;
+    if (host) (void)cudaFreeHost(p);
+    else (void)cudaFree(p);
+    p = NULL;
+    cap = 0;
+    void *grown = NULL;
+    if (!cuda_ok(host ? cudaMallocHost(&grown, bytes) : cudaMalloc(&grown, bytes), what)) return false;
+    p = (TValue *)grown;
+    cap = bytes;
+    return true;
+}
+
+static bool moe_stream_wait(cudaStream_t stream, const char *what);
+
+/* DS4_CUDA_MOE_STREAM_PROBE: the time one empty round trip to the current
+ * device takes, the floor under every per-layer wait there. */
+static void moe_stream_probe(int device) {
+    void *word = NULL, *host = NULL;
+    if (cudaMalloc(&word, 64) == cudaSuccess && cudaMallocHost(&host, 64) == cudaSuccess) {
+        const unsigned rounds = 500;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (unsigned i = 0; i < rounds; i++) {
+            (void)cudaMemcpyAsync(host, word, 64, cudaMemcpyDeviceToHost, cuda_decode_stream());
+            (void)moe_stream_wait(cuda_decode_stream(), "MoE round trip probe");
+        }
+        fprintf(stderr, "ds4: CUDA device %d empty round trip: %.3f ms\n", device,
+                1000.0 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / rounds);
+    }
+    (void)cudaFree(word);
+    (void)cudaFreeHost(host);
+    (void)cudaGetLastError();
+}
+
+/* A blocking wait gives the thread up to the scheduler, which on Windows
+ * costs most of a millisecond however short the work; with
+ * DS4_CUDA_MOE_STREAM_SPIN the thread polls for a few milliseconds first. */
+static bool moe_stream_wait(cudaStream_t stream, const char *what) {
+    static const bool spin = getenv("DS4_CUDA_MOE_STREAM_SPIN") != NULL;
+    if (spin) {
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
+        while (cudaStreamQuery(stream) == cudaErrorNotReady && std::chrono::steady_clock::now() < give_up) {}
+        (void)cudaGetLastError();
+    }
+    return cuda_ok(cudaStreamSynchronize(stream), what);
+}
+
+/* DS4_CUDA_MOE_STREAM_RAM_MIB sizes a host arena for experts that no device
+ * holds; shared by all devices.  Without it they are read from the file
+ * mapping every time, which is the disk whenever the file does not fit the
+ * page cache.  The arena is private memory in chunks, page-locked as far as
+ * the driver allows: Windows refuses one large locked block, and whatever it
+ * will not lock is still RAM the file cache cannot drop. */
+struct moe_stream_ram {
+    std::vector<char *> chunks;
+    uint64_t slot_bytes = 0;
+    uint32_t slots = 0, chunk_slots = 0;
+    bool tried = false;
+    std::unordered_map<uint64_t, uint32_t> slot_of;
+    std::vector<uint64_t> key, stamp;
+    std::vector<uint32_t> uses;
+    /* A slot an expert was loaded from is free once that copy has run, which
+     * the next batch's wait for the device guarantees: released until then. */
+    std::vector<uint32_t> free_slots, released;
+    char *at(uint32_t slot) const { return chunks[slot / chunk_slots] + (uint64_t)(slot % chunk_slots) * slot_bytes; }
+};
+static moe_stream_ram g_moe_stream_ram;
+static uint64_t moe_stream_env_mib(const char *name, uint64_t fallback);
+
+static void moe_stream_ram_init(moe_stream_ram &ram, uint64_t slot_bytes) {
+    if (ram.tried) return;
+    ram.tried = true;
+    const uint64_t slots = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RAM_MIB", 0) / slot_bytes;
+    if (!slots || slots > UINT32_MAX) return;
+    ram.slot_bytes = slot_bytes;
+    ram.chunk_slots = (uint32_t)((256ull << 20) / slot_bytes) + 1u;
+    uint64_t locked = 0;
+    bool lock = true;
+    for (uint64_t have = 0; have < slots; have += ram.chunk_slots) {
+        const uint64_t bytes = (uint64_t)ram.chunk_slots * slot_bytes;
+        void *chunk = NULL;
+        /* Locking up to the driver's limit leaves its own transfers failing
+         * with out of memory, even after handing chunks back; stay well under. */
+        lock = lock && locked + bytes <= moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RAM_LOCK_MIB", 10240ull << 20);
+        if (lock && cudaMallocHost(&chunk, bytes) != cudaSuccess) {
+            /* The driver's limit is reached: hand two chunks back, or its own
+             * transfers find nothing left to lock and fail. */
+            (void)cudaGetLastError();
+            lock = false;
+            chunk = NULL;
+            for (size_t back = 0; back < 2 && back < ram.chunks.size(); back++) {
+                char *&locked_chunk = ram.chunks[ram.chunks.size() - 1 - back];
+                (void)cudaFreeHost(locked_chunk);
+                locked_chunk = (char *)malloc(bytes);
+                locked -= bytes;
+                if (!locked_chunk) {
+                    fprintf(stderr, "ds4: CUDA MoE expert RAM tier ran out of memory\n");
+                    exit(1);
+                }
+            }
+        }
+        if (chunk) locked += bytes;
+        else if (!(chunk = malloc(bytes))) break;
+        ram.chunks.push_back((char *)chunk);
+    }
+    ram.slots = (uint32_t)(ram.chunks.size() * ram.chunk_slots);
+    ram.key.assign(ram.slots, moe_stream_no_key);
+    ram.stamp.assign(ram.slots, 0);
+    ram.uses.assign(ram.slots, 0);
+    for (uint32_t i = ram.slots; i > 0; i--) ram.free_slots.push_back(i - 1u);
+    fprintf(stderr, "ds4: CUDA MoE expert RAM tier: %u experts, %.2f GiB, %.2f GiB of it page-locked\n",
+            ram.slots, (double)((uint64_t)ram.slots * slot_bytes) / 1073741824.0, (double)locked / 1073741824.0);
+}
+
+static uint64_t moe_stream_oldest(const moe_stream_cache &c) {
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < c.slots; i++)
+        if (c.stamp[i] < oldest) oldest = c.stamp[i];
+    return oldest;
+}
+
+static uint64_t moe_stream_env_mib(const char *name, uint64_t fallback) {
+    const char *env = getenv(name);
+    return env && env[0] ? strtoull(env, NULL, 10) << 20 : fallback;
+}
+
+static void moe_stream_cache_release(moe_stream_cache &c) {
+    (void)cudaFree(c.gate);
+    (void)cudaFreeHost(c.stage);
+    c.stage_used = 0;
+    (void)cudaFree(c.hx);
+    (void)cudaFree(c.hmid);
+    (void)cudaFree(c.hpart);
+    (void)cudaFreeHost(c.host_x);
+    (void)cudaFreeHost(c.host_part);
+    c.hx = c.hmid = c.hpart = c.host_x = c.host_part = NULL;
+    c.hx_cap = c.hmid_cap = c.hpart_cap = c.host_x_cap = c.host_part_cap = 0;
+    c.gate = c.up = c.down = c.stage = NULL;
+    c.slots = c.filled = 0;
+    c.slot_of.clear();
+}
+
+/* The arena takes the device memory that is free, less a reserve for cuBLAS
+ * and later allocations.  What is free is only known after one forward: a
+ * single device caches each weight, and the converted copies its dense
+ * kernels use, on first use.  So the first forward runs on a provisional
+ * arena of one layer's experts, and the arena is sized for real when the
+ * second one starts.  --ssd-streaming-cache-experts sets the slot count per
+ * device outright, DS4_CUDA_MOE_STREAM_CACHE_MIB the size and
+ * DS4_CUDA_MOE_STREAM_RESERVE_MIB the reserve. */
+static bool moe_stream_cache_init(moe_stream_cache &c, int device, uint64_t gate_bytes,
+                                  uint64_t down_bytes, uint32_t min_slots, uint32_t layer_experts) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_bytes, &total_bytes), "MoE expert cache memory query")) return false;
+    const uint64_t reserve = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RESERVE_MIB", 512ull << 20);
+    const uint64_t budget = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_CACHE_MIB",
+                                               free_bytes > reserve ? free_bytes - reserve : 0);
+    const uint64_t slot_bytes = 2 * gate_bytes + down_bytes;
+    c.provisional = !c.resized && !g_stream_expert_budget && budget / slot_bytes > layer_experts;
+    const uint64_t slots = g_stream_expert_budget ? g_stream_expert_budget :
+                           c.provisional ? layer_experts : budget / slot_bytes;
+    if (slots < min_slots || slots > UINT32_MAX) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache on device %d needs %u slots of %.2f MiB but %.2f GiB "
+                        "fits %llu; free device memory or lower the context\n",
+                device, min_slots, (double)slot_bytes / 1048576.0, (double)budget / 1073741824.0,
+                (unsigned long long)slots);
+        return false;
+    }
+    void *arena = NULL, *stage = NULL;
+    if (!cuda_ok(cudaMalloc(&arena, slots * slot_bytes), "MoE expert cache") ||
+        !cuda_ok(cudaMallocHost(&stage, moe_stream_stage_slots * slot_bytes), "MoE expert cache staging")) {
+        (void)cudaFree(arena);
+        return false;
+    }
+    c.gate = (char *)arena;
+    c.up = c.gate + gate_bytes;
+    c.down = c.gate + 2 * gate_bytes;
+    c.stage = (char *)stage;
+    c.gate_bytes = gate_bytes;
+    c.down_bytes = down_bytes;
+    c.slot_bytes = slot_bytes;
+    c.slots = (uint32_t)slots;
+    c.key.assign(slots, moe_stream_no_key);
+    c.stamp.assign(slots, 0);
+    c.heat.assign(slots, 0);
+    if (!c.provisional) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache on device %d: %u experts, %.2f GiB\n",
+                device, c.slots, (double)(slots * slot_bytes) / 1073741824.0);
+    }
+    return true;
+}
+
+/* The slot holding (layer, expert), loaded first when it is not cached.  The
+ * victim is the least recently used slot that the open batch has not touched. */
+static int moe_stream_slot(moe_stream_cache &c, const ds4_gpu_stream_expert_table *t, uint32_t expert) {
+    const uint64_t key = (uint64_t)t->layer << 32 | expert;
+    int slot = -1;
+    const auto found = c.slot_of.find(key);
+    if (found != c.slot_of.end()) {
+        slot = (int)found->second;
+    } else {
+        /* With the CPU path the device keeps what is used most, so the
+         * least used goes; otherwise the least recently used. */
+        uint64_t oldest = g_moe_stream_clock;
+        uint32_t coldest = UINT32_MAX;
+        for (uint32_t i = 0; i < c.slots; i++) {
+            const bool free_now = c.stamp[i] < g_moe_stream_clock;
+            if (free_now && (g_moe_stream_by_use ? c.heat[i] < coldest : c.stamp[i] < oldest)) {
+                oldest = c.stamp[i];
+                coldest = c.heat[i];
+                slot = (int)i;
+            }
+        }
+        if (slot >= 0) {
+            /* An expert is in exactly one place: a device slot, a slot of the
+             * RAM tier, or only the file.  The one this load pushes out of the
+             * device goes to RAM, so nothing used recently has to come from
+             * the disk again.  Every copy is queued on the stream the kernels
+             * run on and nothing waits here: the save runs before the load
+             * that overwrites it, the load before the kernel that reads it. */
+            moe_stream_ram &ram = g_moe_stream_ram;
+            moe_stream_ram_init(ram, c.slot_bytes);
+            const cudaStream_t stream = cuda_decode_stream();
+            char *at = c.gate + (uint64_t)slot * c.slot_bytes;
+            const uint64_t victim = c.key[slot];
+            c.filled += victim == moe_stream_no_key;
+            const auto in_ram = ram.slot_of.find(key);
+            const bool ram_hit = in_ram != ram.slot_of.end();
+            const uint32_t source_slot = ram_hit ? in_ram->second : UINT32_MAX;
+            bool ok = true;
+            if (victim != moe_stream_no_key && ram.slots) {
+                int keep = -1;
+                if (!ram.free_slots.empty()) {
+                    keep = (int)ram.free_slots.back();
+                    ram.free_slots.pop_back();
+                } else {
+                    uint64_t oldest = UINT64_MAX;
+                    for (uint32_t i = 0; i < ram.slots; i++) {
+                        if (ram.key[i] != moe_stream_no_key && i != source_slot && ram.stamp[i] < oldest) {
+                            oldest = ram.stamp[i];
+                            keep = (int)i;
+                        }
+                    }
+                    if (keep >= 0) ram.slot_of.erase(ram.key[keep]);
+                }
+                if (keep >= 0) {
+                    ok = cuda_ok(cudaMemcpyAsync(ram.at((uint32_t)keep), at, c.slot_bytes, cudaMemcpyDeviceToHost,
+                                                 stream), "MoE expert cache save");
+                    ram.key[keep] = victim;
+                    ram.uses[keep] = c.heat[slot];
+                    ram.stamp[keep] = g_moe_stream_clock;
+                    ram.slot_of[victim] = (uint32_t)keep;
+                }
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            const char *source = NULL;
+            c.heat[slot] = ram_hit ? ram.uses[source_slot] : 0;
+            if (ram_hit) {
+                source = ram.at(source_slot);
+                ram.slot_of.erase(key);
+                ram.key[source_slot] = moe_stream_no_key;
+                ram.released.push_back(source_slot);
+            } else {
+                if (c.stage_used == moe_stream_stage_slots) {
+                    ok = ok && cuda_ok(cudaStreamSynchronize(stream), "MoE expert cache staging wait");
+                    c.stage_used = 0;
+                }
+                char *staged = c.stage + (uint64_t)c.stage_used++ * c.slot_bytes;
+                const char *map = (const char *)t->model_map;
+                memcpy(staged, map + t->gate_offset + (uint64_t)expert * c.gate_bytes, c.gate_bytes);
+                memcpy(staged + c.gate_bytes, map + t->up_offset + (uint64_t)expert * c.gate_bytes, c.gate_bytes);
+                memcpy(staged + 2 * c.gate_bytes, map + t->down_offset + (uint64_t)expert * c.down_bytes,
+                       c.down_bytes);
+                source = staged;
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            ok = ok && cuda_ok(cudaMemcpyAsync(at, source, c.slot_bytes, cudaMemcpyHostToDevice, stream),
+                               "MoE expert cache load");
+            c.misses++;
+            c.from_ram += ram_hit;
+            c.host_s += std::chrono::duration<double>(t1 - t0).count();
+            c.device_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+            if (c.key[slot] != moe_stream_no_key) c.slot_of.erase(c.key[slot]);
+            c.key[slot] = ok ? key : moe_stream_no_key;
+            if (ok) c.slot_of[key] = (uint32_t)slot;
+            else slot = -1;
+        }
+    }
+    if (slot >= 0) {
+        c.stamp[slot] = g_moe_stream_clock;
+        c.heat[slot]++;
+    }
+    return slot;
+}
+
+/* The fewest uses of any expert the device could give up in this batch. */
+static uint32_t moe_stream_coldest(const moe_stream_cache &c) {
+    uint32_t coldest = UINT32_MAX;
+    for (uint32_t i = 0; i < c.slots; i++)
+        if (c.stamp[i] < g_moe_stream_clock && c.heat[i] < coldest) coldest = c.heat[i];
+    return coldest;
+}
+
+/* The RAM tier slot holding (layer, expert) for the CPU, read from the file
+ * first when it is not there; -1 when every slot is in use by this batch. */
+static int moe_stream_ram_hold(moe_stream_ram &ram, const moe_stream_cache &c,
+                               const ds4_gpu_stream_expert_table *t, uint32_t expert) {
+    const uint64_t key = (uint64_t)t->layer << 32 | expert;
+    int slot = -1;
+    if (const auto found = ram.slot_of.find(key); found != ram.slot_of.end()) {
+        slot = (int)found->second;
+    } else {
+        if (!ram.free_slots.empty()) {
+            slot = (int)ram.free_slots.back();
+            ram.free_slots.pop_back();
+        } else {
+            uint64_t oldest = g_moe_stream_clock;
+            for (uint32_t i = 0; i < ram.slots; i++) {
+                if (ram.key[i] != moe_stream_no_key && ram.stamp[i] < oldest) {
+                    oldest = ram.stamp[i];
+                    slot = (int)i;
+                }
+            }
+            if (slot >= 0) ram.slot_of.erase(ram.key[slot]);
+        }
+        if (slot >= 0) {
+            char *at = ram.at((uint32_t)slot);
+            const char *map = (const char *)t->model_map;
+            memcpy(at, map + t->gate_offset + (uint64_t)expert * c.gate_bytes, c.gate_bytes);
+            memcpy(at + c.gate_bytes, map + t->up_offset + (uint64_t)expert * c.gate_bytes, c.gate_bytes);
+            memcpy(at + 2 * c.gate_bytes, map + t->down_offset + (uint64_t)expert * c.down_bytes, c.down_bytes);
+            ram.key[slot] = key;
+            ram.uses[slot] = 0;
+            ram.slot_of[key] = (uint32_t)slot;
+        }
+    }
+    if (slot >= 0) {
+        ram.stamp[slot] = g_moe_stream_clock;
+        ram.uses[slot]++;
+    }
+    return slot;
+}
+
+static uint32_t moe_cpu_block_bytes(unsigned type) {
+    return type == 10 ? 84u : type == 12 ? 144u : type == 16 ? 66u : 0u;
+}
+
+/* The CPU's share of the open batch, into g_moe_cpu.out: gate and up of each
+ * expert against its token's input, SiLU, then down.  No CUDA calls, so it
+ * runs while the devices work on theirs. */
+static bool moe_stream_cpu_compute(const moe_stream_cache &c, unsigned down_type, unsigned NS, unsigned M) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t n = (uint32_t)g_moe_stream.cpu_pairs.size();
+    const unsigned gate_type = g_moe_stream.mid_type, K = g_moe_stream.mid_K, F = g_moe_stream.mid_M;
+    const uint64_t gate_row = c.gate_bytes / F, down_row = c.down_bytes / M;
+    const uint32_t gate_block = moe_cpu_block_bytes(gate_type), down_block = moe_cpu_block_bytes(down_type);
+    const uint32_t down_in = down_block ? (uint32_t)(down_row / down_block) * 256u : 0u;
+    if (!gate_block || !down_block || K % 256u || gate_row != (uint64_t)K / 256u * gate_block || down_in < F) {
+        fprintf(stderr, "ds4: CUDA MoE CPU path cannot evaluate expert types %u/%u of %u/%u inputs\n",
+                gate_type, down_type, K, F);
+        return false;
+    }
+    const uint64_t xq_bytes = (uint64_t)K / 256u * g_moe_cpu.xq_block_bytes;
+    const uint64_t midq_bytes = (uint64_t)down_in / 256u * g_moe_cpu.xq_block_bytes;
+    const moe_stream_ram &ram = g_moe_stream_ram;
+    g_moe_cpu.xq.resize(n * xq_bytes);
+    g_moe_cpu.midq.resize(n * midq_bytes);
+    g_moe_cpu.gate.resize((uint64_t)n * F);
+    g_moe_cpu.up.resize((uint64_t)n * F);
+    g_moe_cpu.mid.assign((uint64_t)n * down_in, 0.0f);
+    if (!moe_stream_grow(g_moe_cpu.out, g_moe_cpu.out_cap, (uint64_t)n * M * 4, true, "MoE CPU output")) return false;
+    const uint32_t gate_chunks = (F + 63u) / 64u, down_chunks = (M + 127u) / 128u;
+    g_moe_cpu_pool.run(n, [&](uint32_t i) {
+        g_moe_cpu.quantize(g_moe_stream.host_x + g_moe_stream.cpu_pairs[i] / NS * K, &g_moe_cpu.xq[i * xq_bytes], K);
+    });
+    g_moe_cpu_pool.run(n * gate_chunks, [&](uint32_t job) {
+        const uint32_t i = job / gate_chunks, first = job % gate_chunks * 64u, end = first + 64u < F ? first + 64u : F;
+        const char *expert = ram.at(g_moe_stream.cpu_slots[i]);
+        float *gate = &g_moe_cpu.gate[(uint64_t)i * F], *up = &g_moe_cpu.up[(uint64_t)i * F];
+        g_moe_cpu.rows(gate_type, expert, gate_row, K, first, end, &g_moe_cpu.xq[i * xq_bytes], gate);
+        g_moe_cpu.rows(gate_type, expert + c.gate_bytes, gate_row, K, first, end, &g_moe_cpu.xq[i * xq_bytes], up);
+        for (uint32_t r = first; r < end; r++)
+            g_moe_cpu.mid[(uint64_t)i * down_in + r] = gate[r] / (1.0f + expf(-gate[r])) * up[r];
+    });
+    g_moe_cpu_pool.run(n, [&](uint32_t i) {
+        g_moe_cpu.quantize(&g_moe_cpu.mid[(uint64_t)i * down_in], &g_moe_cpu.midq[i * midq_bytes], down_in);
+    });
+    g_moe_cpu_pool.run(n * down_chunks, [&](uint32_t job) {
+        const uint32_t i = job / down_chunks, first = job % down_chunks * 128u, end = first + 128u < M ? first + 128u : M;
+        g_moe_cpu.rows(down_type, ram.at(g_moe_stream.cpu_slots[i]) + 2 * c.gate_bytes, down_row, down_in, first, end,
+                       &g_moe_cpu.midq[i * midq_bytes], g_moe_cpu.out + (uint64_t)i * M);
+    });
+    g_moe_stream.cpu_done = true;
+    g_moe_cpu.pairs += n;
+    g_moe_cpu.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
+
+/* The CPU's rows into the primary's part, behind its own down kernel. */
+static bool moe_stream_cpu_write(float *part, unsigned stride, unsigned NS, unsigned M) {
+    bool ok = true;
+    for (size_t i = 0; i < g_moe_stream.cpu_pairs.size() && ok; i++) {
+        const uint64_t pair = g_moe_stream.cpu_pairs[i], t = pair / NS, slot = pair % NS;
+        ok = cuda_ok(cudaMemcpyAsync(part + (t * stride + slot) * M, g_moe_cpu.out + (uint64_t)i * M, (uint64_t)M * 4,
+                                     cudaMemcpyHostToDevice, cuda_decode_stream()), "MoE CPU output write");
+    }
+    return ok;
+}
+
+/* The helper's gate and up over its share, started once the primary's own
+ * kernel is queued; x_host is the layer input read back from the primary. */
+static bool moe_stream_helper_mid(const float *x_host, unsigned type, unsigned T, unsigned NS,
+                                  unsigned K, unsigned M) {
+    moe_stream_cache &h = *g_moe_stream.helper;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!cuda_ok(cudaSetDevice(g_moe_stream.helper_device), "MoE helper device")) return false;
+    bool ok = moe_stream_grow(h.hx, h.hx_cap, (uint64_t)T * K * 4, false, "MoE helper input") &&
+        moe_stream_grow(h.hmid, h.hmid_cap, (uint64_t)T * NS * M * 4, false, "MoE helper mid") &&
+        cuda_ok(cudaMemcpyAsync(h.hx, x_host, (uint64_t)T * K * 4, cudaMemcpyHostToDevice, 0),
+                "MoE helper input copy") &&
+        moe_mv_dispatch(h.hmid, h.hx, h.selected, h.gate, h.up, NULL, NULL, type, UINT_MAX, h.slots,
+                        T, NS, K, M, false, h.slot_bytes);
+    ok = cuda_ok(cudaSetDevice(g_moe_stream.device), "MoE primary device") && ok;
+    h.hop_s[3] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
+}
+
+/* The helper's down projection, then its rows into the primary's part, queued
+ * behind the primary's own down kernel, which wrote zeros there. */
+static bool moe_stream_helper_down(float *part, unsigned stride, unsigned type, unsigned T, unsigned NS,
+                                   unsigned K, unsigned M) {
+    moe_stream_cache &h = *g_moe_stream.helper;
+    const uint64_t bytes = (uint64_t)T * NS * M * 4;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!cuda_ok(cudaSetDevice(g_moe_stream.helper_device), "MoE helper device")) return false;
+    bool ok = moe_stream_grow(h.hpart, h.hpart_cap, bytes, false, "MoE helper output") &&
+        moe_stream_grow(h.host_part, h.host_part_cap, bytes, true, "MoE helper output staging") &&
+        moe_mv_dispatch(h.hpart, h.hmid, h.selected, h.down, NULL, NULL, NULL, type, UINT_MAX, h.slots,
+                        T, NS, K, M, true, h.slot_bytes);
+    if (ok && !g_moe_stream.cpu_pairs.empty()) ok = moe_stream_cpu_compute(*g_moe_stream.cache, type, NS, M);
+    const auto t1 = std::chrono::steady_clock::now();
+    ok = ok && cuda_ok(cudaMemcpyAsync(h.host_part, h.hpart, bytes, cudaMemcpyDeviceToHost, 0),
+                       "MoE helper output read") &&
+        moe_stream_wait(0, "MoE helper wait");
+    const auto t2 = std::chrono::steady_clock::now();
+    ok = cuda_ok(cudaSetDevice(g_moe_stream.device), "MoE primary device") && ok;
+    for (size_t i = 0; i < g_moe_stream.helper_pairs.size() && ok; i++) {
+        const uint64_t pair = g_moe_stream.helper_pairs[i], t = pair / NS, slot = pair % NS;
+        ok = cuda_ok(cudaMemcpyAsync(part + (t * stride + slot) * M, h.host_part + pair * M, (uint64_t)M * 4,
+                                     cudaMemcpyHostToDevice, cuda_decode_stream()), "MoE helper output write");
+    }
+    h.hop_s[0] += std::chrono::duration<double>(t1 - t0).count();
+    h.hop_s[1] += std::chrono::duration<double>(t2 - t1).count();
+    h.hop_s[2] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t2).count();
+    h.hops++;
+    return ok;
+}
+
+}
+
+namespace qwen4_cuda {
+/* One whole layer's experts for a large batch, as the file lays them out:
+ * all gates, all ups, all downs (see ds4_gpu_qwen4_moe_stream_layer). */
+/* What a device keeps for whole-layer batches: the layer buffer and, for the
+ * caller that has no list tensors of its own, the grouped kernels' scratch. */
+struct moe_layer_device {
+    char *buffer = NULL;
+    uint64_t cap = 0;
+    bool unavailable = false;
+    int *lists = NULL, *counts = NULL, *none = NULL;
+    unsigned *tiles = NULL;
+    uint64_t lists_cap = 0, counts_cap = 0, none_cap = 0, tiles_cap = 0;
+};
+static std::unordered_map<int, moe_layer_device> g_moe_layer_devices;
+static struct {
+    char *buffer;                         /* the current device's, while a layer is open */
+    uint64_t gate_off, up_off, down_off, gate_bytes;
+    bool active, seen, complete;
+    /* A pass leaves the experts its rows used most where single tokens find
+     * them: the top of each layer in the device cache, copied on the device,
+     * the next in the RAM tier, copied as the layer's bytes go by.  Which
+     * those are is only known from an earlier pass, hence the counters. */
+    uint32_t last_layer, layers, forwards;
+    uint64_t expert_gate, expert_down;
+    /* Where moe_layer_read drops each expert of the layer it is reading as
+     * the bytes go by, -1 for nowhere: a RAM tier slot, or a slot of the
+     * device cache that keeps a fixed share of the ranking. */
+    std::vector<int> ram_slot, fixed_slot;
+    moe_stream_cache *fixed_cache;
+    std::vector<bool> ram_done, fixed_done;   /* per layer: its experts were handed out */
+} g_moe_layer;
+static std::unordered_map<uint64_t, uint32_t> g_moe_layer_heat;   /* rows that used (layer << 32 | expert) */
+
+#ifdef _WIN32
+/* Faulting the mapping in page by page reads at a fraction of what the
+ * drive does; these go to the device through page-locked buffers filled by
+ * large unbuffered reads, each read overlapping the previous buffer's copy. */
+struct moe_layer_stage {
+    char *stage[4];
+    cudaEvent_t copied[4];
+    unsigned next;
+    bool usable;
+};
+/* The buffers and their events belong to one device each: an event cannot be
+ * recorded on another device's stream, and a buffer must not be refilled
+ * while a copy from it to some other device is still queued. */
+static struct {
+    HANDLE file;
+    bool tried;
+    std::unordered_map<int, moe_layer_stage> by_device;
+} g_moe_layer_reader;
+static const uint64_t moe_layer_stage_bytes = 32ull << 20, moe_layer_sector = 4096;
+
+static moe_layer_stage *moe_layer_stage_here(void) {
+    int device = -1;
+    moe_layer_stage *here = NULL;
+    if (cudaGetDevice(&device) == cudaSuccess) {
+        const bool made = g_moe_layer_reader.by_device.count(device) != 0;
+        moe_layer_stage &s = g_moe_layer_reader.by_device[device];
+        if (!made) {
+            s.usable = true;
+            for (unsigned i = 0; i < 4 && s.usable; i++)
+                s.usable = cudaMallocHost((void **)&s.stage[i], moe_layer_stage_bytes + moe_layer_sector) ==
+                               cudaSuccess &&
+                           cudaEventCreateWithFlags(&s.copied[i], cudaEventDisableTiming) == cudaSuccess;
+            (void)cudaGetLastError();
+        }
+        if (s.usable) here = &s;
+    }
+    return here;
+}
+
+static bool moe_layer_reader_open(void) {
+    if (!g_moe_layer_reader.tried) {
+        g_moe_layer_reader.tried = true;
+        g_moe_layer_reader.file = INVALID_HANDLE_VALUE;
+        if (g_model_fd >= 0)
+            g_moe_layer_reader.file = ReOpenFile((HANDLE)_get_osfhandle(g_model_fd), GENERIC_READ,
+                                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                 FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
+        (void)cudaGetLastError();
+    }
+    return g_moe_layer_reader.file != INVALID_HANDLE_VALUE && moe_layer_stage_here() != NULL;
+}
+
+/* Reads experts first_expert.. of one tensor, bytes in all, from file_off. */
+static bool moe_layer_read(char *device, uint64_t file_off, uint64_t bytes, cudaStream_t stream,
+                           uint64_t expert_bytes, uint64_t slot_part, uint32_t first_expert = 0) {
+    moe_layer_stage *here = moe_layer_stage_here();
+    bool ok = here != NULL;
+    for (uint64_t done = 0; done < bytes && ok;) {
+        const unsigned b = here->next++ % 4u;
+        const uint64_t at = file_off + done, start = at & ~(moe_layer_sector - 1);
+        const uint64_t want = bytes - done < moe_layer_stage_bytes ? bytes - done : moe_layer_stage_bytes;
+        const uint64_t span = (at - start + want + moe_layer_sector - 1) & ~(moe_layer_sector - 1);
+        OVERLAPPED where = {};
+        where.Offset = (DWORD)start;
+        where.OffsetHigh = (DWORD)(start >> 32);
+        DWORD got = 0;
+        /* The buffer's last copy must have run before it is filled again. */
+        const char *data = here->stage[b] + (at - start);
+        ok = cuda_ok(cudaEventSynchronize(here->copied[b]), "MoE layer staging wait") &&
+             (ReadFile(g_moe_layer_reader.file, here->stage[b], (DWORD)span, &got, &where) ||
+              GetLastError() == ERROR_HANDLE_EOF) && got >= at - start + want &&
+             (!device || cuda_ok(cudaMemcpyAsync(device + done, data, want, cudaMemcpyHostToDevice, stream),
+                                 "MoE layer load"));
+        for (uint64_t local = done / expert_bytes;
+             ok && first_expert + local < g_moe_layer.ram_slot.size() && local * expert_bytes < done + want; local++) {
+            const uint64_t e = first_expert + local;
+            const uint64_t first = local * expert_bytes > done ? local * expert_bytes : done;
+            const uint64_t end = (local + 1) * expert_bytes < done + want ? (local + 1) * expert_bytes : done + want;
+            const uint64_t in_slot = slot_part + (first - local * expert_bytes);
+            if (const int ram_slot = g_moe_layer.ram_slot[e]; ram_slot >= 0)
+                memcpy(g_moe_stream_ram.at((uint32_t)ram_slot) + in_slot, data + (first - done), end - first);
+            if (const int fixed_slot = g_moe_layer.fixed_slot[e]; fixed_slot >= 0) {
+                const moe_stream_cache &c = *g_moe_layer.fixed_cache;
+                ok = cuda_ok(cudaMemcpyAsync(c.gate + (uint64_t)fixed_slot * c.slot_bytes + in_slot, data + (first - done),
+                                             end - first, cudaMemcpyHostToDevice, stream), "MoE fixed expert load");
+            }
+        }
+        ok = ok && cuda_ok(cudaEventRecord(here->copied[b], stream), "MoE layer staging mark");
+        done += want;
+    }
+    return ok;
+}
+#endif
+
+/* The use counts outlive the process in <model>.expert-uses, written at exit.
+ * A device that is slow to load, an external one above all, is given the
+ * most used experts of that ranking once and then left alone. */
+static std::string g_moe_stats_file;
+static bool g_moe_stats_loaded;
+static const char moe_stats_magic[8] = {'D', 'S', '4', 'X', 'U', 'S', 'E', '1'};
+
+static void moe_stats_save(void) {
+    const std::string scratch = g_moe_stats_file + ".tmp";
+    FILE *out = g_moe_layer_heat.empty() ? NULL : fopen(scratch.c_str(), "wb");
+    if (out) {
+        const uint32_t header[2] = {g_moe_layer.layers, (uint32_t)g_moe_layer_heat.size()};
+        bool ok = fwrite(moe_stats_magic, 8, 1, out) == 1 && fwrite(header, sizeof(header), 1, out) == 1;
+        for (const auto &entry : g_moe_layer_heat)
+            ok = ok && fwrite(&entry.first, 8, 1, out) == 1 && fwrite(&entry.second, 4, 1, out) == 1;
+        ok = fclose(out) == 0 && ok;
+        if (ok) {
+            (void)remove(g_moe_stats_file.c_str());
+            ok = rename(scratch.c_str(), g_moe_stats_file.c_str()) == 0;
+        }
+        if (!ok) fprintf(stderr, "ds4: could not write expert use counts to %s\n", g_moe_stats_file.c_str());
+    }
+}
+
+static void moe_stats_load(void) {
+    if (FILE *in = fopen(g_moe_stats_file.c_str(), "rb"); in != NULL) {
+        char magic[8];
+        uint32_t header[2] = {0, 0};
+        bool ok = fread(magic, 8, 1, in) == 1 && !memcmp(magic, moe_stats_magic, 8) &&
+                  fread(header, sizeof(header), 1, in) == 1 && header[0] > 0;
+        std::unordered_map<uint64_t, uint32_t> counts;
+        for (uint32_t i = 0; ok && i < header[1]; i++) {
+            uint64_t key = 0;
+            uint32_t uses = 0;
+            ok = fread(&key, 8, 1, in) == 1 && fread(&uses, 4, 1, in) == 1;
+            counts[key] = uses;
+        }
+        fclose(in);
+        if (ok) {
+            g_moe_layer_heat = std::move(counts);
+            g_moe_layer.layers = header[0];
+            g_moe_layer.complete = true;
+            g_moe_stats_loaded = !g_moe_layer_heat.empty();
+            fprintf(stderr, "ds4: expert use counts for %u experts read from %s\n", header[1],
+                    g_moe_stats_file.c_str());
+        } else {
+            fprintf(stderr, "ds4: %s is not a complete expert use count file; ignored\n", g_moe_stats_file.c_str());
+        }
+    }
+}
+
+/* The layer's experts by rows that used them so far, most used first. */
+static std::vector<std::pair<uint32_t, uint32_t>> moe_layer_ranked(uint32_t layer, uint32_t experts) {
+    std::vector<std::pair<uint32_t, uint32_t>> ranked;
+    for (uint32_t e = 0; e < experts; e++)
+        if (const auto heat = g_moe_layer_heat.find((uint64_t)layer << 32 | e); heat != g_moe_layer_heat.end())
+            ranked.emplace_back(heat->second, e);
+    std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    return ranked;
+}
+
+static bool moe_layer_held(uint64_t key) {
+    bool held = g_moe_stream_ram.slot_of.count(key) != 0;
+    for (const auto &entry : g_moe_stream_caches) held = held || entry.second.slot_of.count(key) != 0;
+    return held;
+}
+
+/* Every pass over the layers reports here.  The layer count is only trusted,
+ * and shares only derived from it, once a pass has wrapped round or the count
+ * came with the stored ranking. */
+static void moe_layer_visit(uint32_t layer) {
+    const bool wrapped = g_moe_layer.seen && layer <= g_moe_layer.last_layer;
+    g_moe_layer.forwards += wrapped;
+    g_moe_layer.complete = g_moe_layer.complete || wrapped;
+    g_moe_layer.seen = true;
+    g_moe_layer.last_layer = layer;
+    if (layer >= g_moe_layer.layers) g_moe_layer.layers = layer + 1;
+}
+
+static bool moe_layer_pending(uint32_t layer, const moe_stream_cache &c) {
+    const bool ram = g_moe_stream_ram.slots && (g_moe_layer.ram_done.size() <= layer || !g_moe_layer.ram_done[layer]);
+    const bool fixed = g_moe_stats_loaded && c.slots && !c.provisional &&
+                       (g_moe_layer.fixed_done.size() <= layer || !g_moe_layer.fixed_done[layer]);
+    return g_moe_layer.complete && (ram || fixed);
+}
+
+/* Gives each expert of a layer its home, once per layer, for moe_layer_read
+ * to fill from one sequential read: with a stored ranking the top of it goes
+ * to the device cache c, to stay; the rest goes to the RAM tier as far as its
+ * share reaches, so that later nothing comes from the disk.  c only takes
+ * part once it is sized.  Returns whether anything was given a slot. */
+static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cache *c) {
+    moe_stream_ram &ram = g_moe_stream_ram;
+    const uint32_t layer = t->layer, layers = g_moe_layer.complete ? g_moe_layer.layers : 0;
+    g_moe_layer.ram_slot.assign(t->n_total_expert, -1);
+    g_moe_layer.fixed_slot.assign(t->n_total_expert, -1);
+    g_moe_layer.fixed_cache = c;
+    if (g_moe_layer.ram_done.size() <= layer) {
+        g_moe_layer.ram_done.resize(layer + 1, false);
+        g_moe_layer.fixed_done.resize(layer + 1, false);
+    }
+    const bool sized = c && c->slots && !c->provisional;
+    const bool want_fixed = sized && g_moe_stats_loaded && layers && !g_moe_layer.fixed_done[layer];
+    const bool want_ram = ram.slots && layers && !g_moe_layer.ram_done[layer];
+    /* The ranking's top positions are the device's even before it can take
+     * them, so they are not put in RAM in the meantime. */
+    const uint32_t fixed_share = g_moe_stats_loaded && layers ? (sized ? c->slots : 0) / layers : 0;
+    uint32_t ram_left = want_ram ? ram.slots / layers : 0, next_free = 0;
+    bool any = false;
+    std::vector<std::pair<uint32_t, uint32_t>> order = moe_layer_ranked(layer, t->n_total_expert);
+    std::vector<bool> ranked(t->n_total_expert, false);
+    for (const auto &entry : order) ranked[entry.second] = true;
+    for (uint32_t e = 0; e < t->n_total_expert; e++)
+        if (!ranked[e]) order.emplace_back(0u, e);
+    for (size_t position = 0; position < order.size() && (want_fixed || want_ram); position++) {
+        const uint32_t expert = order[position].second;
+        const uint64_t key = (uint64_t)layer << 32 | expert;
+        const auto in_ram = ram.slot_of.find(key);
+        if (want_fixed && position < fixed_share && in_ram != ram.slot_of.end()) {
+            /* It went to RAM while this device was not sized yet: move it. */
+            while (next_free < c->slots && c->key[next_free] != moe_stream_no_key) next_free++;
+            if (next_free < c->slots &&
+                cuda_ok(cudaMemcpyAsync(c->gate + (uint64_t)next_free * c->slot_bytes, ram.at(in_ram->second),
+                                        c->slot_bytes, cudaMemcpyHostToDevice, cuda_decode_stream()),
+                        "MoE fixed expert move")) {
+                c->key[next_free] = key;
+                c->slot_of[key] = next_free;
+                c->heat[next_free] = order[position].first;
+                c->stamp[next_free] = 0;
+                c->filled++;
+                ram.key[in_ram->second] = moe_stream_no_key;
+                ram.released.push_back(in_ram->second);
+                ram.slot_of.erase(in_ram);
+            }
+        } else if (!moe_layer_held(key)) {
+            if (position < fixed_share) {
+                while (want_fixed && next_free < c->slots && c->key[next_free] != moe_stream_no_key) next_free++;
+                if (want_fixed && next_free < c->slots) {
+                    c->key[next_free] = key;
+                    c->slot_of[key] = next_free;
+                    c->heat[next_free] = order[position].first;
+                    c->stamp[next_free] = 0;
+                    c->filled++;
+                    g_moe_layer.fixed_slot[expert] = (int)next_free;
+                    any = true;
+                }
+            } else if (ram_left && !ram.free_slots.empty()) {
+                const uint32_t slot = ram.free_slots.back();
+                ram.free_slots.pop_back();
+                ram.key[slot] = key;
+                ram.slot_of[key] = slot;
+                ram.uses[slot] = order[position].first;
+                ram.stamp[slot] = 0;
+                g_moe_layer.ram_slot[expert] = (int)slot;
+                ram_left--;
+                any = true;
+            }
+        }
+    }
+    g_moe_layer.fixed_done[layer] = g_moe_layer.fixed_done[layer] || want_fixed;
+    g_moe_layer.ram_done[layer] = g_moe_layer.ram_done[layer] || want_ram;
+    return any;
+}
+
+static const char *moe_layer_weight(uint64_t off) {
+    const char *at = NULL;
+    if (g_moe_layer.active) {
+        if (off == g_moe_layer.gate_off) at = g_moe_layer.buffer;
+        else if (off == g_moe_layer.up_off) at = g_moe_layer.buffer + g_moe_layer.gate_bytes;
+        else if (off == g_moe_layer.down_off) at = g_moe_layer.buffer + 2 * g_moe_layer.gate_bytes;
+    }
+    return at;
+}
+}
+
+extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table *t) {
+    using namespace qwen4_cuda;
+    int resident = 0, device = -1;
+    g_moe_layer.buffer = NULL;
+    /* DS4_CUDA_MOE_STREAM_NO_LAYER=1 keeps the per-token expert path for A/B. */
+    static const bool off = getenv("DS4_CUDA_MOE_STREAM_NO_LAYER") != NULL;
+    if (!off && g_ssd_streaming_mode && t && t->model_map && cudaGetDevice(&device) == cudaSuccess &&
+        !g_moe_layer_devices[device].unavailable) {
+        moe_layer_device &here = g_moe_layer_devices[device];
+        const uint64_t gate = (uint64_t)t->n_total_expert * t->gate_expert_bytes;
+        const uint64_t down = (uint64_t)t->n_total_expert * t->down_expert_bytes;
+        if (here.cap < 2 * gate + down) {
+            (void)cudaFree(here.buffer);
+            here.buffer = NULL;
+            here.cap = 0;
+            void *grown = NULL;
+            if (cudaMalloc(&grown, 2 * gate + down) == cudaSuccess) {
+                here.buffer = (char *)grown;
+                here.cap = 2 * gate + down;
+                fprintf(stderr, "ds4: CUDA device %d takes large batches a whole layer of experts at a time "
+                                "(%.2f GiB buffer)\n", device, (double)here.cap / 1073741824.0);
+            } else {
+                (void)cudaGetLastError();
+                here.unavailable = true;
+                fprintf(stderr, "ds4: no memory on device %d for a whole layer of experts (%.2f GiB); large "
+                                "batches keep the per-token expert path\n", device,
+                        (double)(2 * gate + down) / 1073741824.0);
+            }
+        }
+        g_moe_layer.buffer = here.buffer;
+        if (g_moe_layer.buffer) {
+            const char *map = (const char *)t->model_map;
+            const cudaStream_t stream = cuda_decode_stream();
+            bool ok = false;
+            moe_layer_visit(t->layer);
+            g_moe_layer.expert_gate = t->gate_expert_bytes;
+            g_moe_layer.expert_down = t->down_expert_bytes;
+            g_moe_layer.ram_slot.clear();
+            g_moe_layer.fixed_slot.clear();
+#ifdef _WIN32
+            if (moe_layer_reader_open()) {
+                int device = 0;
+                (void)cudaGetDevice(&device);
+                moe_stream_ram_init(g_moe_stream_ram, 2 * t->gate_expert_bytes + t->down_expert_bytes);
+                moe_stream_cache &c = g_moe_stream_caches[device];
+                (void)moe_layer_plan(t, &c);
+                /* An expert this device's cache holds is copied from there, on
+                 * the device; one in the RAM tier comes from RAM; only runs of
+                 * the others are read from the file. */
+                const moe_stream_ram &ram = g_moe_stream_ram;
+                std::vector<int> cached(t->n_total_expert, -1), in_ram(t->n_total_expert, -1);
+                for (uint32_t e = 0; e < t->n_total_expert; e++) {
+                    const uint64_t key = (uint64_t)t->layer << 32 | e;
+                    if (const auto slot = c.slot_of.find(key); slot != c.slot_of.end() && g_moe_layer.fixed_slot[e] < 0)
+                        cached[e] = (int)slot->second;
+                    else if (const auto slot = ram.slot_of.find(key);
+                             slot != ram.slot_of.end() && g_moe_layer.ram_slot[e] < 0)
+                        in_ram[e] = (int)slot->second;
+                }
+                const auto load = [&](char *to, uint64_t file_off, uint64_t expert_bytes, uint64_t part) {
+                    bool loaded = true;
+                    for (uint32_t e = 0; e < t->n_total_expert && loaded;) {
+                        if (cached[e] >= 0 || in_ram[e] >= 0) {
+                            const char *from = cached[e] >= 0 ? c.gate + (uint64_t)cached[e] * c.slot_bytes + part
+                                                              : ram.at((uint32_t)in_ram[e]) + part;
+                            loaded = cuda_ok(cudaMemcpyAsync(to + (uint64_t)e * expert_bytes, from, expert_bytes,
+                                                             cached[e] >= 0 ? cudaMemcpyDeviceToDevice
+                                                                            : cudaMemcpyHostToDevice, stream),
+                                             "MoE layer gather");
+                            e++;
+                        } else {
+                            uint32_t end = e;
+                            while (end < t->n_total_expert && cached[end] < 0 && in_ram[end] < 0) end++;
+                            loaded = moe_layer_read(to + (uint64_t)e * expert_bytes, file_off + (uint64_t)e * expert_bytes,
+                                                    (uint64_t)(end - e) * expert_bytes, stream, expert_bytes, part, e);
+                            e = end;
+                        }
+                    }
+                    return loaded;
+                };
+                ok = load(g_moe_layer.buffer, t->gate_offset, t->gate_expert_bytes, 0) &&
+                     load(g_moe_layer.buffer + gate, t->up_offset, t->gate_expert_bytes, t->gate_expert_bytes) &&
+                     load(g_moe_layer.buffer + 2 * gate, t->down_offset, t->down_expert_bytes,
+                          2 * t->gate_expert_bytes);
+            } else
+#endif
+            ok =
+                cuda_ok(cudaMemcpyAsync(g_moe_layer.buffer, map + t->gate_offset, gate, cudaMemcpyHostToDevice,
+                                        stream), "MoE layer gate load") &&
+                cuda_ok(cudaMemcpyAsync(g_moe_layer.buffer + gate, map + t->up_offset, gate, cudaMemcpyHostToDevice,
+                                        stream), "MoE layer up load") &&
+                cuda_ok(cudaMemcpyAsync(g_moe_layer.buffer + 2 * gate, map + t->down_offset, down,
+                                        cudaMemcpyHostToDevice, stream), "MoE layer down load");
+            g_moe_layer.gate_off = t->gate_offset;
+            g_moe_layer.up_off = t->up_offset;
+            g_moe_layer.down_off = t->down_offset;
+            g_moe_layer.gate_bytes = gate;
+            g_moe_layer.active = ok;
+            resident = ok;
+        }
+    }
+    return resident;
+}
+
+extern "C" void ds4_gpu_qwen4_moe_stream_input(const ds4_gpu_tensor *x, uint32_t width) {
+    qwen4_cuda::g_moe_stream.input = x;
+    qwen4_cuda::g_moe_stream.input_width = width;
+}
+
+extern "C" void ds4_gpu_qwen4_moe_stream_set_stats_path(const char *model_path) {
+    using namespace qwen4_cuda;
+    if (model_path && model_path[0] && g_moe_stats_file.empty()) {
+        g_moe_stats_file = std::string(model_path) + ".expert-uses";
+        moe_stats_load();
+        atexit(moe_stats_save);
+    }
+}
+
+/* After the tiled kernels of a layer brought in by _stream_layer: counts the
+ * rows that used each expert and copies the layer's most used ones from the
+ * layer buffer into the device's expert cache, so the tokens generated after
+ * the prompt do not start on an empty cache. */
+static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *counts) {
+    using namespace qwen4_cuda;
+    int device = -1;
+    bool ok = g_moe_layer.active && t && counts &&
+        cuda_ok(cudaGetDevice(&device), "MoE layer keep device") &&
+        moe_stream_grow(g_moe_stream.host_ids, g_moe_stream.host_ids_cap, (uint64_t)t->n_total_expert * 4, true,
+                        "MoE layer counts staging") &&
+        cuda_ok(cudaMemcpyAsync(g_moe_stream.host_ids, counts, (uint64_t)t->n_total_expert * 4,
+                                cudaMemcpyDeviceToHost, cuda_decode_stream()), "MoE layer counts read") &&
+        moe_stream_wait(cuda_decode_stream(), "MoE layer counts wait");
+    for (uint32_t e = 0; ok && e < t->n_total_expert; e++)
+        if (g_moe_stream.host_ids[e] > 0) g_moe_layer_heat[(uint64_t)t->layer << 32 | e] += (uint32_t)g_moe_stream.host_ids[e];
+    /* The cache can only be sized once a whole forward has loaded the dense
+     * weights, so the first pass of a session keeps nothing. */
+    if (ok && g_moe_layer.forwards) {
+        moe_stream_cache &c = g_moe_stream_caches[device];
+        if (!c.slots) {
+            c.resized = true;
+            ok = moe_stream_cache_init(c, device, t->gate_expert_bytes, t->down_expert_bytes, 16, t->n_total_expert);
+        }
+        const auto ranked = moe_layer_ranked(t->layer, t->n_total_expert);
+        const uint32_t share = ok && !c.provisional ? c.slots / g_moe_layer.layers : 0;
+        const uint64_t gate_all = g_moe_layer.gate_bytes;
+        for (size_t i = 0; ok && i < ranked.size() && i < share; i++) {
+            const uint32_t expert = ranked[i].second;
+            const uint64_t key = (uint64_t)t->layer << 32 | expert;
+            if (!moe_layer_held(key)) {
+                int slot = -1;
+                uint32_t coldest = ranked[i].first;
+                /* With a ranking from an earlier run the set is fixed: only free slots. */
+                for (uint32_t s = 0; s < c.slots && (slot < 0 || c.key[slot] != moe_stream_no_key); s++) {
+                    if (c.key[s] == moe_stream_no_key || (!g_moe_stats_loaded && c.heat[s] < coldest)) {
+                        coldest = c.key[s] == moe_stream_no_key ? 0 : c.heat[s];
+                        slot = (int)s;
+                    }
+                }
+                if (slot >= 0) {
+                    char *at = c.gate + (uint64_t)slot * c.slot_bytes;
+                    const cudaStream_t stream = cuda_decode_stream();
+                    ok = cuda_ok(cudaMemcpyAsync(at, g_moe_layer.buffer + (uint64_t)expert * c.gate_bytes, c.gate_bytes,
+                                                 cudaMemcpyDeviceToDevice, stream), "MoE layer keep gate") &&
+                         cuda_ok(cudaMemcpyAsync(at + c.gate_bytes,
+                                                 g_moe_layer.buffer + gate_all + (uint64_t)expert * c.gate_bytes,
+                                                 c.gate_bytes, cudaMemcpyDeviceToDevice, stream), "MoE layer keep up") &&
+                         cuda_ok(cudaMemcpyAsync(at + 2 * c.gate_bytes,
+                                                 g_moe_layer.buffer + 2 * gate_all + (uint64_t)expert * c.down_bytes,
+                                                 c.down_bytes, cudaMemcpyDeviceToDevice, stream), "MoE layer keep down");
+                    if (c.key[slot] != moe_stream_no_key) c.slot_of.erase(c.key[slot]);
+                    else c.filled++;
+                    c.key[slot] = key;
+                    c.slot_of[key] = (uint32_t)slot;
+                    c.heat[slot] = ranked[i].first;
+                    c.stamp[slot] = 0;
+                }
+            }
+        }
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_qwen4_moe_stream_layer_keep(const ds4_gpu_stream_expert_table *t,
+        const ds4_gpu_tensor *counts) {
+    return t && qwen4_cuda::tensor(counts, (uint64_t)t->n_total_expert * 4) ?
+           moe_layer_keep(t, (const int *)counts->ptr) : 0;
+}
+
+/* For a graph without list tensors and with the shared expert as the last
+ * slot (Kolibri-1): mid and part of a whole batch as the slot kernels would
+ * leave them, but with the routed experts through the tiled kernels on a
+ * layer brought in whole.  The slot kernels run first with an empty selection:
+ * that computes the shared slot and zeroes the routed ones, which the tiled
+ * kernels then fill.  Returns 1 when done, 0 when the caller should use the
+ * slot path (streaming off, small batch, no room), -1 on failure. */
+extern "C" int ds4_gpu_qwen4_moe_stream_layer_run(const ds4_gpu_stream_expert_table *t,
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, ds4_gpu_tensor *part, const ds4_gpu_tensor *selected,
+        const void *map, uint64_t size, uint32_t T, uint32_t NS, uint32_t K, uint32_t F, uint32_t E,
+        uint32_t gate_type, uint32_t down_type, uint64_t sgo, uint64_t suo, uint64_t sdo, uint32_t st) {
+    using namespace qwen4_cuda;
+    int done = 0, device = -1;
+    const uint32_t NE = t ? t->n_total_expert : 0, NO = NS + 1;
+    if (g_ssd_streaming_mode && t && NE && NE <= 512 && st != UINT_MAX && tensor(mid, (uint64_t)T * NO * F * 4) &&
+        tensor(x, (uint64_t)T * K * 4) && tensor(part, (uint64_t)T * NO * E * 4) &&
+        tensor(selected, (uint64_t)T * NS * 4) && cudaGetDevice(&device) == cudaSuccess) {
+        moe_layer_device &here = g_moe_layer_devices[device];
+        const uint64_t pairs = (uint64_t)T * NS;
+        const bool fresh = here.none_cap < pairs * 4;
+        const bool room = !here.unavailable &&
+            moe_stream_grow(here.lists, here.lists_cap, (uint64_t)NE * T * 4, false, "MoE layer lists") &&
+            moe_stream_grow(here.counts, here.counts_cap, (uint64_t)NE * 4, false, "MoE layer counts") &&
+            moe_stream_grow(here.tiles, here.tiles_cap, ((uint64_t)NE + 1) * 4, false, "MoE layer tiles") &&
+            moe_stream_grow(here.none, here.none_cap, pairs * 4, false, "MoE layer empty selection");
+        if (!room) {
+            (void)cudaGetLastError();
+            here.unavailable = true;
+        } else if (ds4_gpu_qwen4_moe_stream_layer(t) > 0) {
+            const cudaStream_t stream = cuda_decode_stream();
+            const uint64_t sb = row_bytes(st, K) * F, sdb = row_bytes(st, F) * E;
+            const char *sg = weight(map, size, sgo, sb), *su = weight(map, size, suo, sb);
+            const char *sd = weight(map, size, sdo, sdb);
+            const char *gate = g_moe_layer.buffer, *up = gate + g_moe_layer.gate_bytes, *down = up + g_moe_layer.gate_bytes;
+            bool ok = sg && su && sd &&
+                (!fresh || cuda_ok(cudaMemsetAsync(here.none, 0xff, pairs * 4, stream), "MoE layer empty selection"));
+            ok = ok && moe_mv_dispatch((float *)mid->ptr, (const float *)x->ptr, here.none, gate, up, sg, su,
+                                       gate_type, st, NE, T, NS, K, F, false);
+            if (ok) {
+                expert_lists<<<1, 256, 0, stream>>>(here.lists, here.counts, (const int *)selected->ptr, T * NS, NE, T);
+                ok = launched();
+            }
+            ok = ok && matrix_dispatch((float *)mid->ptr, (const float *)x->ptr, gate, up, here.lists, here.counts,
+                                       gate_type, NE, T, NS, NO, K, F, T, false, here.tiles) &&
+                 moe_mv_dispatch((float *)part->ptr, (const float *)mid->ptr, here.none, down, NULL, sd, NULL,
+                                 down_type, st, NE, T, NS, F, E, true) &&
+                 matrix_dispatch((float *)part->ptr, (const float *)mid->ptr, down, NULL, here.lists, here.counts,
+                                 down_type, NE, T, NS, NO, F, E, T, true, here.tiles) &&
+                 moe_layer_keep(t, here.counts);
+            done = ok ? 1 : -1;
+        }
+    }
+    return done;
+}
+
+extern "C" void ds4_gpu_qwen4_moe_stream_set_cpu(qwen4_cuda::moe_cpu_quantize_fn quantize,
+        qwen4_cuda::moe_cpu_rows_fn rows, uint32_t xq_block_bytes) {
+    qwen4_cuda::g_moe_cpu.quantize = quantize;
+    qwen4_cuda::g_moe_cpu.rows = rows;
+    qwen4_cuda::g_moe_cpu.xq_block_bytes = xq_block_bytes;
+}
+
+extern "C" void ds4_gpu_qwen4_moe_stream_end(void) {
+    qwen4_cuda::g_moe_stream.cache = NULL;
+    qwen4_cuda::g_moe_stream.helper = NULL;
+    qwen4_cuda::g_moe_stream.cpu_pairs.clear();
+    qwen4_cuda::g_moe_layer.active = false;
+}
+
+/* Reads `selected` back, which waits for the kernels that produced it, makes
+ * every selected expert resident on the current device and leaves the slot
+ * numbers for the mid and down wrappers.  A no-op when SSD streaming is off. */
+extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table *t,
+        const ds4_gpu_tensor *selected, uint32_t T, uint32_t NS) {
+    using namespace qwen4_cuda;
+    ds4_gpu_qwen4_moe_stream_end();
+    if (!g_ssd_streaming_mode) return 1;
+    const uint64_t pairs = (uint64_t)T * NS;
+    int device = -1;
+    if (!t || !t->model_map || !t->n_total_expert || !t->gate_expert_bytes || !t->down_expert_bytes ||
+        !pairs || !tensor(selected, pairs * 4) ||
+        !cuda_ok(cudaGetDevice(&device), "MoE expert cache device")) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache got an invalid expert table or selection\n");
+        return 0;
+    }
+    moe_stream_cache &c = g_moe_stream_caches[device];
+    const uint32_t min_slots = pairs < t->n_total_expert ? (uint32_t)pairs : t->n_total_expert;
+    /* A layer number that does not go up starts the next forward. */
+    if (c.slots && c.provisional && t->layer <= c.last_layer) {
+        moe_stream_cache_release(c);
+        c.resized = true;
+    }
+    c.last_layer = t->layer;
+    if (!c.slots && !moe_stream_cache_init(c, device, t->gate_expert_bytes, t->down_expert_bytes,
+                                           min_slots, t->n_total_expert)) return 0;
+    if (c.gate_bytes != t->gate_expert_bytes || c.down_bytes != t->down_expert_bytes || c.slots < min_slots) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache on device %d holds %u experts of %llu+%llu bytes; "
+                        "layer %u needs %u of %llu+%llu at once\n",
+                device, c.slots, (unsigned long long)c.gate_bytes, (unsigned long long)c.down_bytes, t->layer,
+                min_slots, (unsigned long long)t->gate_expert_bytes, (unsigned long long)t->down_expert_bytes);
+        return 0;
+    }
+    /* The layer input rides on the same wait when the caller announced it:
+     * a helper or the CPU needs it on the host, and a second blocking read
+     * for it costs as much as the first. */
+    const ds4_gpu_tensor *input = g_moe_stream.input;
+    const uint64_t input_bytes = (uint64_t)T * g_moe_stream.input_width * 4;
+    g_moe_stream.input = NULL;
+    g_moe_stream.input_ready = false;
+    const auto wait_from = std::chrono::steady_clock::now();
+    if (!moe_stream_grow(g_moe_stream.host_ids, g_moe_stream.host_ids_cap, pairs * 4, true,
+                         "MoE expert cache selection staging") ||
+        !cuda_ok(cudaMemcpyAsync(g_moe_stream.host_ids, selected->ptr, pairs * 4, cudaMemcpyDeviceToHost,
+                                 cuda_decode_stream()), "MoE expert cache selection read") ||
+        (input && tensor(input, input_bytes) &&
+         !(moe_stream_grow(g_moe_stream.host_x, g_moe_stream.host_x_cap, input_bytes, true,
+                           "MoE expert input staging") &&
+           cuda_ok(cudaMemcpyAsync(g_moe_stream.host_x, input->ptr, input_bytes, cudaMemcpyDeviceToHost,
+                                   cuda_decode_stream()), "MoE expert input read"))) ||
+        !moe_stream_wait(cuda_decode_stream(), "MoE expert cache selection wait")) return 0;
+    g_moe_stream.input_ready = input && tensor(input, input_bytes);
+    g_moe_stream.wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - wait_from).count();
+    g_moe_stream.waits++;
+    int *ids = g_moe_stream.host_ids;
+    g_moe_stream_clock++;
+    c.stage_used = 0;
+    g_moe_stream_ram.free_slots.insert(g_moe_stream_ram.free_slots.end(), g_moe_stream_ram.released.begin(),
+                                       g_moe_stream_ram.released.end());
+    g_moe_stream_ram.released.clear();
+    /* DS4_CUDA_MOE_STREAM_TRACE names a file that receives "layer expert" for
+     * every routed expert use, for sizing a hot set from real traffic. */
+    static FILE *trace = getenv("DS4_CUDA_MOE_STREAM_TRACE") ?
+                         fopen(getenv("DS4_CUDA_MOE_STREAM_TRACE"), "w") : NULL;
+    if (trace)
+        for (uint64_t i = 0; i < pairs; i++) fprintf(trace, "%u %d\n", t->layer, ids[i]);
+    bool ok = true;
+    static const int helper_device = [device]() {
+        int count = 0;
+        if (!getenv("DS4_CUDA_MOE_STREAM_HELPER") || cudaGetDeviceCount(&count) != cudaSuccess) return -1;
+        for (int d = 0; d < count; d++)
+            if (d != device) return d;
+        return -1;
+    }();
+    /* Not while the primary's arena is provisional: the helper would take the
+     * whole first forward and keep the hottest experts a hop away. */
+    moe_stream_cache *h = helper_device >= 0 && helper_device != device && !c.provisional ?
+                          &g_moe_stream_caches[helper_device] : NULL;
+    static bool probed = getenv("DS4_CUDA_MOE_STREAM_PROBE") == NULL;
+    if (!probed && h) {
+        probed = true;
+        moe_stream_probe(device);
+        if (cudaSetDevice(helper_device) == cudaSuccess) moe_stream_probe(helper_device);
+        (void)cudaSetDevice(device);
+    }
+    if (h && !h->slots) {
+        h->resized = true;
+        ok = cuda_ok(cudaSetDevice(helper_device), "MoE helper device") &&
+             moe_stream_cache_init(*h, helper_device, t->gate_expert_bytes, t->down_expert_bytes,
+                                   min_slots, t->n_total_expert);
+        ok = cuda_ok(cudaSetDevice(device), "MoE primary device") && ok;
+    }
+    ok = ok && (!h || moe_stream_grow(g_moe_stream.host_helper_ids, g_moe_stream.host_helper_ids_cap, pairs * 4,
+                                      true, "MoE helper selection staging"));
+    int *helper_ids = h && ok ? g_moe_stream.host_helper_ids : NULL;
+    for (uint64_t i = 0; helper_ids && i < pairs; i++) helper_ids[i] = -1;
+    g_moe_stream.helper_pairs.clear();
+    /* What this batch uses and a device already holds is stamped before any
+     * load picks a victim: a save in flight on one device's stream must not
+     * be the source of a load on the other's. */
+    moe_layer_visit(t->layer);
+    moe_stream_ram_init(g_moe_stream_ram, c.slot_bytes);
+#ifdef _WIN32
+    /* The first visit to a layer reads it once and hands its experts out: to
+     * this device its share of the stored ranking, which with a helper it
+     * then keeps (see below), and to the RAM tier the rest. */
+    if (!c.provisional && moe_layer_pending(t->layer, c) && moe_layer_reader_open() && moe_layer_plan(t, &c)) {
+        const cudaStream_t stream = cuda_decode_stream();
+        const uint64_t gate = (uint64_t)t->n_total_expert * t->gate_expert_bytes;
+        ok = ok && moe_layer_read(NULL, t->gate_offset, gate, stream, t->gate_expert_bytes, 0) &&
+             moe_layer_read(NULL, t->up_offset, gate, stream, t->gate_expert_bytes, t->gate_expert_bytes) &&
+             moe_layer_read(NULL, t->down_offset, (uint64_t)t->n_total_expert * t->down_expert_bytes, stream,
+                            t->down_expert_bytes, 2 * t->gate_expert_bytes);
+    }
+    g_moe_layer.ram_slot.clear();
+    g_moe_layer.fixed_slot.clear();
+#endif
+    for (uint64_t i = 0; i < pairs; i++) {
+        if (ids[i] >= 0 && (uint32_t)ids[i] < t->n_total_expert) {
+            const uint64_t key = (uint64_t)t->layer << 32 | (uint32_t)ids[i];
+            g_moe_layer_heat[key]++;
+            if (const auto mine = c.slot_of.find(key); mine != c.slot_of.end())
+                c.stamp[mine->second] = g_moe_stream_clock;
+            if (h)
+                if (const auto theirs = h->slot_of.find(key); theirs != h->slot_of.end())
+                    h->stamp[theirs->second] = g_moe_stream_clock;
+        }
+    }
+    static const bool cpu_wanted = getenv("DS4_CUDA_MOE_STREAM_CPU") != NULL;
+    moe_stream_ram_init(g_moe_stream_ram, c.slot_bytes);
+    const bool cpu_mode = cpu_wanted && g_moe_cpu.rows && !c.provisional && g_moe_stream_ram.slots >= pairs;
+    g_moe_stream.cpu_pairs.clear();
+    g_moe_stream.cpu_slots.clear();
+    g_moe_stream.cpu_done = false;
+    g_moe_stream_by_use = cpu_mode;
+    /* Counts halve now and then, so what was hot many queries ago gives way. */
+    if (cpu_mode && g_moe_stream_clock % 4096 == 0) {
+        for (auto &entry : g_moe_stream_caches)
+            for (uint32_t &uses : entry.second.heat) uses >>= 1;
+        for (uint32_t &uses : g_moe_stream_ram.uses) uses >>= 1;
+    }
+    /* A swap is two experts over the bus, so only so many per batch, and only
+     * for an expert with a full percent more uses than the one it replaces
+     * (2020 against 2000), and at least four more while the counts are still
+     * small: two of similar use would trade places for ever. */
+    uint64_t promotions = pairs / 8 + 1;
+    const uint32_t promotion_floor = 4;
+    for (uint64_t i = 0; i < pairs && ok; i++) {
+        /* An id outside the layer stays negative, which the kernels skip. */
+        if (ids[i] >= 0 && (uint32_t)ids[i] < t->n_total_expert) {
+            const uint64_t key = (uint64_t)t->layer << 32 | (uint32_t)ids[i];
+            const bool on_device = c.slot_of.count(key) || (h && h->slot_of.count(key));
+            const bool devices_full = c.filled == c.slots && (!h || h->filled == h->slots);
+            if (cpu_mode && !on_device && devices_full) {
+                /* The devices are to hold what is used most: a RAM expert
+                 * used more than a device's least used one takes its place. */
+                const int ram_slot = moe_stream_ram_hold(g_moe_stream_ram, c, t, (uint32_t)ids[i]);
+                ok = ram_slot >= 0;
+                const uint32_t heat = ok ? g_moe_stream_ram.uses[ram_slot] : 0;
+                const uint32_t mine = moe_stream_coldest(c), theirs = h ? moe_stream_coldest(*h) : UINT32_MAX;
+                const uint32_t coldest = mine < theirs ? mine : theirs;
+                const bool hotter = coldest != UINT32_MAX && heat >= coldest + promotion_floor &&
+                                    (uint64_t)heat * 100u >= (uint64_t)coldest * 101u;
+                if (!ok || !promotions || !hotter) {
+                    g_moe_stream.cpu_pairs.push_back(i);
+                    g_moe_stream.cpu_slots.push_back((uint32_t)ram_slot);
+                    ids[i] = -1;
+                } else if (theirs < mine) {
+                    promotions--;
+                    helper_ids[i] = ids[i];
+                    g_moe_stream.helper_pairs.push_back(i);
+                    ids[i] = -1;
+                } else {
+                    promotions--;
+                    ids[i] = moe_stream_slot(c, t, (uint32_t)ids[i]);
+                    ok = ids[i] >= 0;
+                }
+            /* An expert neither device holds goes to the one whose least
+             * recently used slot is the older. */
+            } else if (h && !c.slot_of.count(key) &&
+                (h->slot_of.count(key) || g_moe_stats_loaded || moe_stream_oldest(*h) < moe_stream_oldest(c))) {
+                helper_ids[i] = ids[i];
+                g_moe_stream.helper_pairs.push_back(i);
+                ids[i] = -1;
+            } else {
+                ids[i] = moe_stream_slot(c, t, (uint32_t)ids[i]);
+                ok = ids[i] >= 0;
+            }
+        } else {
+            ids[i] = -1;
+        }
+    }
+    if (ok && !g_moe_stream.helper_pairs.empty()) {
+        ok = cuda_ok(cudaSetDevice(helper_device), "MoE helper device");
+        h->stage_used = 0;
+        for (size_t i = 0; i < g_moe_stream.helper_pairs.size() && ok; i++) {
+            int &id = helper_ids[g_moe_stream.helper_pairs[i]];
+            id = moe_stream_slot(*h, t, (uint32_t)id);
+            ok = id >= 0;
+        }
+        if (ok && h->selected_cap < pairs) {
+            void *grown = NULL;
+            ok = cuda_ok(cudaMalloc(&grown, pairs * 4), "MoE helper selection");
+            if (ok) {
+                (void)cudaFree(h->selected);
+                h->selected = (int *)grown;
+                h->selected_cap = pairs;
+            }
+        }
+        ok = ok && cuda_ok(cudaMemcpyAsync(h->selected, helper_ids, pairs * 4, cudaMemcpyHostToDevice, 0),
+                           "MoE helper selection write");
+        ok = cuda_ok(cudaSetDevice(device), "MoE primary device") && ok;
+        c.helped += g_moe_stream.helper_pairs.size();
+        c.misses += h->misses;
+        c.from_ram += h->from_ram;
+        h->from_ram = 0;
+        c.host_s += h->host_s;
+        c.device_s += h->device_s;
+        h->misses = 0;
+        h->host_s = h->device_s = 0.0;
+    }
+    /* DS4_CUDA_MOE_STREAM_STATS=N reports misses and their cost every N uses. */
+    static const uint64_t stats_every = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_STATS", 0) >> 20;
+    c.uses += pairs;
+    if (stats_every && c.uses >= stats_every) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache on device %d: %llu of %llu uses missed, "
+                        "%.3f ms read + %.3f ms upload per miss, %llu of them from RAM, %llu run on the helper\n",
+                device, (unsigned long long)c.misses, (unsigned long long)c.uses,
+                c.misses ? 1000.0 * c.host_s / (double)c.misses : 0.0,
+                c.misses ? 1000.0 * c.device_s / (double)c.misses : 0.0,
+                (unsigned long long)c.from_ram, (unsigned long long)c.helped);
+        fprintf(stderr, "ds4: CUDA MoE per-layer wait: %.3f ms over %llu layers\n",
+                g_moe_stream.waits ? 1000.0 * g_moe_stream.wait_s / (double)g_moe_stream.waits : 0.0,
+                (unsigned long long)g_moe_stream.waits);
+        g_moe_stream.wait_s = 0.0;
+        g_moe_stream.waits = 0;
+        if (g_moe_cpu.pairs) {
+            fprintf(stderr, "ds4: CUDA MoE CPU path: %llu uses, %.3f ms each\n", (unsigned long long)g_moe_cpu.pairs,
+                    1000.0 * g_moe_cpu.seconds / (double)g_moe_cpu.pairs);
+            g_moe_cpu.pairs = 0;
+            g_moe_cpu.seconds = 0.0;
+        }
+        if (h && h->hops) {
+            fprintf(stderr, "ds4: CUDA MoE helper, ms per layer: mid %.3f, down launch %.3f, wait and read %.3f, "
+                            "write back %.3f\n",
+                    1000.0 * h->hop_s[3] / (double)h->hops, 1000.0 * h->hop_s[0] / (double)h->hops,
+                    1000.0 * h->hop_s[1] / (double)h->hops, 1000.0 * h->hop_s[2] / (double)h->hops);
+            h->hops = 0;
+            h->hop_s[0] = h->hop_s[1] = h->hop_s[2] = h->hop_s[3] = 0.0;
+        }
+        c.uses = c.misses = c.helped = c.from_ram = 0;
+        c.host_s = c.device_s = 0.0;
+    }
+    if (ok && c.selected_cap < pairs) {
+        void *grown = NULL;
+        ok = cuda_ok(cudaMalloc(&grown, pairs * 4), "MoE expert cache selection");
+        if (ok) {
+            (void)cudaFree(c.selected);
+            c.selected = (int *)grown;
+            c.selected_cap = pairs;
+        }
+    }
+    ok = ok && cuda_ok(cudaMemcpyAsync(c.selected, ids, pairs * 4, cudaMemcpyHostToDevice, cuda_decode_stream()),
+                       "MoE expert cache selection write");
+    if (ok) {
+        g_moe_stream.helper = g_moe_stream.helper_pairs.empty() ? NULL : h;
+        g_moe_stream.device = device;
+        g_moe_stream.helper_device = helper_device;
+        g_moe_stream.cache = &c;
+        g_moe_stream.gate_off = t->gate_offset;
+        g_moe_stream.up_off = t->up_offset;
+        g_moe_stream.down_off = t->down_offset;
+    }
+    return ok;
+}
+
 extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *sel, const void *map, uint64_t size, uint64_t go, uint64_t uo,
         uint32_t type, uint32_t NE, uint32_t T, uint32_t NS, uint32_t K, uint32_t M,
@@ -2091,13 +3542,34 @@ extern "C" int ds4_gpu_qwen4_moe_mid_tensor(ds4_gpu_tensor *mid, const ds4_gpu_t
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(mid, (uint64_t)T*NO*M*4) ||
         !tensor(x, (uint64_t)T*K*4) || !tensor(sel, (uint64_t)T*NS*4)) return 0;
-    const uint64_t bytes = expert_row_bytes(type, K)*M*NE, sb = row_bytes(st, K)*M;
-    const char *g = weight(map,size,go,bytes), *u = weight(map,size,uo,bytes);
+    const uint64_t expert_bytes = expert_row_bytes(type, K)*M, sb = row_bytes(st, K)*M;
+    const moe_stream_cache *stream = g_moe_stream.cache;
+    const bool streamed = stream && go == g_moe_stream.gate_off && uo == g_moe_stream.up_off;
+    if (streamed && (stream->gate_bytes != expert_bytes || stream->selected_cap < (uint64_t)T*NS)) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache holds %llu-byte gate experts, the kernel expects %llu\n",
+                (unsigned long long)stream->gate_bytes, (unsigned long long)expert_bytes);
+        return 0;
+    }
+    const char *g = streamed ? stream->gate : weight(map,size,go,expert_bytes*NE);
+    const char *u = streamed ? stream->up : weight(map,size,uo,expert_bytes*NE);
     const char *sg = st != UINT_MAX ? weight(map,size,sgo,sb) : NULL;
     const char *su = st != UINT_MAX ? weight(map,size,suo,sb) : NULL;
     if (!g || !u || (st != UINT_MAX && (!sg || !su))) return 0;
-    return moe_mv_dispatch((float *)mid->ptr,(const float *)x->ptr,(const int *)sel->ptr,
-                           g,u,sg,su,type,st,NE,T,NS,K,M,false);
+    moe_stream_cache *helper = streamed ? g_moe_stream.helper : NULL;
+    /* x was complete when _begin read the selection, so this does not wait. */
+    if (streamed && (helper || !g_moe_stream.cpu_pairs.empty()) && !g_moe_stream.input_ready &&
+        !(moe_stream_grow(g_moe_stream.host_x, g_moe_stream.host_x_cap, (uint64_t)T*K*4, true,
+                          "MoE expert input staging") &&
+          cuda_ok(cudaMemcpy(g_moe_stream.host_x, x->ptr, (uint64_t)T*K*4, cudaMemcpyDeviceToHost),
+                  "MoE expert input read"))) return 0;
+    g_moe_stream.mid_type = type;
+    g_moe_stream.mid_K = K;
+    g_moe_stream.mid_M = M;
+    return moe_mv_dispatch((float *)mid->ptr,(const float *)x->ptr,
+                           streamed ? stream->selected : (const int *)sel->ptr,
+                           g,u,sg,su,type,st,streamed ? stream->slots : NE,T,NS,K,M,false,
+                           streamed ? stream->slot_bytes : 0) &&
+           (!helper || moe_stream_helper_mid(g_moe_stream.host_x,type,T,NS,K,M));
 }
 
 extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu_tensor *mid,
@@ -2108,11 +3580,26 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
     const unsigned NO = NS + (st != UINT_MAX);
     if (!T || !NE || !NS || !K || !M || !tensor(part,(uint64_t)T*NO*M*4) ||
         !tensor(mid,(uint64_t)T*NO*K*4) || !tensor(sel,(uint64_t)T*NS*4)) return 0;
-    const char *w = weight(map,size,off,expert_row_bytes(type,K)*M*NE);
+    const uint64_t expert_bytes = expert_row_bytes(type,K)*M;
+    const moe_stream_cache *stream = g_moe_stream.cache;
+    const bool streamed = stream && off == g_moe_stream.down_off;
+    if (streamed && (stream->down_bytes != expert_bytes || stream->selected_cap < (uint64_t)T*NS)) {
+        fprintf(stderr, "ds4: CUDA MoE expert cache holds %llu-byte down experts, the kernel expects %llu\n",
+                (unsigned long long)stream->down_bytes, (unsigned long long)expert_bytes);
+        return 0;
+    }
+    const char *w = streamed ? stream->down : weight(map,size,off,expert_bytes*NE);
     const char *sw = st != UINT_MAX ? weight(map,size,so,row_bytes(st,K)*M) : NULL;
     if (!w || (st != UINT_MAX && !sw)) return 0;
-    return moe_mv_dispatch((float *)part->ptr,(const float *)mid->ptr,(const int *)sel->ptr,
-                           w,NULL,sw,NULL,type,st,NE,T,NS,K,M,true);
+    const bool cpu = streamed && !g_moe_stream.cpu_pairs.empty();
+    return moe_mv_dispatch((float *)part->ptr,(const float *)mid->ptr,
+                           streamed ? stream->selected : (const int *)sel->ptr,
+                           w,NULL,sw,NULL,type,st,streamed ? stream->slots : NE,T,NS,K,M,true,
+                           streamed ? stream->slot_bytes : 0) &&
+           (!(streamed && g_moe_stream.helper) ||
+            moe_stream_helper_down((float *)part->ptr,NO,type,T,NS,K,M)) &&
+           (!cpu || ((g_moe_stream.cpu_done || moe_stream_cpu_compute(*stream,type,NS,M)) &&
+                     moe_stream_cpu_write((float *)part->ptr,NO,NS,M)));
 }
 
 extern "C" int ds4_gpu_qwen4_moe_reduce_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *part,
@@ -2150,7 +3637,8 @@ static int qwen4_moe_mm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         !tensor(out,(uint64_t)T*NO*M*4) || !tensor(x,(uint64_t)T*(down ? NO : 1)*K*4) ||
         !tensor(lists,(uint64_t)NE*cap*4) || !tensor(counts,(uint64_t)NE*4)) return 0;
     const uint64_t bytes = expert_row_bytes(type,K)*M*NE;
-    const char *w0 = weight(map,size,o0,bytes), *w1 = down ? NULL : weight(map,size,o1,bytes);
+    const char *l0 = moe_layer_weight(o0), *l1 = down ? NULL : moe_layer_weight(o1);
+    const char *w0 = l0 ? l0 : weight(map,size,o0,bytes), *w1 = down ? NULL : l1 ? l1 : weight(map,size,o1,bytes);
     if (!w0 || (!down && !w1)) return 0;
     return matrix_dispatch((float *)out->ptr,(const float *)x->ptr,w0,w1,(const int *)lists->ptr,
         (const int *)counts->ptr,type,NE,T,NS,NO,K,M,cap,down);
@@ -2188,7 +3676,13 @@ extern "C" int ds4_gpu_qwen4_gdn_front_tensor(ds4_gpu_tensor *qkv, ds4_gpu_tenso
     return launched() && ds4_gpu_qwen4_gdn_prep_tensor(qkv,ga,gb,map,size,so,dto,T,Hk,Hv,D);
 }
 
-extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) { return 1; }
+/* None of the "fused" entry points below is one launch on CUDA; the combine
+ * one even adds a copy and a pointer swap that keeps a layer from being
+ * replayed as a graph.  Off unless DS4_QWEN4_DECODE_FUSIONS asks for them. */
+extern "C" int ds4_gpu_qwen4_decode_fusions_enabled(void) {
+    static const int on = getenv("DS4_QWEN4_DECODE_FUSIONS") != NULL;
+    return on;
+}
 
 extern "C" int ds4_gpu_qwen4_hc_combine_norm_tensor(ds4_gpu_tensor *next, const ds4_gpu_tensor *blk,
         const ds4_gpu_tensor *oldinj, ds4_gpu_tensor *xn, ds4_gpu_tensor *inj, const ds4_gpu_tensor *R,

@@ -285,6 +285,92 @@ static attn_args make_attn_args(unsigned T, unsigned H, unsigned Hkv, unsigned D
     return a;
 }
 
+/* Scores of one head, one column per token: softmax over the keys the token
+ * may attend, rows 0 .. pos0 + token, and zero for the later ones. */
+__global__ void attn_softmax_columns(float *scores, unsigned n_keys, unsigned pos0) {
+    const unsigned tok = blockIdx.x, tid = threadIdx.x, n = min(pos0 + tok + 1u, n_keys);
+    float *col = scores + (uint64_t)tok * n_keys;
+    __shared__ float red[256];
+    float m = -3.0e38f;
+    for (unsigned i = tid; i < n; i += blockDim.x) m = fmaxf(m, col[i]);
+    red[tid] = m;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float l = 0.0f;
+    for (unsigned i = tid; i < n; i += blockDim.x) {
+        const float w = expf(col[i] - m);
+        col[i] = w;
+        l += w;
+    }
+    red[tid] = l;
+    __syncthreads();
+    for (unsigned s = blockDim.x / 2u; s; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    const float inv = red[0] > 0.0f ? 1.0f / red[0] : 0.0f;
+    for (unsigned i = tid; i < n_keys; i += blockDim.x) col[i] = i < n ? col[i] * inv : 0.0f;
+}
+
+static std::unordered_map<int, std::pair<float *, uint64_t>> g_attn_scores;   /* by CUDA device */
+
+/* Full-context attention for a batch as two matrix products per head: the
+ * per-token kernel walks every key serially for every row, which for a prompt
+ * chunk deep into a long context is the whole cost of the layer.  The caches
+ * interleave the heads, which a leading dimension of all heads' width skips
+ * over.  Rows are taken in groups whose score matrix stays within a fixed
+ * size.  Returns 0 when it cannot run and the caller falls back. */
+static int attn_batch_products(float *out, const float *q, const float *kc, const float *vc,
+                               unsigned T, unsigned H, unsigned Hkv, unsigned D, unsigned pos0, float scale) {
+    const unsigned n_keys = pos0 + T, group = H / Hkv;
+    const uint64_t budget = 256ull << 20;
+    const unsigned rows = (unsigned)std::max<uint64_t>(1, std::min<uint64_t>(T, budget / ((uint64_t)n_keys * 4)));
+    int device = -1, done = 0;
+    cublasHandle_t blas = cuda_cublas_for_tier(g_current_logical_tier < 0 ? 0 : g_current_logical_tier);
+    if (blas && cudaGetDevice(&device) == cudaSuccess) {
+        std::pair<float *, uint64_t> &scores = g_attn_scores[device];
+        const uint64_t need = (uint64_t)rows * n_keys * 4;
+        if (scores.second < need) {
+            (void)cudaFree(scores.first);
+            void *grown = NULL;
+            scores = { NULL, 0 };
+            if (cudaMalloc(&grown, need) == cudaSuccess) scores = { (float *)grown, need };
+            else (void)cudaGetLastError();
+        }
+        bool ok = scores.first != NULL;
+        const float one = 1.0f, zero = 0.0f;
+        for (unsigned t0 = 0; t0 < T && ok; t0 += rows) {
+            const unsigned n = std::min(rows, T - t0), keys = pos0 + t0 + n;
+            for (unsigned h = 0; h < H && ok; h++) {
+                const unsigned kvh = h / group;
+                const float *qh = q + ((uint64_t)t0 * H + h) * D;
+                ok = cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, (int)keys, (int)n, (int)D, &scale,
+                                 kc + (uint64_t)kvh * D, (int)(Hkv * D), qh, (int)(H * D), &zero,
+                                 scores.first, (int)keys) == CUBLAS_STATUS_SUCCESS;
+                if (ok) {
+                    attn_softmax_columns<<<n, 256, 0, cuda_decode_stream()>>>(scores.first, keys, pos0 + t0);
+                    ok = qwen4_cuda::launched() &&
+                         cublasSgemm(blas, CUBLAS_OP_N, CUBLAS_OP_N, (int)D, (int)n, (int)keys, &one,
+                                     vc + (uint64_t)kvh * D, (int)(Hkv * D), scores.first, (int)keys, &zero,
+                                     out + ((uint64_t)t0 * H + h) * D, (int)(H * D)) == CUBLAS_STATUS_SUCCESS;
+                }
+            }
+        }
+        done = ok;
+        static bool told;
+        if (ok && !told) {
+            told = true;
+            fprintf(stderr, "ds4: Kolibri-1 full-context attention of prompt chunks runs as matrix products\n");
+        }
+    }
+    return done;
+}
+
 } // namespace kolibri1_cuda
 
 #ifndef DS4_KOLIBRI1_CUDA_KERNELS_ONLY
@@ -328,6 +414,11 @@ extern "C" int ds4_gpu_kolibri_attn_decode_tensor(
         !qwen4_cuda::tensor(q, qb) || !qwen4_cuda::tensor(k_cache, cb) || !qwen4_cuda::tensor(v_cache, cb) ||
         !qwen4_cuda::tensor(out, qb) ||
         (a.n_splits > 1 && !qwen4_cuda::tensor(part, ds4_gpu_kolibri_attn_part_floats(T, H, D) * 4))) return 0;
+    /* DS4_KOLIBRI1_NO_ATTN_PRODUCTS=1 keeps the per-token kernel for A/B. */
+    static const bool products = getenv("DS4_KOLIBRI1_NO_ATTN_PRODUCTS") == NULL;
+    if (products && !window && !cache_rows && !part && T >= 64 && !g_decode_graph_capturing &&
+        attn_batch_products((float *)out->ptr, (const float *)q->ptr, (const float *)k_cache->ptr,
+                            (const float *)v_cache->ptr, T, H, Hkv, D, pos0, scale)) return 1;
     attn_decode<<<dim3(a.n_splits, Hkv, T), 32 * ATTN_NSG, 0, cuda_decode_stream()>>>(
         a, (const float *)q->ptr, (const float *)k_cache->ptr, (const float *)v_cache->ptr,
         (float *)out->ptr, a.n_splits > 1 ? (float *)part->ptr : NULL);

@@ -59324,6 +59324,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
 
 static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
+    ds4_gpu_decode_graphs_invalidate();
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
@@ -59634,6 +59635,7 @@ static uint32_t qwen4_ctx_initial_rows(uint32_t ctx_max, uint32_t cap_tokens) {
  * GPU memory.  On failure the layers already moved keep their larger buffers,
  * which still hold the kept rows, and ctx_cap stays as it was. */
 static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_t keep) {
+    ds4_gpu_decode_graphs_invalidate();
     const uint64_t kv_row = qwen4_kv_pos_bytes(), bk_row = (uint64_t)DS4_N_INDEXER_HEAD_DIM * 2u;
     const uint32_t new_blocks = new_cap / 4u + 1u;
     const uint32_t keep_blocks = keep ? keep / 4u + 1u : 0u;
@@ -60232,8 +60234,73 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* CUDA SSD streaming: the trunk layers whose routed experts are not resident
+ * and reach a device through its expert cache (ds4_gpu_qwen4_moe_stream_begin).
+ * Set once at engine open; the prediction layers' experts, of another format
+ * and size, stay resident. */
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+static void moe_stream_cpu_quantize(const float *x, void *xq, uint32_t n) {
+    ds4_quantize_row_q8_K(x, xq, (int64_t)n);
+}
+
+static void moe_stream_cpu_rows(uint32_t type, const void *rows, uint64_t row_bytes, uint32_t in_dim,
+                                uint32_t first_row, uint32_t end_row, const void *xq, float *out) {
+    for (uint32_t r = first_row; r < end_row; r++) {
+        const uint8_t *row = (const uint8_t *)rows + (uint64_t)r * row_bytes;
+        float sum = 0.0f;
+        if (type == DS4_TENSOR_Q4_K) ds4_vec_dot_q4_K_q8_K((int)in_dim, &sum, (const block_q4_K *)row, xq);
+        else if (type == DS4_TENSOR_Q2_K) ds4_vec_dot_q2_K_q8_K((int)in_dim, &sum, (const block_q2_K *)row, xq);
+        else ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &sum, (const block_iq2_xxs *)row, xq);
+        out[r] = sum;
+    }
+}
+
+/* The CPU evaluates Q4_K, Q2_K and IQ2_XXS experts only, with the activation
+ * quantized to Q8_K as the CPU reference does: its outputs differ from the
+ * device kernels' by that rounding. */
+static void moe_stream_cpu_register(const ds4_tensor *gate, const ds4_tensor *down) {
+    static bool done;
+    if (done) return;
+    done = true;
+    const bool gate_ok = gate->type == DS4_TENSOR_Q4_K || gate->type == DS4_TENSOR_Q2_K ||
+                         gate->type == DS4_TENSOR_IQ2_XXS;
+    const bool down_ok = down->type == DS4_TENSOR_Q4_K || down->type == DS4_TENSOR_Q2_K ||
+                         down->type == DS4_TENSOR_IQ2_XXS;
+    if (gate_ok && down_ok)
+        ds4_gpu_qwen4_moe_stream_set_cpu(moe_stream_cpu_quantize, moe_stream_cpu_rows, sizeof(block_q8_K));
+}
+#endif
+
+static const ds4_layer_weights *g_qwen4_stream_layers;
+static uint32_t g_qwen4_stream_layer_count;
+
+static bool qwen4_layer_streams_experts(const ds4_layer_weights *l) {
+    return g_qwen4_stream_layers && l >= g_qwen4_stream_layers &&
+           l < g_qwen4_stream_layers + g_qwen4_stream_layer_count;
+}
+
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+static ds4_gpu_stream_expert_table qwen4_stream_table(const ds4_model *m, const ds4_layer_weights *l) {
+    uint64_t in_dim = 0, gate_rows = 0, gate_row_bytes = 0, down_rows = 0, down_row_bytes = 0;
+    (void)tensor_expert_bytes(m, l->ffn_gate_exps, 0, &in_dim, &gate_rows, &gate_row_bytes);
+    (void)tensor_expert_bytes(m, l->ffn_down_exps, 0, &in_dim, &down_rows, &down_row_bytes);
+    return (ds4_gpu_stream_expert_table){
+        .model_map = m->map,
+        .model_size = m->size,
+        .layer = (uint32_t)(l - g_qwen4_stream_layers),
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = l->ffn_gate_exps->abs_offset,
+        .up_offset = l->ffn_up_exps->abs_offset,
+        .down_offset = l->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_rows * gate_row_bytes,
+        .down_expert_bytes = down_rows * down_row_bytes,
+    };
+}
+#endif
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
     const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
+    const bool streamed = qwen4_layer_streams_experts(l);
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
     bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
@@ -60256,13 +60323,25 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #else
     const uint32_t mm_min = 8u;
 #endif
-    const bool mm = T > mm_min &&
+    const bool mm_shape =
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
         qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
+    /* Streamed experts are addressed through the cache's slots, which only
+     * the per-(token, slot) kernels do.  A chunk large enough to use most of
+     * a layer's experts instead has the whole layer brought to the device
+     * for its turn: one pass of its weights, shared by every row. */
+    bool layer_resident = false;
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+    if (ok && streamed && mm_shape && T >= 64u) {
+        const ds4_gpu_stream_expert_table table = qwen4_stream_table(m, l);
+        layer_resident = ds4_gpu_qwen4_moe_stream_layer(&table) > 0;
+    }
+#endif
+    const bool mm = T > mm_min && (!streamed || layer_resident) && mm_shape;
     if (mm) {
         if (ok) {
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
@@ -60297,6 +60376,13 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 g->pos, T, (int)l->ffn_gate_exps->name.len, l->ffn_gate_exps->name.ptr, ok ? 1 : 0,
                 elapsed[0] * 1e3, elapsed[1] * 1e3, elapsed[2] * 1e3, elapsed[3] * 1e3,
                 elapsed[4] * 1e3, elapsed[5] * 1e3, elapsed[6] * 1e3);
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+        if (ok && layer_resident) {
+            const ds4_gpu_stream_expert_table table = qwen4_stream_table(m, l);
+            ok = ds4_gpu_qwen4_moe_stream_layer_keep(&table, g->moe_counts) != 0;
+        }
+        ds4_gpu_qwen4_moe_stream_end();
+#endif
         return ok;
     }
     /* A decode batch runs the shared expert as dense projections over its
@@ -60308,7 +60394,11 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
-    const bool shared_dense = false;
+    /* CUDA reaches here with streamed experts for every batch size; the slot
+     * would read the shared expert through its slowest path once per row. */
+    const bool shared_dense = T > 1u &&
+        qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+        qwen4_graph_dense_ok(l->ffn_down_shexp);
 #endif
     if (ok && shared_dense) {
         ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
@@ -60338,6 +60428,15 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     } else
 #endif
     if (ok) {
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+        if (streamed) {
+            const ds4_gpu_stream_expert_table table = qwen4_stream_table(m, l);
+            moe_stream_cpu_register(l->ffn_gate_exps, l->ffn_down_exps);
+            ds4_gpu_qwen4_moe_stream_input(g->mixed, DS4_N_EMBD);
+            ok = ds4_gpu_qwen4_moe_stream_begin(&table, g->selected, T, DS4_N_EXPERT_USED) != 0;
+        }
+        if (ok)
+#endif
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
@@ -60348,6 +60447,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+        ds4_gpu_qwen4_moe_stream_end();
+#endif
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
@@ -60356,6 +60458,53 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     }
     return ok;
 }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* A linear layer's work up to the router for one decoded token, none of which
+ * depends on the position: the mixer, the recurrent step, the residual
+ * combine and the second mixer.  CUDA pays a fixed cost per kernel launch
+ * that exceeds the work of most of these, so they are captured once per
+ * layer and replayed as one submission.  DS4_QWEN4_NO_DECODE_GRAPH=1 keeps
+ * the separate launches for A/B. */
+static bool qwen4_decode_island_ok(const ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t T) {
+    static int off = -1;
+    if (off < 0) off = getenv("DS4_QWEN4_NO_DECODE_GRAPH") != NULL;
+    return !off && T == 1u && ds4_qwen4_layer_is_linear(il) && !g->mtp_R && !g->dump_prompt_rows &&
+           !g->steer_dirs && !g->snap_after_first && !g->snap_after_second &&
+           !ds4_gpu_qwen4_decode_fusions_enabled() && ds4_gpu_decode_graphs_supported();
+}
+
+static bool qwen4_decode_island(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t il) {
+    const ds4_decode_graph_key key = {
+        .il = il, .island = 0, .variant = 38,
+        .cur_hc = g->R, .after_attn_hc = g->inj,
+        .after_ffn_hc = g->layer_lin_state[il], .attn_norm = (void *)m->map,
+    };
+    bool ok = false, settled = false;
+    while (!settled) {
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        if (state == 1) {
+            ok = true;
+            settled = true;
+        } else {
+            ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, 1) &&
+                 qwen4_graph_linear(g, m, l, il, 1) &&
+                 ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, DS4_N_EMBD, DS4_N_HC) != 0 &&
+                 qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
+            if (state != 0) settled = true;
+            else if (!ok) {
+                ds4_gpu_decode_graph_abort(&key);
+                settled = true;
+            } else {
+                /* A failed capture executed nothing and retired the entry: encode again. */
+                settled = ds4_gpu_decode_graph_end(&key) == 0;
+            }
+        }
+    }
+    return ok;
+}
+#endif
 
 /* host side: embedding rows tiled into R and the PLE n-gram gather */
 static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
@@ -60451,13 +60600,13 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     static int timing = -1;
     if (timing < 0) {
         const char *tv = getenv("DS4_QWEN4_TIMING");
-        timing = tv ? (atoi(tv) >= 2 ? 2 : 1) : 0;
+        timing = tv ? (atoi(tv) >= 3 ? 3 : atoi(tv) >= 2 ? 2 : 1) : 0;
     }
     /* Start the GPU while the host encodes the rest of the trunk. The
      * command queue preserves layer order; zero restores one submission. */
-    uint32_t flush_layer = timing != 2 && n_trunk > 2u ? 2u : 0u;
+    uint32_t flush_layer = timing < 2 && n_trunk > 2u ? 2u : 0u;
     const char *flush_env = getenv("DS4_QWEN4_FLUSH_LAYER");
-    if (timing != 2 && flush_env && flush_env[0]) {
+    if (timing < 2 && flush_env && flush_env[0]) {
         char *end = NULL;
         const unsigned long layer = strtoul(flush_env, &end, 10);
         if (end != flush_env && *end == '\0' && layer < n_trunk) {
@@ -60470,9 +60619,10 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
-     * report GPU ms per group (adds sync overhead; diagnostics only) */
+     * report GPU ms per group (adds sync overhead; diagnostics only); 3 does
+     * the same for single decoded tokens. */
     double prof[6] = {0};
-    const bool prof_on = timing == 2 && T > 1u;
+    const bool prof_on = (timing == 2 && T > 1u) || timing == 3;
     double prof_last = prof_on ? now_sec() : 0.0;
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
@@ -60498,11 +60648,26 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
                                                g->snap_after_second ? g->snap2_ple_hist : NULL, 1u);
         }
         QWEN4_PROF(0);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (ok && !prof_on && qwen4_decode_island_ok(g, il, T)) {
+            ok = qwen4_decode_island(g, m, l, il);
+            if (!ok) fprintf(stderr, "ds4: Qwen3.8 forward failed in layer %u (replayed mixer and recurrence)\n", il);
+            if (ok) ok = qwen4_graph_moe(g, m, l, T);
+            if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
+            if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
+            continue;
+        }
+#endif
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
         QWEN4_PROF(1);
+        const bool before_core = ok;
         if (ok) {
             ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
                                                : qwen4_graph_attention(g, m, l, il, pos0, T);
+        }
+        if (before_core && !ok) {
+            fprintf(stderr, "ds4: Qwen3.8 forward failed in layer %u (%s)\n", il,
+                    ds4_qwen4_layer_is_linear(il) ? "linear attention" : "attention");
         }
         if (ok) {
             /* GDN and full attention both project into the same E-wide blk
@@ -60530,7 +60695,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
         }
         QWEN4_PROF(4);
+        const bool before_moe = ok;
         if (ok) ok = qwen4_graph_moe(g, m, l, T);   /* the reduce folds the combine in */
+        if (!ok) fprintf(stderr, "ds4: Qwen3.8 forward failed in layer %u (%s)\n", il, before_moe ? "MoE" : "mixer or attention");
         if (ok && g->dump_prompt_rows)
             metal_graph_debug_dump_tensor("qwen_router", g->router,
                                            (uint64_t)T * DS4_N_EXPERT, il, pos0);
@@ -61036,6 +61203,13 @@ static int generate_qwen4_metal_argmax(
  * rows, mirroring the CPU cache spans.
  * --------------------------------------------------------------------- */
 
+/* Transients a session can borrow from the engine arena.  The per-session
+ * K/V rings and the logits row are not in the list. */
+#define DS4_KOLIBRI1_SCRATCH_FIELDS(X) \
+    X(R) X(x) X(blk) X(attn_o) X(moe_out) X(q) X(kv) X(attn_part) \
+    X(router) X(selected) X(rweights) X(mid) X(part)
+#define DS4_KOLIBRI1_SCRATCH_COUNT 13
+
 typedef struct ds4_kolibri1_gpu_graph {
     uint32_t ctx_cap;
     uint32_t pos;
@@ -61050,6 +61224,16 @@ typedef struct ds4_kolibri1_gpu_graph {
     ds4_gpu_tensor *layer_k_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
     float *host_row;
+    /* CUDA layer placement.  n_tiers == 0 is the single-device graph and
+     * leaves the rest unused.  Otherwise every layer runs on the device that
+     * holds its weights and K/V rows, each device in use has its own set of
+     * transients in tier_scratch, and the fields above alias the set of
+     * active_tier; only the residual R crosses a device boundary. */
+    int n_tiers;
+    int active_tier;
+    int head_tier;
+    int layer_tier[DS4_MAX_LAYER];
+    ds4_gpu_tensor *tier_scratch[DS4_MAX_GPUS][DS4_KOLIBRI1_SCRATCH_COUNT];
 } ds4_kolibri1_gpu_graph;
 
 /* Projections the graph accepts: the fixture is all F32, the released
@@ -61103,18 +61287,34 @@ static bool kolibri1_graph_weights_supported(const ds4_weights *w) {
     return true;
 }
 
-/* Transients a session can borrow from the engine arena.  The per-session
- * K/V rings and the logits row are not in the list. */
-#define DS4_KOLIBRI1_SCRATCH_FIELDS(X) \
-    X(R) X(x) X(blk) X(attn_o) X(moe_out) X(q) X(kv) X(attn_part) \
-    X(router) X(selected) X(rweights) X(mid) X(part)
+/* Point the transient fields at one device's set, or store them back. */
+static void kolibri1_graph_bind_tier(ds4_kolibri1_gpu_graph *g, int tier) {
+    int i = 0;
+#define DS4_KOLIBRI1_SCRATCH_BIND(field_) g->field_ = g->tier_scratch[tier][i++];
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_BIND)
+#undef DS4_KOLIBRI1_SCRATCH_BIND
+    g->active_tier = tier;
+}
+
+static void kolibri1_graph_store_tier(ds4_kolibri1_gpu_graph *g, int tier) {
+    int i = 0;
+#define DS4_KOLIBRI1_SCRATCH_STORE(field_) g->tier_scratch[tier][i++] = g->field_;
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_STORE)
+#undef DS4_KOLIBRI1_SCRATCH_STORE
+}
 
 static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
     if (!g) return;
     if (g->owns_scratch) {
+        if (g->n_tiers) {
+            for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+                for (int i = 0; i < DS4_KOLIBRI1_SCRATCH_COUNT; i++) ds4_gpu_tensor_free(g->tier_scratch[tier][i]);
+            }
+        } else {
 #define DS4_KOLIBRI1_SCRATCH_FREE(field_) ds4_gpu_tensor_free(g->field_);
-        DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_FREE)
+            DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_FREE)
 #undef DS4_KOLIBRI1_SCRATCH_FREE
+        }
         free(g->host_row);
     }
     /* The logits row and the K/V rings are always private to the session. */
@@ -61153,22 +61353,69 @@ static uint64_t kolibri1_graph_scratch_bytes(const ds4_kolibri1_gpu_graph *g) {
     return total;
 }
 
-static ds4_gpu_tensor *kolibri1_graph_alloc_f32(uint64_t n) {
-    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(n * sizeof(float));
+/* tier < 0 allocates on the default device, as the single-device graph does. */
+static ds4_gpu_tensor *kolibri1_graph_alloc_bytes(int tier, uint64_t bytes) {
+    return tier < 0 ? ds4_gpu_tensor_alloc(bytes) : ds4_gpu_tensor_alloc_ptr_on(tier, bytes);
+}
+
+static ds4_gpu_tensor *kolibri1_graph_alloc_f32(int tier, uint64_t n) {
+    ds4_gpu_tensor *t = kolibri1_graph_alloc_bytes(tier, n * sizeof(float));
     if (t) ds4_gpu_tensor_fill_f32(t, 0.0f, n);
     return t;
 }
 
+/* One set of transients on a device, into the graph's fields. */
+static bool kolibri1_graph_alloc_scratch(ds4_kolibri1_gpu_graph *g, int tier) {
+    const uint64_t E = DS4_N_EMBD, T = g->cap_tokens;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    bool ok = true;
+#define KOLIBRI1_ALLOC(field_, n_) do { g->field_ = kolibri1_graph_alloc_f32(tier, n_); ok = ok && g->field_; } while (0)
+    KOLIBRI1_ALLOC(R, T * E);
+    KOLIBRI1_ALLOC(x, T * E);
+    KOLIBRI1_ALLOC(blk, T * E);
+    KOLIBRI1_ALLOC(attn_o, T * q_dim);
+    KOLIBRI1_ALLOC(moe_out, T * E);
+    KOLIBRI1_ALLOC(q, T * q_dim);
+    KOLIBRI1_ALLOC(kv, T * 2u * kv_dim);
+    KOLIBRI1_ALLOC(attn_part, ds4_gpu_kolibri_attn_part_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    KOLIBRI1_ALLOC(router, T * DS4_N_EXPERT);
+    KOLIBRI1_ALLOC(selected, T * DS4_N_EXPERT_USED);
+    KOLIBRI1_ALLOC(rweights, T * DS4_N_EXPERT_USED);
+    KOLIBRI1_ALLOC(mid, T * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP);
+    KOLIBRI1_ALLOC(part, T * (DS4_N_EXPERT_USED + 1u) * E);
+#undef KOLIBRI1_ALLOC
+    return ok;
+}
+
+/* placement is the engine's layer placement (entry il + 1 per layer, the
+ * output head last) when the layers are spread over n_gpus CUDA devices, and
+ * NULL for one device. */
 static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w,
                                  uint32_t ctx_cap, uint32_t cap_tokens,
-                                 const ds4_kolibri1_gpu_graph *shared) {
+                                 const ds4_kolibri1_gpu_graph *shared,
+                                 const int *placement, int n_gpus) {
     memset(g, 0, sizeof(*g));
     if (!kolibri1_graph_weights_supported(w)) return false;
     const uint64_t E = DS4_N_EMBD;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     g->ctx_cap = ctx_cap;
     g->cap_tokens = cap_tokens;
+    if (placement) {
+        if (shared || n_gpus < 2 || n_gpus > DS4_MAX_GPUS) return false;
+        g->n_tiers = n_gpus;
+        g->head_tier = placement[DS4_N_LAYER + 1];
+        bool valid = g->head_tier >= 0 && g->head_tier < n_gpus;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            g->layer_tier[il] = placement[il + 1];
+            valid = valid && g->layer_tier[il] >= 0 && g->layer_tier[il] < n_gpus;
+        }
+        if (!valid) {
+            fprintf(stderr, "ds4: Kolibri-1 graph needs every layer and the output head on a CUDA device\n");
+            memset(g, 0, sizeof(*g));
+            return false;
+        }
+    }
     /* Sliding layers hold only the window plus the in-flight chunk: a token
      * attends the last DS4_N_SWA rows, and the current batch stages its rows
      * before the attention runs, so no two positions within one window plus
@@ -61178,43 +61425,42 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
 
     bool ok = true;
     g->owns_scratch = shared == NULL;
-#define KOLIBRI1_ALLOC(field_, n_) do { g->field_ = kolibri1_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
     if (shared) {
 #define KOLIBRI1_BORROW(field_) g->field_ = shared->field_;
-        KOLIBRI1_BORROW(R) KOLIBRI1_BORROW(x) KOLIBRI1_BORROW(blk) KOLIBRI1_BORROW(attn_o)
-        KOLIBRI1_BORROW(moe_out) KOLIBRI1_BORROW(q) KOLIBRI1_BORROW(kv) KOLIBRI1_BORROW(attn_part)
-        KOLIBRI1_BORROW(router) KOLIBRI1_BORROW(selected) KOLIBRI1_BORROW(rweights)
-        KOLIBRI1_BORROW(mid) KOLIBRI1_BORROW(part)
+        DS4_KOLIBRI1_SCRATCH_FIELDS(KOLIBRI1_BORROW)
 #undef KOLIBRI1_BORROW
         g->host_row = shared->host_row;
-        goto private_state;
+    } else {
+        if (g->n_tiers) {
+            /* Allocate on the devices some layer or the head runs on; a set
+             * is stored before the fields move on to the next device, so a
+             * failure half way frees everything through tier_scratch. */
+            for (int tier = 0; tier < g->n_tiers && ok; tier++) {
+                bool used = tier == g->head_tier;
+                for (uint32_t il = 0; il < DS4_N_LAYER && !used; il++) used = g->layer_tier[il] == tier;
+                if (used) {
+                    ok = kolibri1_graph_alloc_scratch(g, tier);
+                    kolibri1_graph_store_tier(g, tier);
+                }
+            }
+            kolibri1_graph_bind_tier(g, g->layer_tier[0]);
+        } else {
+            ok = kolibri1_graph_alloc_scratch(g, -1);
+        }
+        g->host_row = xmalloc((size_t)cap_tokens * E * sizeof(float));
+        ok = ok && g->host_row;
     }
-    KOLIBRI1_ALLOC(R, cap_tokens * E);
-    KOLIBRI1_ALLOC(x, cap_tokens * E);
-    KOLIBRI1_ALLOC(blk, cap_tokens * E);
-    KOLIBRI1_ALLOC(attn_o, cap_tokens * q_dim);
-    KOLIBRI1_ALLOC(moe_out, cap_tokens * E);
-    KOLIBRI1_ALLOC(q, cap_tokens * q_dim);
-    KOLIBRI1_ALLOC(kv, cap_tokens * 2u * kv_dim);
-    KOLIBRI1_ALLOC(attn_part, ds4_gpu_kolibri_attn_part_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM));
-    KOLIBRI1_ALLOC(router, cap_tokens * DS4_N_EXPERT);
-    KOLIBRI1_ALLOC(selected, cap_tokens * DS4_N_EXPERT_USED);
-    KOLIBRI1_ALLOC(rweights, cap_tokens * DS4_N_EXPERT_USED);
-    KOLIBRI1_ALLOC(mid, cap_tokens * (DS4_N_EXPERT_USED + 1u) * DS4_N_FF_EXP);
-    KOLIBRI1_ALLOC(part, cap_tokens * (DS4_N_EXPERT_USED + 1u) * E);
-    g->host_row = xmalloc((size_t)cap_tokens * E * sizeof(float));
-    ok = ok && g->host_row;
 
-private_state:
     /* The logits belong to the caller that reads them back. */
-    KOLIBRI1_ALLOC(logits, DS4_N_VOCAB);
-#undef KOLIBRI1_ALLOC
+    g->logits = kolibri1_graph_alloc_f32(g->n_tiers ? g->head_tier : -1, DS4_N_VOCAB);
+    ok = ok && g->logits;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         /* Full layers keep one row per absolute position; sliding layers a
          * ring of window + chunk rows (see slide_rows). */
         const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? ctx_cap : g->slide_rows;
-        g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * sizeof(float));
-        g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)rows * kv_dim * sizeof(float));
+        const int tier = g->n_tiers ? g->layer_tier[il] : -1;
+        g->layer_k_cache[il] = kolibri1_graph_alloc_bytes(tier, (uint64_t)rows * kv_dim * sizeof(float));
+        g->layer_v_cache[il] = kolibri1_graph_alloc_bytes(tier, (uint64_t)rows * kv_dim * sizeof(float));
         ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il];
     }
     if (!ok) {
@@ -61274,6 +61520,38 @@ static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model 
     return ok;
 }
 
+/* DS4_KOLIBRI1_STAGE_PROFILE=1 waits for the device after each stage and
+ * prints the mean milliseconds per decoded token every 50 tokens. */
+enum { kolibri1_prof_attn, kolibri1_prof_router, kolibri1_prof_stage, kolibri1_prof_experts,
+       kolibri1_prof_hop, kolibri1_prof_head, kolibri1_prof_count };
+static double g_kolibri1_prof[kolibri1_prof_count];
+static double g_kolibri1_prof_at;
+static uint32_t g_kolibri1_prof_tokens;
+
+static bool kolibri1_prof_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_KOLIBRI1_STAGE_PROFILE") != NULL;
+    return on != 0;
+}
+
+static void kolibri1_prof_mark(int stage) {
+    if (!kolibri1_prof_on()) return;
+    (void)ds4_gpu_synchronize();
+    const double now = now_sec();
+    if (stage >= 0) g_kolibri1_prof[stage] += now - g_kolibri1_prof_at;
+    g_kolibri1_prof_at = now;
+}
+
+static void kolibri1_prof_token(void) {
+    if (!kolibri1_prof_on() || ++g_kolibri1_prof_tokens < 50) return;
+    const double *p = g_kolibri1_prof;
+    fprintf(stderr, "ds4: Kolibri-1 ms/token: attention %.1f, router %.1f, expert staging %.1f, "
+                    "experts %.1f, device hops %.1f, head %.1f\n",
+            20.0 * p[0], 20.0 * p[1], 20.0 * p[2], 20.0 * p[3], 20.0 * p[4], 20.0 * p[5]);
+    memset(g_kolibri1_prof, 0, sizeof(g_kolibri1_prof));
+    g_kolibri1_prof_tokens = 0;
+}
+
 /* Every layer's MLP: sigmoid router with expert bias, per-(token, slot)
  * expert matvecs, the shared expert as an extra slot, and the weighted sum
  * (shared unweighted, matching the CPU reference exactly). */
@@ -61285,7 +61563,8 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
                                                  l->ffn_exp_probs_b->abs_offset, m->map, m->size,
                                                  T, DS4_N_EXPERT, slots,
                                                  DS4_EXPERT_WEIGHT_SCALE);
-#ifdef __APPLE__
+    kolibri1_prof_mark(kolibri1_prof_router);
+#ifdef DS4_HAS_QWEN4_MOE_STREAM
     if (ok) {
         /* SSD streaming stages the selected experts in the expert cache;
          * without it this is a no-op and the experts stay mapped. */
@@ -61303,11 +61582,38 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
             .gate_expert_bytes = gate_rows * gate_row_bytes,
             .down_expert_bytes = down_rows * down_row_bytes,
         };
+#ifndef __APPLE__
+        /* A batch that uses most of a layer's experts has the layer brought to
+         * the device whole and its routed experts run through the tiled
+         * kernels: one pass of the weights for all rows instead of an expert
+         * load per miss.  Below this many rows the pass costs more than it saves. */
+        const uint32_t whole_layer_rows = 256;
+        const bool tiled = T >= whole_layer_rows && (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
+            qwen4_expert_type_has_mm(l->ffn_gate_exps->type) && l->ffn_up_exps->type == l->ffn_gate_exps->type &&
+            qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
+            l->ffn_up_shexp->type == l->ffn_gate_shexp->type && l->ffn_down_shexp->type == l->ffn_gate_shexp->type;
+        if (tiled) {
+            const int ran = ds4_gpu_qwen4_moe_stream_layer_run(&table, g->mid, g->x, g->part, g->selected,
+                m->map, m->size, T, slots, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, l->ffn_gate_exps->type,
+                l->ffn_down_exps->type, l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                l->ffn_down_shexp->abs_offset, l->ffn_gate_shexp->type);
+            if (ran != 0) {
+                ds4_gpu_qwen4_moe_stream_end();
+                ok = ran > 0 &&
+                     ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
+                kolibri1_prof_mark(kolibri1_prof_experts);
+                return ok;
+            }
+        }
+        moe_stream_cpu_register(l->ffn_gate_exps, l->ffn_down_exps);
+        ds4_gpu_qwen4_moe_stream_input(g->x, DS4_N_EMBD);
+#endif
         ok = ds4_gpu_qwen4_moe_stream_begin(&table, g->selected, T, slots) != 0;
     }
 #else
     (void)il;
 #endif
+    kolibri1_prof_mark(kolibri1_prof_stage);
     ok = ok &&
               ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->x, g->selected, m->map, m->size,
                                            l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -61319,10 +61625,12 @@ static bool kolibri1_graph_moe(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
                                             l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
                                             DS4_N_EXPERT, T, slots, DS4_N_FF_EXP, DS4_N_EMBD,
                                             l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type);
-#ifdef __APPLE__
+#ifdef DS4_HAS_QWEN4_MOE_STREAM
     ds4_gpu_qwen4_moe_stream_end();
 #endif
-    return ok && ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
+    ok = ok && ds4_gpu_kolibri_moe_sum_tensor(g->moe_out, g->part, g->rweights, T, slots, DS4_N_EMBD);
+    kolibri1_prof_mark(kolibri1_prof_experts);
+    return ok;
 }
 
 /* Embeddings are staged on the host like the Qwen graph does: one ref_row
@@ -61333,6 +61641,30 @@ static bool kolibri1_graph_stage_inputs(ds4_kolibri1_gpu_graph *g, const ds4_mod
         ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * DS4_N_EMBD);
     }
     return ds4_gpu_tensor_write(g->R, 0, g->host_row, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
+}
+
+/* Continue on another device: its transients become the graph's fields and
+ * the first `rows` rows of the residual R move over.  Kernels run on each
+ * device's default stream while the cross-device copy uses the devices' own
+ * copy streams, so both sides are synchronized around it; this happens once
+ * per device boundary and forward, not per layer.  carry is false where the
+ * new device's R is about to be written anyway. */
+static bool kolibri1_graph_enter_tier(ds4_kolibri1_gpu_graph *g, int tier, uint32_t rows, bool carry) {
+    if (!g->n_tiers) return true;
+    const bool hop = tier != g->active_tier;
+    bool ok = true;
+    if (hop && carry) {
+        ds4_gpu_tensor *from = g->R;
+        ds4_gpu_tensor *to = g->tier_scratch[tier][0];
+        ok = ds4_gpu_synchronize() != 0 &&
+             ds4_gpu_tensor_copy_xdev(to, from, (uint64_t)rows * DS4_N_EMBD * sizeof(float)) != 0 &&
+             ds4_gpu_synchronize() != 0;
+    }
+    if (ok && (hop || !carry)) {
+        kolibri1_graph_bind_tier(g, tier);
+        ok = ds4_gpu_set_current_device(tier) == 0 && (!(hop && carry) || ds4_gpu_synchronize() != 0);
+    }
+    return ok;
 }
 
 /* Forward T tokens at pos0.  Norms run in-place through x as scratch: each
@@ -61348,11 +61680,15 @@ static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_m
         }
     }
     const uint32_t pos0 = g->pos;
+    if (!kolibri1_graph_enter_tier(g, g->layer_tier[0], T, false)) return false;
     if (!kolibri1_graph_stage_inputs(g, m, w, tokens, T)) return false;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        kolibri1_prof_mark(il ? kolibri1_prof_experts : -1);
+        ok = kolibri1_graph_enter_tier(g, g->layer_tier[il], T, true);
+        kolibri1_prof_mark(kolibri1_prof_hop);
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
                                                          l->attn_norm->abs_offset,
                                                          DS4_N_EMBD, T, DS4_RMS_EPS);
@@ -61364,6 +61700,7 @@ static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_m
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->R, m->map, m->size,
                                                          l->ffn_norm->abs_offset,
                                                          DS4_N_EMBD, T, DS4_RMS_EPS);
+        kolibri1_prof_mark(kolibri1_prof_attn);
         if (ok) ok = kolibri1_graph_moe(g, m, l, il, T);
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->x, g->moe_out, m->map, m->size,
                                                          l->post_ffn_norm->abs_offset,
@@ -61371,6 +61708,7 @@ static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_m
                      ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
     }
     /* Final norm and head on the last row; callers read one logit row. */
+    if (ok) ok = kolibri1_graph_enter_tier(g, g->head_tier, T, true);
     if (ok) {
         ds4_gpu_tensor *last_R = ds4_gpu_tensor_view(g->R, (uint64_t)(T - 1u) * DS4_N_EMBD * sizeof(float),
                                                      (uint64_t)DS4_N_EMBD * sizeof(float));
@@ -61384,6 +61722,8 @@ static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_m
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, DS4_N_VOCAB * sizeof(float)) != 0;
     }
+    kolibri1_prof_mark(kolibri1_prof_head);
+    if (T == 1) kolibri1_prof_token();
     if (ok) g->pos += T;
     return ok;
 }
@@ -61853,6 +62193,19 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
  *
  * Visible in both GPU and DS4_NO_GPU builds. */
 static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
+#ifdef DS4_HAS_KOLIBRI1_GPU
+    if (ds4_model_is_kolibri1()) {
+        /* Every device in use holds one set of the graph's transients; the
+         * K/V rows are priced per layer in engine_compute_entry_bytes. */
+        const int ctx = e && e->placement_ctx_hint > 0 ?
+            e->placement_ctx_hint : 4096;
+        const ds4_context_memory mem = ds4_context_memory_estimate_with_prefill(
+                DS4_BACKEND_CUDA, ctx, e ? e->prefill_chunk : 0);
+        const size_t bytes = mem.scratch_bytes > SIZE_MAX ?
+            SIZE_MAX : (size_t)mem.scratch_bytes;
+        return engine_size_mul_sat(bytes, engine_placement_session_count(e));
+    }
+#endif
     if (ds4_model_is_qwen4()) {
         /* Qwen currently uses one device and independent session workspaces.
          * Reserve its whole graph here, not DeepSeek's per-layer KV layout. */
@@ -72003,6 +72356,43 @@ static bool engine_cuda_tp_decode_requested(const ds4_engine *e);
 static bool engine_cuda_tp_ep_requested(const ds4_engine *e);
 static bool engine_cuda_tp_output_env_requested(void);
 
+/* Kolibri-1 tensors that take no device memory and no placement budget: the
+ * embedding matrix, because token embeddings are staged on the host
+ * (kolibri1_graph_stage_inputs), and under SSD streaming the routed experts,
+ * which reach a device through its expert cache only. */
+static bool engine_tensor_stays_on_host(const ds4_engine *e, const ds4_tensor *t) {
+    bool on_host = false;
+    if (ds4_model_is_kolibri1()) {
+        on_host = t == e->weights.token_embd;
+        for (uint32_t il = 0; il < DS4_N_LAYER && !on_host && e->ssd_streaming; il++) {
+            const ds4_layer_weights *l = &e->weights.layer[il];
+            on_host = t == l->ffn_gate_exps || t == l->ffn_up_exps || t == l->ffn_down_exps;
+        }
+    }
+    return on_host;
+}
+
+/* Kolibri-1 under SSD streaming: the resident weights are small, so the
+ * packer would put every layer on the first device and leave the others'
+ * memory, and with it their expert caches, unused.  Spread the layers in
+ * proportion to the device budgets instead; the head follows the last layer. */
+static void engine_spread_streamed_layers(ds4_engine *e) {
+    const int n = e->gpu_cfg.n_gpus;
+    uint64_t total = 0;
+    for (int d = 0; d < n; d++) total += e->gpu_cfg.vram_bytes[d];
+    if (n > 1 && total != 0) {
+        uint64_t below = 0;
+        uint32_t il = 0;
+        for (int d = 0; d < n; d++) {
+            below += e->gpu_cfg.vram_bytes[d];
+            const uint32_t end = d == n - 1 ? DS4_N_LAYER : (uint32_t)((double)below / (double)total * DS4_N_LAYER + 0.5);
+            for (; il < end && il < DS4_N_LAYER; il++) e->placement[il + 1] = d;
+        }
+        e->placement[0] = e->placement[1];
+        e->placement[DS4_N_LAYER + 1] = e->placement[DS4_N_LAYER];
+    }
+}
+
 /* Compute per-entry byte footprint estimates. Walks the tensor table once
  * and adds each tensor's bytes to its entry bucket. Also adds a per-layer
  * KV/scratch estimate so the packer's budget math reflects runtime
@@ -72015,6 +72405,7 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0 || t == e->model.ngram_tensor) continue;
+        if (engine_tensor_stays_on_host(e, t)) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= n_entries) entry = 0;
         if (cuda_tp_ep && engine_cuda_tp_output_env_requested() &&
@@ -72040,6 +72431,25 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
             SIZE_MAX : out[0] + e->vision_model.size;
         return 0;
     }
+#ifdef DS4_HAS_KOLIBRI1_GPU
+    if (ds4_model_is_kolibri1()) {
+        /* K/V rows live with their layer, as kolibri1_graph_alloc sizes them:
+         * one per position on full layers, the sliding ring elsewhere. */
+        const uint32_t ctx = e->placement_ctx_hint > 0 ? (uint32_t)e->placement_ctx_hint : 4096u;
+        const uint32_t chunk = e->prefill_chunk && e->prefill_chunk < ctx ?
+            e->prefill_chunk : kolibri1_prefill_chunk_tokens(ctx);
+        const uint64_t slide_rows = (uint64_t)DS4_N_SWA + chunk < ctx ? (uint64_t)DS4_N_SWA + chunk : ctx;
+        const uint64_t kv_row = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            const uint64_t rows = ds4_kolibri1_layer_is_full(il) ? ctx : slide_rows;
+            const size_t cache_bytes = engine_size_mul_sat((size_t)(rows * kv_row * 2u),
+                                                           engine_placement_session_count(e));
+            out[il + 1] = out[il + 1] > SIZE_MAX - cache_bytes ?
+                SIZE_MAX : out[il + 1] + cache_bytes;
+        }
+        return 0;
+    }
+#endif
 
     /* Per-layer KV estimate. The CTX hint is plumbed from the CLI
      * (--ctx, --ctx-max, etc.) so the packer accounts for the actual
@@ -72394,6 +72804,13 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     }
     e->n_placement_entries = DS4_N_LAYER + 2;
     engine_adjust_output_head_for_cuda_tp(e, entry_bytes);
+    /* DS4_KOLIBRI1_SPREAD_LAYERS forces the spread for resident experts too,
+     * which lets a model that fits one device exercise the device hops. */
+    if (ds4_model_is_kolibri1() && (e->ssd_streaming || getenv("DS4_KOLIBRI1_SPREAD_LAYERS"))) {
+        bool on_devices = true;
+        for (int i = 0; i < e->n_placement_entries; i++) on_devices = on_devices && e->placement[i] != DS4_LAYER_PACK_CPU;
+        if (on_devices) engine_spread_streamed_layers(e);
+    }
 
     int first_tier = e->placement[0];
     int multi_tier = 0;
@@ -72517,6 +72934,7 @@ static int engine_install_per_device_caches(ds4_engine *e) {
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0) continue;
+        if (engine_tensor_stays_on_host(e, t)) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
         int logical_tier = e->placement[entry];
@@ -73395,22 +73813,29 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     config_validate_model(&e->model);
     if (ds4_model_is_kolibri1() && !opt->inspect_only) {
-        /* The Kolibri-1 graph runs the plain decoder stack on one Metal or
-         * CUDA device; tensor parallelism and the other execution modes stay
-         * reserved until their graphs exist. */
+        /* The Kolibri-1 graph runs the plain decoder stack on one Metal
+         * device or on CUDA, there with its layers placed across the
+         * configured devices; tensor parallelism and the other execution
+         * modes stay reserved until their graphs exist. */
         const bool backend_ok =
 #ifdef DS4_HAS_KOLIBRI1_GPU
             e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
 #endif
             e->backend == DS4_BACKEND_CPU;
+        const bool kolibri_streaming_ok =
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+            e->backend == DS4_BACKEND_CUDA ||
+#endif
+            e->backend == DS4_BACKEND_METAL;
         if (!backend_ok || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
-            opt->cuda_tensor_parallel || (gpu_cfg && gpu_cfg->n_gpus > 1) || load_slice ||
-            (e->ssd_streaming && e->backend != DS4_BACKEND_METAL) || opt->dspark ||
+            opt->cuda_tensor_parallel ||
+            (gpu_cfg && gpu_cfg->n_gpus > 1 && e->backend != DS4_BACKEND_CUDA) || load_slice ||
+            (e->ssd_streaming && !kolibri_streaming_ok) || opt->dspark ||
             e->power_percent != 100 || opt->first_token_test ||
             (opt->mtp_path && opt->mtp_path[0]) || opt->vision_path) {
-            fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference, Metal or one CUDA device; "
-                            "tensor parallelism, pipeline execution, SSD streaming off Metal, "
-                            "DSpark, MTP models and vision are not supported\n");
+            fprintf(stderr, "ds4: Kolibri-1 runs on the CPU reference, Metal or CUDA devices; "
+                            "tensor parallelism, pipeline execution, SSD streaming on the CPU reference "
+                            "or ROCm, DSpark, MTP models and vision are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -73422,19 +73847,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
             e->backend == DS4_BACKEND_METAL || e->backend == DS4_BACKEND_CUDA ||
 #endif
             (opt->first_token_test && e->backend == DS4_BACKEND_CPU);
+        const bool qwen_streaming_ok =
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+            e->backend == DS4_BACKEND_CUDA;
+#else
+            false;
+#endif
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark ||
+            (e->ssd_streaming && !qwen_streaming_ok) || opt->dspark ||
             (e->power_percent != 100 && e->backend != DS4_BACKEND_METAL) ||
             (opt->mtp_path && opt->mtp_path[0])) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
+                            "tensor parallelism, pipeline execution, SSD streaming off CUDA, DSpark, "
                             "external MTP models and power throttling off Metal are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+#if defined(DS4_HAS_QWEN4_GPU) && defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+        if (e->ssd_streaming) {
+            g_qwen4_stream_layers = e->weights.layer;
+            g_qwen4_stream_layer_count = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+            ds4_gpu_qwen4_moe_stream_set_stats_path(opt->model_path);
+        }
+#endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         /* Qwen3.8 has no per-layer throttle of its own; --power becomes a duty
          * cycle on every Metal command batch */
@@ -73874,7 +74312,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
+    /* Kolibri-1 keeps one expert cache per device; the other graphs' cache
+     * belongs to a single device. */
+    if (e->ssd_streaming && e->multi_tier && !ds4_model_is_kolibri1()) {
         fprintf(stderr,
                 "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
         ds4_engine_close(e);
@@ -74068,6 +74508,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
 #endif
             (void)ds4_gpu_set_model_fd(e->model.fd);
+            /* Kolibri-1 is the one multi-tier graph that streams experts. */
+            if (ds4_model_is_kolibri1()) {
+                ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+                ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+                ds4_gpu_qwen4_moe_stream_set_stats_path(opt->model_path);
+#endif
+            }
 
             if (engine_install_gpu_placement(e) != 0) {
                 ds4_engine_close(e);
@@ -76026,9 +76474,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         const ds4_kolibri1_gpu_graph *shared =
             share && arena_fits ? e->kolibri_shared_workspace : NULL;
         /* SSD streaming maps only the token embedding up front; the routed
-         * experts come through the expert cache, everything else maps here. */
-        if ((e->ssd_streaming && !metal_graph_stream_map_decode_static_all(&e->model, &e->weights)) ||
-            !kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, shared)) {
+         * experts come through the expert cache, everything else maps here.
+         * CUDA needs no mapping step: its resident weights are cached per
+         * device at placement, or on first use on a single device. */
+        if ((e->ssd_streaming && e->backend == DS4_BACKEND_METAL &&
+             !metal_graph_stream_map_decode_static_all(&e->model, &e->weights)) ||
+            !kolibri1_graph_alloc(&s->kolibri_gpu, &e->weights, (uint32_t)ctx_size, cap_tokens, shared,
+                                  e->multi_tier ? e->placement : NULL, e->gpu_cfg.n_gpus)) {
             free(s);
             return 1;
         }

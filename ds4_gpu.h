@@ -425,16 +425,58 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected);
-#ifdef __APPLE__
+#if defined(__APPLE__) || !defined(DS4_ROCM_BUILD)
 /* SSD streaming for the per-token Qwen MoE kernels (Kolibri-1): stages the
  * layer's selected experts in the expert cache, ending and reopening the
  * active command batch to read `selected`; until _end the MoE mid/down
- * wrappers read routed experts through the cache's address tables. A no-op
- * when SSD streaming is off. */
+ * wrappers read routed experts through the cache's address tables (Metal) or
+ * the current device's slot arena (CUDA). A no-op when SSD streaming is off. */
+#define DS4_HAS_QWEN4_MOE_STREAM 1
 int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table *table,
                                    const ds4_gpu_tensor *selected,
                                    uint32_t n_tokens, uint32_t n_slots);
 void ds4_gpu_qwen4_moe_stream_end(void);
+#ifndef __APPLE__
+/* CUDA: lets the expert cache evaluate experts it holds in host memory on
+ * the CPU instead of moving them to a device. quantize turns n activations
+ * into the Q8_K form the row kernels take, xq_block_bytes per 256 of them;
+ * rows writes the dot of each of a range of quantized weight rows with it. */
+typedef void (*ds4_gpu_moe_cpu_quantize_fn)(const float *x, void *xq, uint32_t n);
+typedef void (*ds4_gpu_moe_cpu_rows_fn)(uint32_t type, const void *rows, uint64_t row_bytes,
+                                        uint32_t in_dim, uint32_t first_row, uint32_t end_row,
+                                        const void *xq, float *out);
+void ds4_gpu_qwen4_moe_stream_set_cpu(ds4_gpu_moe_cpu_quantize_fn quantize,
+                                      ds4_gpu_moe_cpu_rows_fn rows, uint32_t xq_block_bytes);
+/* CUDA: names the layer input, width floats per token, that the mid kernel
+ * after the next _begin will read, so _begin can fetch it for a second
+ * device or the CPU in the wait it makes anyway. Optional. */
+void ds4_gpu_qwen4_moe_stream_input(const ds4_gpu_tensor *x, uint32_t width);
+/* CUDA: the model file the expert use counts belong to. They are read from
+ * and, at exit, written to <model_path>.expert-uses, and decide which experts
+ * a device is given at load. */
+void ds4_gpu_qwen4_moe_stream_set_stats_path(const char *model_path);
+/* CUDA: brings all of one layer's routed experts to the device for a large
+ * batch, so the tiled expert kernels can run on a streamed layer; they read
+ * it until _end. Returns 1 when the layer is there, 0 when streaming is off
+ * or the device has no room, in which case the caller keeps the slot path. */
+int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table *table);
+/* CUDA, for a graph that keeps the shared expert as the last of n_slots + 1
+ * slots and has no expert list tensors: fills mid and part for a whole batch
+ * as the slot kernels would, with the routed experts through the tiled
+ * kernels on a layer brought in whole. 1: done, 0: use the slot path, -1: failed. */
+int ds4_gpu_qwen4_moe_stream_layer_run(const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, ds4_gpu_tensor *part, const ds4_gpu_tensor *selected,
+        const void *model_map, uint64_t model_size, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, uint32_t gate_type, uint32_t down_type,
+        uint64_t shared_gate_offset, uint64_t shared_up_offset, uint64_t shared_down_offset,
+        uint32_t shared_type);
+/* CUDA, after the tiled kernels of such a layer: keeps its most used experts
+ * in the expert cache. counts is the per-expert row count of the batch. */
+int ds4_gpu_qwen4_moe_stream_layer_keep(const ds4_gpu_stream_expert_table *table,
+                                        const ds4_gpu_tensor *counts);
+#endif
+#endif
+#ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and
  * the caller retries synchronously). */

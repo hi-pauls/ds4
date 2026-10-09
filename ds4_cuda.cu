@@ -20,6 +20,12 @@
 #include <pthread.h>
 #include <atomic>
 #include "ds4_linux_memory.h"
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -33773,6 +33779,46 @@ extern "C" void ds4_gpu_stream_expert_cache_set_hotness_prior(const double *, ui
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_selected_cache_release();
+}
+
+/* Resident-set introspection, single eviction and the predicted-expert
+ * readahead exist for the Metal cache only.  The CUDA cache reports nothing
+ * resident, which makes the conversation cache store no expert set and the
+ * decode loop skip its readahead: both are optimizations. */
+typedef struct {
+    uint16_t layer;
+    uint16_t expert;
+    uint32_t priority;
+} ds4_stream_expert_ref;
+
+extern "C" uint32_t ds4_gpu_stream_expert_cache_enum_residents(ds4_stream_expert_ref *, uint32_t) {
+    return 0;
+}
+
+extern "C" void ds4_gpu_stream_expert_cache_evict_one(uint32_t, uint32_t) {
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_resident(uint32_t, uint32_t) {
+    return 0;
+}
+
+extern "C" void ds4_gpu_stream_expert_cache_readahead_async(const ds4_gpu_stream_expert_table *,
+                                                            const int32_t *, uint32_t) {
+}
+
+/* The engine sizes K/V rows from this switch, and the CUDA Qwen3.8 kernels
+ * read them as half floats only: continuing would misread every row. */
+extern "C" void ds4_gpu_qwen4_set_kv_q8(bool on) {
+    if (on) {
+        fprintf(stderr, "ds4: the q8_0 Qwen3.8 K/V cache is implemented for Metal only; "
+                        "unset DS4_QWEN4_KV_Q8 for CUDA\n");
+        exit(1);
+    }
+}
+
+/* bytes of one (position, kv head) K or V row: half floats, see above */
+extern "C" uint64_t ds4_gpu_qwen4_kv_row_bytes(uint32_t head_dim) {
+    return (uint64_t)head_dim * 2u;
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
