@@ -59639,6 +59639,10 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return qwen4_graph_alloc_f32_on(-1, n);
 }
 
+/* Rows of transients a streamed graph keeps while decoding; the placement of
+ * a split graph counts with it on every backend. */
+enum { qwen4_decode_scratch_tokens = 256 };
+
 /* Bytes of the transients qwen4_graph_alloc_scratch allocates for T tokens
  * at a context of ctx_max rows, for the placement of a split graph.  Keep in
  * step with the allocation list below. */
@@ -60653,7 +60657,6 @@ static void moe_stream_cpu_register(const ds4_tensor *gate, const ds4_tensor *do
 static const ds4_layer_weights *g_qwen4_stream_layers;
 
 #if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
-enum { qwen4_decode_scratch_tokens = 256 };
 
 /* The transients again, for forwards of up to new_cap tokens.  Nothing in
  * them outlives a forward, so no content moves. */
@@ -73217,7 +73220,11 @@ static uint64_t engine_qwen4_layer_cache_bytes(uint32_t il, uint32_t ctx, uint32
 }
 
 static uint32_t engine_qwen4_prefill_chunk(const ds4_engine *e, uint32_t ctx) {
+#ifdef DS4_HAS_QWEN4_GPU
     return e->prefill_chunk && e->prefill_chunk < ctx ? e->prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
+#else
+    return e->prefill_chunk && e->prefill_chunk < ctx ? e->prefill_chunk : ctx;
+#endif
 }
 
 /* Kolibri-1 under SSD streaming: the resident weights are small, so the
@@ -73273,8 +73280,12 @@ static int engine_place_qwen4_layers(ds4_engine *e, const size_t *entry_bytes, c
      * qwen4_graph_scratch_for has shrunk those transients to a few rows: the
      * difference comes back to each device's expert cache, so the shares the
      * split balances are counted with it. */
+#ifdef DS4_HAS_QWEN4_GPU
     const uint64_t decode_rows = chunk < qwen4_decode_scratch_tokens ? chunk : qwen4_decode_scratch_tokens;
     const uint64_t reclaim = qwen4_graph_scratch_estimate(chunk, ctx) - qwen4_graph_scratch_estimate(decode_rows, ctx);
+#else
+    const uint64_t reclaim = 0;
+#endif
     int best_k = -1, best_head = -1;
     double best = -1.0;
     uint64_t prefix = entry_bytes[0];
