@@ -376,6 +376,8 @@ void ds4_convcache_free(ds4_convcache *cc) {
     for (int i = 0; i < cc->len; i++) {
         ds4_session_snapshot_free(&cc->entries[i].snap);
         free(cc->entries[i].text);
+        free(cc->entries[i].residents);
+        free(cc->entries[i].aux_blob);
     }
     free(cc->entries);
     free(cc->opt.disk_dir);
@@ -510,6 +512,7 @@ int ds4_convcache_store(ds4_convcache *cc,
     while (cc->ram_used_bytes + snap.len > cc->opt.ram_budget_bytes) {
         int v = find_lru_victim(cc, pinned_text_prefix, pinned_text_prefix_len);
         if (v < 0) {
+            free(residents);
             ds4_session_snapshot_free(&snap);
             if (err && errlen) {
                 snprintf(err, errlen,

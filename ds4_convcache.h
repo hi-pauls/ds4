@@ -11,8 +11,8 @@
  *   - Writes to disk happen only on eviction (RAM budget exhausted) or on
  *     server shutdown — not per turn, not per request.
  *
- * Entries are keyed by the SHA-1 of the rendered prompt text, matching the
- * existing kvstore convention so on-disk snapshots stay interchangeable.
+ * Disk files are named by a djb2 hash of the rendered prompt text seeded with
+ * the model key, and carry that key; lookups match on the text itself.
  *
  * Thread model: caller synchronises access. ds4-server serialises
  * generate_job on a single worker, so no locking is needed inside this
