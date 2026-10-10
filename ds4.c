@@ -7192,6 +7192,15 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     g_ds4_shape.n_layer -= DS4_N_NEXTN_PREDICT - nextn;
     g_ds4_shape.n_nextn_predict = nextn;
 
+    /* expert-pruned derivatives keep a subset of the routed experts in every layer */
+    const uint32_t n_expert = required_u32(m, "qwen4exp.expert_count");
+    if (n_expert <= DS4_N_EXPERT_USED || n_expert > DS4_N_EXPERT) {
+        fprintf(stderr, "ds4: qwen4exp.expert_count %u must exceed the %u used experts and be at most %u\n",
+                n_expert, DS4_N_EXPERT_USED, DS4_N_EXPERT);
+        exit(1);
+    }
+    g_ds4_shape.n_expert = n_expert;
+
     config_expect_u32("block_count", required_u32(m, "qwen4exp.block_count"), DS4_N_LAYER);
     config_expect_u32("attention.head_count",
                       required_u32(m, "qwen4exp.attention.head_count"), DS4_N_HEAD);
