@@ -118,4 +118,6 @@ $(OUT)/ds4_cuda.def: $(CUDA_OBJS)
 $(CUDA_DLL): $(CUDA_OBJS) $(OUT)/ds4_cuda.def
 	$(VCENV) link /nologo /DLL /OUT:$@ $(CUDA_OBJS) /DEF:$(OUT)/ds4_cuda.def /IMPLIB:$(OUT)/ds4_cuda.lib cudart.lib cublas.lib
 
+include win32/Tests.mk
+
 -include $(CORE_OBJS:.o=.d) $(wildcard $(OUT)/*.d)
