@@ -12657,7 +12657,7 @@ enum { QWEN_SPAN_NONE, QWEN_SPAN_THINK, QWEN_SPAN_TOOL };
 
 /* the marker tokens, or NULL when one of them is not a single token */
 static const qwen_span_ids *qwen_span_ids_get(ds4_engine *engine) {
-    static qwen_span_ids ids = { -1, -1, -1, -1, -1, -1 };
+    static qwen_span_ids ids;
     static bool looked_up = false, valid = false;
     if (!looked_up) {
         const char *markers[5] = { "<think>", "</think>", "<tool_response>", "</tool_response>", "<|im_start|>" };
@@ -23994,7 +23994,7 @@ static void test_json_escape_replaces_invalid_utf8(void) {
 
 static void test_qwen_span_match(void) {
     /* markers 900-903; other ids are text */
-    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905 };
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
     qwen_span_cut cuts[4];
     int n = 0, tail = 0;
     /* live: sys, reasoning, tool result of 12, answer; the prompt drops the
