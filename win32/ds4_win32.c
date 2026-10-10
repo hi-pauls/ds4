@@ -654,7 +654,17 @@ int fcntl(int fd, int cmd, ...) {
         u_long enabled = (va_arg(args, int) & O_NONBLOCK) != 0;
         if (ioctlsocket((SOCKET)fd, FIONBIO, &enabled) != 0) result = socket_failed();
         else *slot = (unsigned char)(SLOT_SOCKET | (enabled ? SLOT_NONBLOCKING : 0));
-    } else if (cmd != F_GETFD && cmd != F_SETFD && cmd != F_SETFL) {
+    } else if (cmd == F_GETFD) {
+        /* Close-on-exec here is a handle no child inherits. */
+        HANDLE handle = slot ? (HANDLE)(intptr_t)fd : (HANDLE)_get_osfhandle(fd);
+        DWORD flags = 0;
+        if (handle == INVALID_HANDLE_VALUE || !GetHandleInformation(handle, &flags)) {
+            errno = EBADF;
+            result = -1;
+        } else {
+            result = (flags & HANDLE_FLAG_INHERIT) ? 0 : FD_CLOEXEC;
+        }
+    } else if (cmd != F_SETFD && cmd != F_SETFL) {
         errno = EINVAL;
         result = -1;
     }
@@ -944,18 +954,65 @@ ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
     return result;
 }
 
-/* Read-only streams over a buffer are all the engine needs; a temporary file
- * the CRT deletes on close stands in for the buffer. */
+/* A temporary file the CRT deletes on close stands in for the buffer.  A
+ * stream opened for reading starts with the buffer's bytes; one opened for
+ * writing is remembered here and copied into its buffer by ds4_w32_fclose,
+ * with the NUL POSIX appends when there is room for it. */
+#undef fclose
+enum { fmem_slots = 16 };
+static struct { FILE *file; char *buf; size_t size; } fmem_open[fmem_slots];
+static SRWLOCK fmem_lock = SRWLOCK_INIT;
+
 FILE *fmemopen(void *buf, size_t size, const char *mode) {
     FILE *result = NULL;
-    if (!buf || !mode || mode[0] != 'r') {
+    if (!buf || !mode || (mode[0] != 'r' && mode[0] != 'w')) {
         errno = EINVAL;
     } else {
         FILE *file = tmpfile();
-        if (file && fwrite(buf, 1, size, file) == size && fseek(file, 0, SEEK_SET) == 0) result = file;
-        else if (file) fclose(file);
+        if (file && mode[0] == 'r') {
+            if (fwrite(buf, 1, size, file) == size && fseek(file, 0, SEEK_SET) == 0) result = file;
+        } else if (file) {
+            AcquireSRWLockExclusive(&fmem_lock);
+            for (int i = 0; i < fmem_slots && !result; i++) {
+                if (!fmem_open[i].file) {
+                    fmem_open[i].file = file;
+                    fmem_open[i].buf = buf;
+                    fmem_open[i].size = size;
+                    result = file;
+                }
+            }
+            ReleaseSRWLockExclusive(&fmem_lock);
+            if (!result) errno = EMFILE;
+        }
+        if (file && !result) fclose(file);
     }
     return result;
+}
+
+int ds4_w32_fclose(FILE *stream) {
+    char *buf = NULL;
+    size_t size = 0;
+    AcquireSRWLockExclusive(&fmem_lock);
+    for (int i = 0; stream && i < fmem_slots && !buf; i++) {
+        if (fmem_open[i].file == stream) {
+            buf = fmem_open[i].buf;
+            size = fmem_open[i].size;
+            fmem_open[i].file = NULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&fmem_lock);
+    int failed = 0;
+    if (buf) {
+        const long written = fflush(stream) == 0 ? ftell(stream) : -1;
+        if (written < 0 || (size_t)written > size || fseek(stream, 0, SEEK_SET) != 0 ||
+            fread(buf, 1, (size_t)written, stream) != (size_t)written) {
+            failed = 1;
+            errno = ENOSPC;
+        } else if ((size_t)written < size) {
+            buf[written] = '\0';
+        }
+    }
+    return fclose(stream) != 0 || failed ? EOF : 0;
 }
 
 time_t timegm(struct tm *tm) {

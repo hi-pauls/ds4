@@ -299,6 +299,10 @@ void *memmem(const void *haystack, size_t hlen, const void *needle, size_t nlen)
 char *strsep(char **stringp, const char *delim);
 ssize_t getline(char **lineptr, size_t *n, FILE *stream);
 FILE *fmemopen(void *buf, size_t size, const char *mode);
+/* What was written to an fmemopen stream reaches its buffer when the stream
+ * is closed, so every fclose goes through the shim. */
+int ds4_w32_fclose(FILE *stream);
+#define fclose ds4_w32_fclose
 time_t timegm(struct tm *tm);
 #ifndef localtime_r
 struct tm *ds4_w32_localtime_r(const time_t *t, struct tm *out);
