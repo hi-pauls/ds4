@@ -12636,6 +12636,16 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
  * content a client drops or prunes while the rest of the history stays. */
 typedef struct {
     int think_open, think_close, tool_open, tool_close, im_start, user;
+    /* runs of one to four newlines that are a single token each: what sits
+     * between </think> and the answer, and differs between what the model
+     * sampled and what the template renders */
+    int blank[4];
+    int n_blank;
+    /* <|im_end|>, which a session continued from a visible key does not hold
+     * between its turns: decoding stops when the model samples it, and the
+     * next turn's suffix starts behind it */
+    int im_end;
+    bool has_im_end;
 } qwen_span_ids;
 
 typedef struct {
@@ -12665,9 +12675,27 @@ static const qwen_span_ids *qwen_span_ids_get(ds4_engine *engine) {
         ids.user = t.len == 2 && t.v[0] == ids.im_start ? t.v[1] : -1;
         valid = valid && ids.user >= 0;
         ds4_tokens_free(&t);
+        const char *blanks[4] = { "\n", "\n\n", "\n\n\n", "\n\n\n\n" };
+        for (int k = 0; k < 4; k++) {
+            ds4_tokens b = {0};
+            ds4_tokenize_rendered_chat(engine, blanks[k], &b);
+            if (b.len == 1) ids.blank[ids.n_blank++] = b.v[0];
+            ds4_tokens_free(&b);
+        }
+        ds4_tokens end = {0};
+        ds4_tokenize_rendered_chat(engine, "<|im_end|>", &end);
+        ids.has_im_end = end.len == 1;
+        if (ids.has_im_end) ids.im_end = end.v[0];
+        ds4_tokens_free(&end);
         looked_up = true;
     }
     return valid ? &ids : NULL;
+}
+
+static bool qwen_span_blank(const qwen_span_ids *ids, int tok) {
+    bool blank = false;
+    for (int k = 0; k < ids->n_blank; k++) blank = blank || ids->blank[k] == tok;
+    return blank;
 }
 
 static int qwen_span_kind(const qwen_span_ids *ids, int tok, int open) {
@@ -12692,14 +12720,33 @@ static int qwen_span_find(const ds4_tokens *t, int from, int tok) {
  * On a match, cuts holds the live ranges to drop in ascending order and *tail
  * the first prompt token the session has not seen; at least one is needed for
  * fresh logits. */
+/* Where the last qwen_span_match stopped walking, for the log line that says
+ * why a session was not kept (qwen_span_reuse). */
+static int qwen_span_stopped_live, qwen_span_stopped_prompt;
+
 static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, const qwen_span_ids *ids,
                             qwen_span_cut *cuts, int max_cuts, int *n_cuts, int *tail) {
     int i = 0, j = 0, open_l = QWEN_SPAN_NONE, open_p = QWEN_SPAN_NONE, n = 0;
-    bool ok = true;
+    bool ok = true, after_think = false;
     while (ok && i < live->len && j < prompt->len) {
         if (live->v[i] == prompt->v[j]) {
+            after_think = live->v[i] == ids->think_close;
             open_l = qwen_span_kind(ids, live->v[i++], open_l);
             open_p = qwen_span_kind(ids, prompt->v[j++], open_p);
+        } else if (after_think && (qwen_span_blank(ids, live->v[i]) || qwen_span_blank(ids, prompt->v[j]))) {
+            /* The blank lines after </think> are the template's on one side
+             * and the model's on the other: two newlines sampled before a
+             * tool call come back as four.  They carry nothing, so each side
+             * drops its own run and the walk goes on behind it. */
+            if (qwen_span_blank(ids, live->v[i])) i++;
+            if (qwen_span_blank(ids, prompt->v[j])) j++;
+            after_think = false;
+        } else if (ids->has_im_end && open_l == QWEN_SPAN_NONE && open_p == QWEN_SPAN_NONE &&
+                   prompt->v[j] == ids->im_end && live->v[i] == ids->im_start) {
+            /* The end of a turn the session never evaluated (see im_end): the
+             * prompt's marker and the newline behind it have no counterpart. */
+            j++;
+            while (j < prompt->len && qwen_span_blank(ids, prompt->v[j])) j++;
         } else if (open_l != QWEN_SPAN_NONE && open_l == open_p) {
             const int close = open_l == QWEN_SPAN_THINK ? ids->think_close : ids->tool_close;
             const int close_l = qwen_span_find(live, i, close), close_p = qwen_span_find(prompt, j, close);
@@ -12724,6 +12771,8 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
             ok = false;
         }
     }
+    qwen_span_stopped_live = i;
+    qwen_span_stopped_prompt = j;
     ok = ok && i == live->len && j < prompt->len;
     *n_cuts = n;
     *tail = j;
@@ -13224,6 +13273,32 @@ static int qwen_span_reuse(server *s, server_slot *slot, const ds4_tokens *promp
             server_log(DS4_LOG_WARNING, "ds4-server: live kv cache span cut failed: %s", err);
             ds4_session_invalidate(slot->session);
         }
+    } else if (ids && live && ds4_session_checkpoint_valid(slot->session)) {
+        /* A session lost to one token is a whole conversation prefilled again,
+         * so say which token: three before the stop and five from it, each side. */
+        const int at_live = qwen_span_stopped_live, at_prompt = qwen_span_stopped_prompt;
+        buf sides[2] = {{0}, {0}};
+        for (int side = 0; side < 2; side++) {
+            const ds4_tokens *t = side ? prompt : live;
+            const int at = side ? at_prompt : at_live;
+            for (int k = at - 3; k < at + 5; k++) {
+                if (k >= 0 && k < t->len) {
+                    size_t len = 0;
+                    char *piece = ds4_token_text(s->engine, t->v[k], &len);
+                    buf_puts(&sides[side], k == at ? " >>" : " ");
+                    for (size_t c = 0; piece && c < len && c < 24; c++)
+                        buf_append(&sides[side], piece[c] == '\n' ? "~" : piece + c, 1);
+                    free(piece);
+                }
+            }
+        }
+        char *live_text = buf_take(&sides[0]), *prompt_text = buf_take(&sides[1]);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: live kv cache span mismatch at live=%d/%d prompt=%d/%d: live [%s ] prompt [%s ]",
+                   at_live, live->len, at_prompt, prompt->len, live_text ? live_text : "",
+                   prompt_text ? prompt_text : "");
+        free(live_text);
+        free(prompt_text);
     }
     return kept;
 }
@@ -13936,7 +14011,12 @@ static bool should_remember_thinking_checkpoint(const request *r,
     if ((r->has_tools || r->prompt_preserves_reasoning) && !omits_reasoning_client)
         return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
-    if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
+    if (finish && !strcmp(finish, "error")) return false;
+    /* An answer cut off at the token limit is still a frontier the client
+     * replays, minus the end-of-turn token it never reached: the Qwen and
+     * Kolibri keys can leave that token out (build_thinking_visible_text), so
+     * the next turn continues instead of prefilling the whole conversation. */
+    if (finish && !strcmp(finish, "length") && !omits_reasoning_client) return false;
     if (thinking && thinking->inside) return false;
     return true;
 }
@@ -14199,9 +14279,14 @@ static char *build_responses_visible_assistant_suffix(const request *r,
  * The next request can then continue from live KV while tokenizing only the new
  * visible suffix. */
 static char *build_thinking_visible_text(const request *r,
-                                         const char *content) {
+                                         const char *content,
+                                         bool turn_closed) {
     if (!r || !r->prompt_text) return NULL;
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+    /* turn_closed is false for an answer cut off at the token limit: the live
+     * session then ends inside the turn, and the key must too, so that the
+     * next request's suffix begins with the end-of-turn token and evaluates it. */
+    const char *turn_end = turn_closed ? "<|im_end|>\n" : "";
 
     size_t pt_len = strlen(r->prompt_text);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_KOLIBRI) {
@@ -14216,7 +14301,7 @@ static char *build_thinking_visible_text(const request *r,
         buf visible = {0};
         buf_append(&visible, r->prompt_text, pt_len);
         append_trimmed_text(&visible, content ? content : "");
-        buf_puts(&visible, "<|im_end|>\n");
+        buf_puts(&visible, turn_end);
         return buf_take(&visible);
     }
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
@@ -14229,7 +14314,7 @@ static char *build_thinking_visible_text(const request *r,
         buf_append(&visible, r->prompt_text, pt_len);
         buf_puts(&visible, "\n</think>\n\n");
         append_trimmed_text(&visible, content ? content : "");
-        buf_puts(&visible, "<|im_end|>\n");
+        buf_puts(&visible, turn_end);
         return buf_take(&visible);
     }
     const char *think_tag = "<think>";
@@ -14255,8 +14340,8 @@ static char *build_thinking_visible_text(const request *r,
 static void remember_thinking_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
-                                         bool visible_continuation) {
-    char *visible = build_thinking_visible_text(&j->req, content);
+                                         bool visible_continuation, bool turn_closed) {
+    char *visible = build_thinking_visible_text(&j->req, content, turn_closed);
     if (!visible) return;
 
     thinking_live_remember(s, slot, visible, &j->req);
@@ -16418,7 +16503,8 @@ decode_again:
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      thinking_live_continuation ||
-                                     (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE));
+                                     (disk_cache_ext_flags & KV_EXT_THINKING_VISIBLE),
+                                     !final_finish || strcmp(final_finish, "length") != 0);
     } else if (!parsed_calls.len) {
         thinking_live_clear(s, slot);
     }
@@ -20994,7 +21080,7 @@ static void test_kolibri_thinking_visible_text_matches_render(void) {
         r.think_mode = DS4_THINK_HIGH;
         r.model_syntax = SERVER_MODEL_SYNTAX_KOLIBRI;
         r.prompt_text = xstrdup(prompt_text);
-        char *visible = build_thinking_visible_text(&r, "The answer is 4.\n");
+        char *visible = build_thinking_visible_text(&r, "The answer is 4.\n", true);
         TEST_ASSERT(visible != NULL);
         chat_msgs history = {0};
         chat_msg h_user1 = {0};
@@ -21401,7 +21487,7 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         r.think_mode = DS4_THINK_HIGH;
         r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
         r.prompt_text = xstrdup(prompt_text);
-        char *visible = build_thinking_visible_text(&r, "The answer is 4.\n");
+        char *visible = build_thinking_visible_text(&r, "The answer is 4.\n", true);
         TEST_ASSERT(visible != NULL);
         chat_msgs history = {0};
         chat_msg h_user1 = {0};
@@ -24240,9 +24326,12 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
     r.prompt_preserves_reasoning = true;
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    /* cut off at the limit after the reasoning closed: still a frontier */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "length"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "error"));
     st.inside = true;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
     st.inside = false;
     r.api = API_RESPONSES;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
@@ -25101,7 +25190,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
     r.prompt_text = xstrdup(prompt_text);
-    char *visible = build_thinking_visible_text(&r, content);
+    char *visible = build_thinking_visible_text(&r, content, true);
     TEST_ASSERT(visible != NULL);
     TEST_ASSERT(!strcmp(visible, canonical.ptr));
     free(visible);
@@ -25431,7 +25520,7 @@ static void test_visible_image_key(void) {
 
     request glm = {.model_syntax = SERVER_MODEL_SYNTAX_GLM, .think_mode = DS4_THINK_HIGH,
                    .prompt_text = "<|user|>hello<|assistant|><think>"};
-    char *visible = build_thinking_visible_text(&glm, " hello ");
+    char *visible = build_thinking_visible_text(&glm, " hello ", true);
     TEST_ASSERT(!strcmp(visible, "<|user|>hello<|assistant|><think></think>hello"));
     free(visible);
 }
