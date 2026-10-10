@@ -1232,6 +1232,24 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
+/* Identity of the weights for the conversation and system-prompt disk
+ * caches, which servers of different models may share: FNV-1a over the
+ * model file's real path, size and mtime, so a variant of the same family
+ * (ds4 vs ds4-abliterated) or a file replaced in place gets its own key. */
+static uint64_t server_model_cache_key(const char *model_path) {
+    char resolved[PATH_MAX];
+    const char *path = model_path && realpath(model_path, resolved) ? resolved : model_path;
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = path ? path : ""; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+    struct stat st;
+    if (path && stat(path, &st) == 0) {
+        const uint64_t parts[2] = { (uint64_t)st.st_size, (uint64_t)st.st_mtime };
+        for (int i = 0; i < 2; i++)
+            for (int b = 0; b < 8; b++) h = (h ^ ((parts[i] >> (8 * b)) & 0xffu)) * 1099511628211ULL;
+    }
+    return h;
+}
+
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
@@ -16995,6 +17013,7 @@ int main(int argc, char **argv) {
             .ram_budget_bytes  = cfg.kv_conv_ram_mb  * 1024ULL * 1024ULL,
             .disk_budget_bytes = cfg.kv_conv_disk_mb * 1024ULL * 1024ULL,
             .disk_dir          = (char *)cfg.kv_conv_disk_dir,
+            .model_key         = server_model_cache_key(cfg.engine.model_path),
         };
         if (cco.ram_budget_bytes == 0) {
             server_log(DS4_LOG_DEFAULT,
@@ -17020,6 +17039,7 @@ int main(int argc, char **argv) {
             ds4_syscache_opt sco = {
                 .disk_budget_bytes = cfg.kv_conv_sys_disk_mb * 1024ULL * 1024ULL,
                 .disk_dir          = (char *)cfg.kv_conv_sys_disk_dir,
+                .model_key         = server_model_cache_key(cfg.engine.model_path),
             };
             if (!ds4_syscache_init(&s.syscache, &sco)) {
                 server_log(DS4_LOG_DEFAULT,

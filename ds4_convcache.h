@@ -60,6 +60,8 @@ typedef struct ds4_convcache_opt {
     uint64_t ram_budget_bytes;    /* required; 0 disables the cache entirely */
     uint64_t disk_budget_bytes;   /* 0 = no disk tier */
     char    *disk_dir;            /* owned by caller; must outlive the cache */
+    uint64_t model_key;           /* the model the KV belongs to; disk entries of
+                                     another key are never loaded */
 } ds4_convcache_opt;
 
 typedef struct ds4_convcache {

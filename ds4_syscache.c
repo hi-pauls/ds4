@@ -21,13 +21,17 @@
 #include <unistd.h>
 #include <zstd.h>
 
-#define DS4_SYSCACHE_MAGIC 0x53595343u  /* "SYSC" */
+/* Layout: [magic] [model_key u64] [text_len] [token_count] [uncompressed_len u64]
+ * [text] [ZSTD snapshot]. SYSC files carry no model key and are rejected. */
+#define DS4_SYSCACHE_MAGIC 0x53595344u  /* "SYSD" */
 #define DS4_SYSCACHE_ZSTD_LEVEL 1
 
 /* ---- hashing (djb2, same shape as convcache — fine for identity keying) ---- */
 
-static void sha_from_text(const char *text, size_t text_len, char out[41]) {
-    uint64_t h = 5381;
+/* Seeded with the model key so two models' caches of one system prompt are
+ * separate files rather than overwriting each other. */
+static void sha_from_text(uint64_t model_key, const char *text, size_t text_len, char out[41]) {
+    uint64_t h = 5381 ^ model_key;
     for (size_t i = 0; i < text_len; i++) h = ((h << 5) + h) ^ (uint8_t)text[i];
     snprintf(out, 41, "%016llx%016llx%08x",
              (unsigned long long)h,
@@ -131,7 +135,7 @@ bool ds4_syscache_has(const ds4_syscache *sc,
     if (!sc || !sc->opt.disk_dir || sc->opt.disk_budget_bytes == 0 ||
         !sys_text || sys_text_len == 0) return false;
     char sha[41];
-    sha_from_text(sys_text, sys_text_len, sha);
+    sha_from_text(sc->opt.model_key, sys_text, sys_text_len, sha);
     char *path = disk_path_for(sc, sha);
     if (!path) return false;
     struct stat st;
@@ -151,19 +155,21 @@ bool ds4_syscache_load(ds4_syscache *sc,
     if (!sc || !session || !sys_text || sys_text_len == 0) return false;
     if (sc->opt.disk_budget_bytes == 0 || !sc->opt.disk_dir) return false;
     char sha[41];
-    sha_from_text(sys_text, sys_text_len, sha);
+    sha_from_text(sc->opt.model_key, sys_text, sys_text_len, sha);
     char *path = disk_path_for(sc, sha);
     if (!path) return false;
 
     FILE *fp = fopen(path, "rb");
     if (!fp) { free(path); return false; }
     uint32_t magic = 0, text_len = 0, token_count = 0;
+    uint64_t file_model_key = 0;
     uint64_t uncompressed_len = 0;
     if (fread(&magic, sizeof(magic), 1, fp) != 1 ||
+        fread(&file_model_key, sizeof(file_model_key), 1, fp) != 1 ||
         fread(&text_len, sizeof(text_len), 1, fp) != 1 ||
         fread(&token_count, sizeof(token_count), 1, fp) != 1 ||
         fread(&uncompressed_len, sizeof(uncompressed_len), 1, fp) != 1 ||
-        magic != DS4_SYSCACHE_MAGIC ||
+        magic != DS4_SYSCACHE_MAGIC || file_model_key != sc->opt.model_key ||
         uncompressed_len == 0)
     {
         fclose(fp); free(path); return false;
@@ -312,7 +318,7 @@ bool ds4_syscache_store(ds4_syscache *sc,
     }
 
     char sha[41];
-    sha_from_text(sys_text, sys_text_len, sha);
+    sha_from_text(sc->opt.model_key, sys_text, sys_text_len, sha);
     char *path = disk_path_for(sc, sha);
     if (!path) { ds4_session_snapshot_free(&snap); return false; }
     size_t plen = strlen(path);
@@ -328,6 +334,7 @@ bool ds4_syscache_store(ds4_syscache *sc,
         uint32_t tc = (uint32_t)token_count;
         uint64_t ul = uncompressed_len;
         ok = fwrite(&magic, sizeof(magic), 1, fp) == 1 &&
+             fwrite(&sc->opt.model_key, sizeof(sc->opt.model_key), 1, fp) == 1 &&
              fwrite(&tl, sizeof(tl), 1, fp) == 1 &&
              fwrite(&tc, sizeof(tc), 1, fp) == 1 &&
              fwrite(&ul, sizeof(ul), 1, fp) == 1 &&

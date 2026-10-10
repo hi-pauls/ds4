@@ -14,16 +14,19 @@
 #include <zstd.h>
 
 /* Disk file layout for a .conv entry:
- *   [4-byte magic] [4-byte text_len] [4-byte token_count]
+ *   [4-byte magic] [8-byte model_key] [4-byte text_len] [4-byte token_count]
  *   [8-byte uncompressed_snap_len]
  *   [4-byte n_residents]
  *   [n_residents * sizeof(ds4_stream_expert_ref) bytes: residents array]
+ *   [4-byte aux_blob_len] [aux_blob_len bytes]
  *   [text_len bytes of rendered text]
  *   [ZSTD-compressed snapshot bytes to end of file]
  * The text follows the (variable-size) residents block; scan_disk_best_match
  * seeks past both header and residents to reach the text for prefix matching.
- * Magic bumped CONW -> CONX to reject old files without a residents block. */
-#define DS4_CONV_FILE_MAGIC 0x434f4e59u  /* "CONY" — + aux blob (tool_mem) */
+ * Servers of different models may share a directory: a file whose model_key
+ * differs is never loaded, and CONY files, which carry no key, are rejected. */
+#define DS4_CONV_FILE_MAGIC 0x434f4e5au  /* "CONZ" — + model_key */
+#define DS4_CONV_TOKEN_COUNT_OFFSET 16   /* magic 4 + model_key 8 + text_len 4 */
 /* Compression level: 1 is the fastest zstd preset. */
 /* Compression level: 1 is the fastest zstd preset. Empirical on ~140 MiB
  * snapshots: ~0.9s encode / ~0.4s decode / ~40% ratio — cheap enough to
@@ -126,6 +129,7 @@ static char *disk_path_for(const ds4_convcache *cc, const char *sha) {
  * The snap_ptr/snap_len are ALREADY compressed by the caller.
  * Silently swallows I/O errors — disk backing is best-effort. */
 static void write_entry_atomic(const char *path,
+                               uint64_t model_key,
                                const char *text, size_t text_len,
                                int token_count,
                                uint64_t uncompressed_len,
@@ -150,6 +154,7 @@ static void write_entry_atomic(const char *path,
         size_t resb = (size_t)nr * sizeof(ds4_stream_expert_ref);
         uint32_t ab = aux_blob ? aux_blob_len : 0u;
         bool ok = fwrite(&magic, sizeof(magic), 1, fp) == 1 &&
+                  fwrite(&model_key, sizeof(model_key), 1, fp) == 1 &&
                   fwrite(&tl,    sizeof(tl),    1, fp) == 1 &&
                   fwrite(&tc,    sizeof(tc),    1, fp) == 1 &&
                   fwrite(&ul,    sizeof(ul),    1, fp) == 1 &&
@@ -215,6 +220,7 @@ static void trim_disk_to_budget(const ds4_convcache *cc, const char *keep_path) 
  * length. Leaves the FILE* positioned just past the text (i.e. at the start
  * of the compressed snapshot bytes) if `keep_open` is non-NULL. */
 static char *read_entry_text(const char *path,
+                             uint64_t model_key,
                              size_t *text_len_out,
                              FILE **keep_open) {
     if (keep_open) *keep_open = NULL;
@@ -223,14 +229,16 @@ static char *read_entry_text(const char *path,
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
     uint32_t magic = 0, text_len = 0, token_count = 0;
+    uint64_t file_model_key = 0;
     uint64_t uncompressed_len = 0;
     uint32_t n_residents = 0;
     if (fread(&magic,           sizeof(magic),           1, fp) != 1 ||
+        fread(&file_model_key,  sizeof(file_model_key),  1, fp) != 1 ||
         fread(&text_len,        sizeof(text_len),        1, fp) != 1 ||
         fread(&token_count,     sizeof(token_count),     1, fp) != 1 ||
         fread(&uncompressed_len, sizeof(uncompressed_len), 1, fp) != 1 ||
         fread(&n_residents,     sizeof(n_residents),     1, fp) != 1 ||
-        magic != DS4_CONV_FILE_MAGIC ||
+        magic != DS4_CONV_FILE_MAGIC || file_model_key != model_key ||
         text_len == 0 || text_len > (uint32_t)(64 * 1024 * 1024))
     {
         fclose(fp);
@@ -281,7 +289,8 @@ static void evict_entry(ds4_convcache *cc, int i, bool write_to_disk) {
     if (write_to_disk && cc->opt.disk_budget_bytes > 0 && cc->opt.disk_dir) {
         char *path = disk_path_for(cc, e->sha);
         if (path) {
-            write_entry_atomic(path, e->text, e->text_len, e->token_count,
+            write_entry_atomic(path, cc->opt.model_key,
+                               e->text, e->text_len, e->token_count,
                                e->uncompressed_len,
                                e->residents, e->residents_len,
                                e->aux_blob, e->aux_blob_len,
@@ -352,6 +361,7 @@ bool ds4_convcache_init(ds4_convcache *cc, const ds4_convcache_opt *opt) {
     if (opt->ram_budget_bytes == 0) return false;
     cc->opt.ram_budget_bytes = opt->ram_budget_bytes;
     cc->opt.disk_budget_bytes = opt->disk_budget_bytes;
+    cc->opt.model_key = opt->model_key;
     if (opt->disk_dir) {
         cc->opt.disk_dir = strdup(opt->disk_dir);
         if (!cc->opt.disk_dir) return false;
@@ -423,9 +433,10 @@ int ds4_convcache_store(ds4_convcache *cc,
     /* Entry SHA — used only for the disk-backed filename. We store a short
      * printable-hex digest based on a djb2 hash; a cryptographic SHA isn't
      * required for cache identity because the RAM lookup path uses direct
-     * byte-prefix comparison on the stored text. */
+     * byte-prefix comparison on the stored text. Seeding it with the model
+     * key keeps two models' copies of one conversation in separate files. */
     char sha[41] = {0};
-    uint64_t h = 5381;
+    uint64_t h = 5381 ^ cc->opt.model_key;
     for (size_t i = 0; i < text_len; i++) h = ((h << 5) + h) ^ (uint8_t)text[i];
     snprintf(sha, sizeof(sha), "%016llx%016llx%08x",
              (unsigned long long)h,
@@ -474,7 +485,7 @@ int ds4_convcache_store(ds4_convcache *cc,
         if (cc->opt.disk_budget_bytes > 0 && cc->opt.disk_dir) {
             char *path = disk_path_for(cc, sha);
             if (path) {
-                write_entry_atomic(path, text, text_len, token_count,
+                write_entry_atomic(path, cc->opt.model_key, text, text_len, token_count,
                                    uncompressed_len,
                                    residents, residents_len,
                                    aux_blob, aux_blob_len,
@@ -652,13 +663,11 @@ static char *scan_disk_best_match(const ds4_convcache *cc,
         snprintf(path, path_len, "%s/%s", cc->opt.disk_dir, name);
         FILE *fp = NULL;
         size_t text_len = 0;
-        char *text = read_entry_text(path, &text_len, &fp);
+        char *text = read_entry_text(path, cc->opt.model_key, &text_len, &fp);
         if (!text) { free(path); continue; }
-        /* Recover token_count from the header — token_count lives at fixed
-         * offset 8 (magic 4 + text_len 4). */
         int token_count = 0;
         long saved = ftell(fp);
-        if (fseeko(fp, 8, SEEK_SET) == 0) {
+        if (fseeko(fp, DS4_CONV_TOKEN_COUNT_OFFSET, SEEK_SET) == 0) {
             uint32_t tc = 0;
             if (fread(&tc, sizeof(tc), 1, fp) == 1) token_count = (int)tc;
         }
@@ -713,14 +722,16 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
     FILE *fp = fopen(path, "rb");
     if (!fp) { free(path); return false; }
     uint32_t magic = 0, text_len = 0, token_count = 0;
+    uint64_t file_model_key = 0;
     uint64_t uncompressed_len = 0;
     uint32_t n_residents = 0;
     if (fread(&magic,            sizeof(magic),            1, fp) != 1 ||
+        fread(&file_model_key,   sizeof(file_model_key),   1, fp) != 1 ||
         fread(&text_len,         sizeof(text_len),         1, fp) != 1 ||
         fread(&token_count,      sizeof(token_count),      1, fp) != 1 ||
         fread(&uncompressed_len, sizeof(uncompressed_len), 1, fp) != 1 ||
         fread(&n_residents,      sizeof(n_residents),      1, fp) != 1 ||
-        magic != DS4_CONV_FILE_MAGIC ||
+        magic != DS4_CONV_FILE_MAGIC || file_model_key != cc->opt.model_key ||
         uncompressed_len == 0)
     {
         fclose(fp); free(path); return false;
@@ -827,7 +838,8 @@ void ds4_convcache_flush_to_disk(ds4_convcache *cc) {
         ds4_convcache_entry *e = &cc->entries[i];
         char *path = disk_path_for(cc, e->sha);
         if (!path) continue;
-        write_entry_atomic(path, e->text, e->text_len, e->token_count,
+        write_entry_atomic(path, cc->opt.model_key,
+                           e->text, e->text_len, e->token_count,
                            e->uncompressed_len,
                            e->residents, e->residents_len,
                            e->aux_blob, e->aux_blob_len,

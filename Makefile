@@ -1013,6 +1013,13 @@ tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-ngrams: tests/test_qwen4_ngrams
 	./tests/test_qwen4_ngrams
 
+tests/test_cache_model_key: tests/test_cache_model_key.c ds4_convcache.c ds4_convcache.h ds4_syscache.c ds4_syscache.h
+	$(CC) $(CFLAGS) -o $@ tests/test_cache_model_key.c ds4_convcache.c ds4_syscache.c $(ZSTD_LDLIBS)
+
+.PHONY: test-cache-model-key
+test-cache-model-key: tests/test_cache_model_key
+	./tests/test_cache_model_key
+
 tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
