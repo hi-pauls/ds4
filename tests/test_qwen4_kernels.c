@@ -863,6 +863,29 @@ static void test_idx_select(uint32_t T, uint32_t n, uint32_t k, uint32_t visible
     free(order); free(got); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gs); free(sc);
 }
 
+/* the attention tests run again with the K/V cache as q8_0 */
+static bool g_test_kv_q8 = false;
+
+/* q8_0 cache rows (D int8 values, then D/32 half scales) of half rows */
+static uint8_t *kv_rows_q8(const _Float16 *kv, uint64_t rows, uint32_t D) {
+    const uint64_t rb = D + D / 16;
+    uint8_t *out = malloc(rows * rb);
+    require_ok(out != NULL, "q8 cache allocation");
+    for (uint64_t r = 0; r < rows; r++) {
+        int8_t *q = (int8_t *)(out + r * rb);
+        uint16_t *scale = (uint16_t *)(out + r * rb + D);
+        for (uint32_t b = 0; b < D / 32; b++) {
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < 32; i++) amax = fmaxf(amax, fabsf((float)kv[r * D + b * 32 + i]));
+            scale[b] = f32_to_f16(amax / 127.0f);
+            const float d = f16_to_f32(scale[b]), id = d > 0 ? 1.0f / d : 0.0f;
+            for (uint32_t i = 0; i < 32; i++)
+                q[b * 32 + i] = (int8_t)fminf(fmaxf(roundf((float)kv[r * D + b * 32 + i] * id), -127.0f), 127.0f);
+        }
+    }
+    return out;
+}
+
 /* Prefill and split attention against scalar attention on the same inputs. */
 static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k_blocks, uint32_t H, bool split) {
     const uint32_t Hkv = 2, D = 256, ratio = 4, sel_stride = k_blocks * ratio + ratio;
@@ -871,6 +894,13 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     float *q = rand_vec(qn, 1.0f), *gate = rand_vec(qn, 2.0f);
     _Float16 *kc = malloc(kvn * 2), *vc = malloc(kvn * 2);
     for (uint64_t i = 0; i < kvn; i++) { kc[i] = (_Float16)(frand() - 0.5f); vc[i] = (_Float16)(frand() - 0.5f); }
+    /* q8: multiples of 2^-8 with a +-127 leading each block, so the scale is
+     * exactly 2^-8 and every kernel reads the same values as the reference */
+    if (g_test_kv_q8) for (uint64_t i = 0; i < kvn; i++) {
+        const float lead = frand() < 0 ? -127.0f : 127.0f;
+        kc[i] = (_Float16)((i % 32 ? roundf(frand() * 127.0f) : lead) / 256.0f);
+        vc[i] = (_Float16)((i % 32 ? roundf(frand() * 127.0f) : -lead) / 256.0f);
+    }
     int32_t *sel = malloc((uint64_t)T * sel_stride * 4);
     uint32_t *cnt = malloc(T * 4);
     uint32_t *blocks = malloc(k_blocks * sizeof(*blocks));
@@ -911,8 +941,14 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     ds4_gpu_tensor *go_ref = upload(NULL, qn), *go_new = upload(NULL, qn);
     ds4_gpu_tensor *partial = split ? ds4_gpu_tensor_alloc((uint64_t)T*H*64*(D+2)*4) : NULL;
     require_ok(!split || partial, "attention partial allocation");
-    require_ok(gk && gv && gsel && gcnt && ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2) &&
+    require_ok(gk && gv && gsel && gcnt &&
                ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * sel_stride * 4) && ds4_gpu_tensor_write(gcnt, 0, cnt, T * 4), "attn mm setup");
+    if (g_test_kv_q8) {
+        const uint64_t rows = (uint64_t)cap * Hkv, rb = D + D / 16;
+        uint8_t *kq = kv_rows_q8(kc, rows, D), *vq = kv_rows_q8(vc, rows, D);
+        require_ok(ds4_gpu_tensor_write(gk, 0, kq, rows * rb) && ds4_gpu_tensor_write(gv, 0, vq, rows * rb), "attn mm q8 setup");
+        free(kq); free(vq);
+    } else require_ok(ds4_gpu_tensor_write(gk, 0, kc, kvn * 2) && ds4_gpu_tensor_write(gv, 0, vc, kvn * 2), "attn mm setup");
     setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
     require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_ref, gq, ggate, gk, gv, gsel, gcnt, NULL, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn reference");
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
@@ -926,7 +962,8 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
         if (fabs(ref[i]) > scale) scale = fabs(ref[i]);
     }
     char name[96];
-    snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s%s", T, H, pos0, sparse ? "sparse" : "dense", split ? " split" : "");
+    snprintf(name, sizeof(name), "attn mm T=%u H=%u pos0=%u %s%s%s", T, H, pos0, sparse ? "sparse" : "dense",
+             split ? " split" : "", g_test_kv_q8 ? " q8 kv" : "");
 #ifdef __APPLE__
     require_ok(worst <= 4e-3 * scale, name);
 #else
@@ -994,6 +1031,14 @@ static void test_attn_groups(void) {
     test_attn_mm_keys(2, 8193, true, 511, 24, true);
     test_attn_mm_keys(8, 8193, true, 511, 32, true);
     test_attn_mm_keys(2, 32769, false, 6, 24, true);
+    ds4_gpu_qwen4_set_kv_q8(true);
+    g_test_kv_q8 = true;
+    test_attn_mm_keys(32, 4093, false, 6, 24, false);
+    test_attn_mm_keys(33, 8193, true, 511, 24, false);
+    test_attn_mm_keys(33, 100, true, 6, 34, false);
+    test_attn_mm_keys(2, 8193, true, 511, 24, true);
+    ds4_gpu_qwen4_set_kv_q8(false);
+    g_test_kv_q8 = false;
 }
 #endif
 
@@ -1160,9 +1205,6 @@ static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
 /* Decode n_pos tokens one at a time through prep / block keys / scoring /
  * expand / attention and compare against a reference that recomputes the
  * selection.  k_blocks is small so the sparse path is exercised early. */
-/* the attention tests run again with the K/V cache as q8_0 */
-static bool g_test_kv_q8 = false;
-
 static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t n_rot,
                            uint32_t Hi, uint32_t Di, uint32_t k_blocks, uint32_t n_pos) {
     /* a ring shorter than the sequence, so positions wrap around it */
@@ -3959,14 +4001,16 @@ int main(void) {
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
     test_attention_rows(&arena);
+#endif
     ds4_gpu_qwen4_set_kv_q8(true);
     g_test_kv_q8 = true;
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+#ifdef __APPLE__
     test_attention_rows(&arena);
+#endif
     ds4_gpu_qwen4_set_kv_q8(false);
     g_test_kv_q8 = false;
-#endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);

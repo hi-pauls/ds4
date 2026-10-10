@@ -177,6 +177,15 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* CUDA, DS4_CUDA_DECODE_STREAM=1: brackets a single-token forward whose
+ * launches then ride a non-blocking stream per device, with the host waits
+ * on that stream (ds4_gpu_end_commands, tensor read/write, the cross-device
+ * copy).  enter returns 0 when the mode is off, and then nothing changes.
+ * flush submits the launches queued so far (DS4_CUDA_DECODE_FLUSH=0 off). */
+int  ds4_gpu_decode_stream_enter(void);
+void ds4_gpu_decode_stream_leave(void);
+int  ds4_gpu_decode_stream_active(void);
+void ds4_gpu_decode_stream_flush(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -470,10 +479,51 @@ int ds4_gpu_qwen4_moe_stream_layer_run(const ds4_gpu_stream_expert_table *table,
         uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, uint32_t gate_type, uint32_t down_type,
         uint64_t shared_gate_offset, uint64_t shared_up_offset, uint64_t shared_down_offset,
         uint32_t shared_type);
+/* CUDA: runs a large batch's routed experts on a second device, a whole
+ * layer at a time, and leaves their weighted sum per token, out_dim floats,
+ * at the start of routed on the current device. 1: done, 0: no second device
+ * or no room there, the caller runs the batch itself, -1: failed. */
+int ds4_gpu_qwen4_moe_stream_layer_remote(const ds4_gpu_stream_expert_table *table,
+        ds4_gpu_tensor *routed, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights, uint32_t n_tokens, uint32_t n_slots, uint32_t in_dim,
+        uint32_t mid_dim, uint32_t out_dim, uint32_t gate_type, uint32_t down_type);
+/* CUDA: the MoE reduce for such a sum: adds the gated shared expert and
+ * applies the residual update as ds4_gpu_qwen4_moe_reduce_tensor does. */
+int ds4_gpu_qwen4_moe_reduce_routed_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *routed,
+        const ds4_gpu_tensor *shared_gate, const ds4_gpu_tensor *shared, ds4_gpu_tensor *R,
+        const ds4_gpu_tensor *inject, uint32_t n_tokens, uint32_t dim, uint32_t n_hc);
 /* CUDA, after the tiled kernels of such a layer: keeps its most used experts
  * in the expert cache. counts is the per-expert row count of the batch. */
 int ds4_gpu_qwen4_moe_stream_layer_keep(const ds4_gpu_stream_expert_table *table,
                                         const ds4_gpu_tensor *counts);
+/* CUDA: gives the current device's expert cache back, for a caller about to
+ * need the memory for a large batch; the next single token sizes it again. */
+void ds4_gpu_qwen4_moe_stream_release(void);
+/* CUDA: with DS4_CUDA_MOE_STREAM_KEEPALIVE set, leaves a small load on the
+ * current device so that it holds its clocks while the caller works elsewhere. */
+void ds4_gpu_qwen4_moe_stream_keep_awake(void);
+/* CUDA: how many bytes on the current device the caller will free before the
+ * expert cache is sized, so that its size can be foreseen while they are held. */
+void ds4_gpu_qwen4_moe_stream_set_reclaim(uint64_t bytes);
+/* CUDA: the graph runs `layers` of its layers on logical tier `logical_tier`
+ * and the others elsewhere.  Each device's expert cache then shares its slots
+ * among that many layers from the first token on, and no device helps
+ * another (DS4_CUDA_MOE_STREAM_HELPER is ignored). */
+void ds4_gpu_qwen4_moe_stream_set_device_layers(int logical_tier, uint32_t layers);
+/* CUDA, DS4_KOLIBRI1_DOORBELL=1 on top of DS4_CUDA_DECODE_STREAM=1: a
+ * single-token forward's expert stages hand the selection to the host from
+ * the device and wait for its answer on the device, so a whole run of
+ * layers is queued without a host wait per layer.  begin arms it for the
+ * token and returns whether it did; service, after each layer, serves the
+ * layers that have rung; finish must come before the host waits for any
+ * stream and returns 0 when the token is to be run again without the
+ * doorbell; end follows that wait.  release lets every device wait out and
+ * belongs on every shutdown path. */
+int  ds4_gpu_qwen4_moe_doorbell_begin(void);
+int  ds4_gpu_qwen4_moe_doorbell_service(void);
+int  ds4_gpu_qwen4_moe_doorbell_finish(int ok);
+void ds4_gpu_qwen4_moe_doorbell_end(int ok);
+void ds4_gpu_qwen4_moe_doorbell_release(void);
 #endif
 #endif
 #ifdef __APPLE__
@@ -3667,6 +3717,61 @@ int ds4_gpu_kolibri_router_topk_tensor(
 int ds4_gpu_kolibri_moe_sum_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
         uint32_t n_tokens, uint32_t n_slots, uint32_t dim);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA: K/V cache rows as q8_0 (per (position, kv head): head_dim int8
+ * values, then head_dim/32 half scales) instead of f32; set before any
+ * Kolibri-1 graph is allocated. */
+void ds4_gpu_kolibri_set_kv_q8(bool on);
+/* CUDA: the same sum onto an out that already holds the shared expert's
+ * output; the part's last slot is not read. */
+int ds4_gpu_kolibri_moe_sum_onto_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t dim);
+/* CUDA decode (one row) fusions of the Kolibri-1 layer, each one launch:
+ * the three Q8_0 q/k/v projections of one quantized activation; the
+ * post-attention norm, residual add and FFN pre-norm; the MoE sum, post-FFN
+ * norm, residual add and (x non-NULL) the next pre-norm with pre_offset. */
+int ds4_gpu_kolibri_qkv_q8_0_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *k_out, ds4_gpu_tensor *v_out,
+        const void *model_map, uint64_t model_size,
+        uint64_t q_offset, uint64_t k_offset, uint64_t v_offset,
+        uint64_t in_dim, uint64_t q_dim, uint64_t kv_dim, const ds4_gpu_tensor *x);
+int ds4_gpu_kolibri_norm_add_norm_tensor(
+        ds4_gpu_tensor *x, ds4_gpu_tensor *R, const ds4_gpu_tensor *blk,
+        const void *model_map, uint64_t model_size,
+        uint64_t post_offset, uint64_t pre_offset, uint32_t n, float eps);
+int ds4_gpu_kolibri_moe_sum_norm_add_norm_tensor(
+        ds4_gpu_tensor *x, ds4_gpu_tensor *R, ds4_gpu_tensor *moe_out,
+        const ds4_gpu_tensor *part, const ds4_gpu_tensor *weights,
+        const void *model_map, uint64_t model_size,
+        uint64_t post_offset, uint64_t pre_offset,
+        uint32_t n_slots, uint32_t n, float eps);
+#endif
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* CUDA decode (one row) launches of the Qwen3.8 layer, each one kernel with
+ * the row arithmetic of the separate ones: up to five projections of one
+ * activation (q8_0/f16/f32/bf16/q4_0 rows); a projection with the hc combine
+ * of its output behind it; the grouped hc norm with the low-rank projection
+ * of xn.  Other weight types fall back to the separate launches inside. */
+int ds4_gpu_qwen4_multi_matvec_tensor(
+        const ds4_gpu_tensor *x, uint32_t in_dim, uint32_t n_weights, ds4_gpu_tensor *const *outs,
+        const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint32_t *types,
+        const uint32_t *rows);
+int ds4_gpu_qwen4_matvec_combine_tensor(
+        ds4_gpu_tensor *R, ds4_gpu_tensor *blk, const ds4_gpu_tensor *inj_part, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
+        uint32_t in_dim, uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_qwen4_hc_norm_down_tensor(
+        ds4_gpu_tensor *xn, ds4_gpu_tensor *inj_part, ds4_gpu_tensor *lo, const ds4_gpu_tensor *R,
+        const void *model_map, uint64_t model_size, uint64_t gamma_offset, uint64_t inject_offset,
+        uint32_t inject_type, uint64_t down_offset, uint32_t down_type, uint32_t n_embd, uint32_t n_hc,
+        uint32_t n_inject, uint32_t n_rank, float eps);
+/* ds4_gpu_tensor_write through a pinned slot and the legacy stream: returns
+ * before the device has the data, ordered behind the launches already
+ * issued.  Not while a decode graph is being captured. */
+int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
+#endif
 
 #ifdef __cplusplus
 }

@@ -138,6 +138,15 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
+/* DS4_CUDA_DECODE_STREAM=1 (see the decode stream section below). */
+static cudaStream_t g_decode_streams[DS4_MAX_GPUS];
+static cudaEvent_t g_decode_hop_ready[DS4_MAX_GPUS];
+static cudaEvent_t g_decode_hop_consumed[DS4_MAX_GPUS];
+static void *g_decode_hop_bounce[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static size_t g_decode_hop_bounce_bytes[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static int g_decode_stream_mode = -1;
+static int g_decode_flush_mode;
+static int g_decode_stream_active;
 
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
@@ -493,6 +502,7 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
+extern "C" void ds4_gpu_qwen4_moe_doorbell_release(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -529,8 +539,12 @@ static int cuda_aligned_q2k_enabled(void) {
 }
 
 static int cuda_aligned_q8_enabled(void) {
-    const char *s = getenv("DS4_CUDA_Q8_NO_ALIGNED");
-    return !(s && s[0] && strcmp(s, "0") != 0);
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *s = getenv("DS4_CUDA_Q8_NO_ALIGNED");
+        enabled = !(s && s[0] && strcmp(s, "0") != 0);
+    }
+    return enabled;
 }
 
 static const char *cuda_derived_weight_ptr(
@@ -542,7 +556,9 @@ static const char *cuda_derived_weight_ptr(
         uint64_t out_dim,
         uint32_t group_count,
         uint64_t bytes) {
-    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return NULL;
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL;
+    if (disabled) return NULL;
     for (const cuda_derived_range &r : g_derived_ranges) {
         if (r.host_base == model_map &&
             r.source_offset == source_offset &&
@@ -861,6 +877,9 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
+    /* The pageable cudaMemcpy may return with its DMA still queued on the
+     * legacy stream, which a decode stream does not wait for. */
+    if (g_decode_stream_active) (void)cudaDeviceSynchronize();
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
@@ -988,12 +1007,120 @@ extern "C" int ds4_gpu_decode_graphs_supported(void) {
     return enabled && g_n_gpus == 1;
 }
 
+/* ------------------------------------------------------------------------
+ * Per-device decode streams.
+ *
+ * DS4_CUDA_DECODE_STREAM=1: a single-token forward the engine brackets with
+ * ds4_gpu_decode_stream_enter/leave launches on a non-blocking stream of
+ * its own per device instead of the legacy NULL stream, which WDDM submits
+ * at a fraction of the cost per launch, and the host then waits on that
+ * stream rather than on the whole device.  Only the device of the tier the
+ * engine selected gets its stream: the expert stage's helper device keeps
+ * its explicit NULL-stream copies in order with the launches it makes
+ * there.  Synchronous copies that relied on the legacy stream ordering
+ * them behind queued launches become asynchronous ones on the decode
+ * stream followed by a wait on it.  DS4_CUDA_DECODE_FLUSH=0 keeps the
+ * per-layer cudaStreamQuery submit off, so its effect can be measured
+ * alone.  With the switch off nothing here is reached. */
+static int cuda_decode_stream_mode(void) {
+    if (g_decode_stream_mode < 0) {
+        const char *s = getenv("DS4_CUDA_DECODE_STREAM");
+        const char *f = getenv("DS4_CUDA_DECODE_FLUSH");
+        g_decode_stream_mode = s && s[0] == '1';
+        g_decode_flush_mode = g_decode_stream_mode && !(f && f[0] == '0');
+        if (g_decode_stream_mode) {
+            fprintf(stderr, "ds4: DS4_CUDA_DECODE_STREAM=1 - decode on per-device streams, per-layer flush %s\n",
+                    g_decode_flush_mode ? "on" : "off");
+        }
+    }
+    return g_decode_stream_mode;
+}
+
+/* The decode stream of the current device when it is the selected tier's,
+ * the legacy stream otherwise (a helper device, or a WITH_DEVICE scope on
+ * another tier). */
+static inline cudaStream_t cuda_decode_stream_current(void) {
+    const int tier = g_current_logical_tier;
+    int device = -1;
+    if (tier >= 0 && tier < g_n_gpus && g_decode_streams[tier] &&
+        cudaGetDevice(&device) == cudaSuccess && device == g_gpu[tier].device_id) {
+        return g_decode_streams[tier];
+    }
+    return (cudaStream_t)0;
+}
+
 /* Stream the decode-island kernels launch on.  Legacy NULL stream in
  * eager mode (unchanged behavior); the capture stream while a capture
- * or replay is in flight. */
+ * or replay is in flight; the per-device decode stream inside a bracketed
+ * decode forward (a capture then runs on that same stream). */
 static inline cudaStream_t cuda_decode_stream(void) {
     if (g_dsv41_shared.active) return g_dsv41_shared.stream;
+    if (g_decode_stream_active) return cuda_decode_stream_current();
     return g_decode_graph_capturing ? g_decode_graph_stream : (cudaStream_t)0;
+}
+
+/* The stream the decode graphs capture on and replay from: the graphs need
+ * one GPU, so inside a bracketed forward it is tier 0's decode stream. */
+static inline cudaStream_t cuda_decode_graph_stream(void) {
+    return g_decode_stream_active ? g_decode_streams[0] : g_decode_graph_stream;
+}
+
+/* What the cuBLAS handle goes back to after a capture. */
+static inline cudaStream_t cuda_cublas_eager_stream(void) {
+    return g_decode_stream_active ? g_decode_streams[0] : (cudaStream_t)NULL;
+}
+
+extern "C" int ds4_gpu_decode_stream_active(void) { return g_decode_stream_active; }
+
+extern "C" int ds4_gpu_decode_stream_enter(void) {
+    int ok = 0;
+    if (cuda_decode_stream_mode() && g_n_gpus > 0 && !g_decode_stream_active) {
+        int device = -1;
+        if (g_current_logical_tier < 0 && cudaGetDevice(&device) == cudaSuccess) {
+            for (int t = 0; t < g_n_gpus; t++) {
+                if (g_gpu[t].device_id == device) g_current_logical_tier = t;
+            }
+        }
+        if (g_current_logical_tier >= 0) {
+            /* cuBLAS rides the handle's stream, NULL by default. */
+            for (int t = 0; t < g_n_gpus; t++) {
+                (void)cublasSetStream((cublasHandle_t)g_gpu[t].cublas, g_decode_streams[t]);
+            }
+            g_decode_stream_active = 1;
+            ok = 1;
+        }
+    }
+    return ok;
+}
+
+extern "C" void ds4_gpu_decode_stream_leave(void) {
+    if (g_decode_stream_active) {
+        g_decode_stream_active = 0;
+        for (int t = 0; t < g_n_gpus; t++) {
+            (void)cublasSetStream((cublasHandle_t)g_gpu[t].cublas, NULL);
+        }
+    }
+}
+
+/* A cudaStreamQuery makes WDDM submit the launches queued so far instead
+ * of holding them until the next blocking call. */
+extern "C" void ds4_gpu_decode_stream_flush(void) {
+    if (g_decode_stream_active && g_decode_flush_mode) {
+        cudaStream_t s = cuda_decode_stream_current();
+        if (s) (void)cudaStreamQuery(s);
+    }
+}
+
+static int cuda_decode_streams_sync(const char *what) {
+    int ok = 1;
+    for (int t = 0; t < g_n_gpus; t++) {
+        if (g_decode_streams[t]) {
+            WITH_DEVICE(g_gpu[t].device_id) {
+                ok = cuda_ok(cudaStreamSynchronize(g_decode_streams[t]), what) && ok;
+            }
+        }
+    }
+    return ok;
 }
 
 static void cuda_dsv41_shared_free(void) {
@@ -1077,7 +1204,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
         return -1;
     }
     if (e->state == 2) {
-        cudaError_t err = cudaGraphLaunch(e->exec, g_decode_graph_stream);
+        cudaError_t err = cudaGraphLaunch(e->exec, cuda_decode_graph_stream());
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: decode graph replay failed (il=%u island=%u): %s\n",
                     key->il, key->island, cudaGetErrorString(err));
@@ -1090,7 +1217,7 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
         return 1;
     }
     /* state == 1: capture this encode. */
-    if (!g_decode_graph_stream) {
+    if (!g_decode_stream_active && !g_decode_graph_stream) {
         if (!cuda_ok(cudaStreamCreate(&g_decode_graph_stream),
                      "decode graph stream create")) {
             g_decode_graph_stream = NULL;
@@ -1100,11 +1227,11 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
     }
     /* cuBLAS rides the legacy NULL stream, which cannot be captured:
      * point the handle at the capture stream for the duration. */
-    (void)cublasSetStream(cuda_cublas_for_tier(0), g_decode_graph_stream);
-    if (!cuda_ok(cudaStreamBeginCapture(g_decode_graph_stream,
+    (void)cublasSetStream(cuda_cublas_for_tier(0), cuda_decode_graph_stream());
+    if (!cuda_ok(cudaStreamBeginCapture(cuda_decode_graph_stream(),
                                         cudaStreamCaptureModeGlobal),
                  "decode graph begin capture")) {
-        (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
+        (void)cublasSetStream(cuda_cublas_for_tier(0), cuda_cublas_eager_stream());
         cuda_decode_graph_entry_kill(e);
         return -1;
     }
@@ -1116,8 +1243,8 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
     if (!key || !g_decode_graph_capturing) return -1;
     g_decode_graph_capturing = 0;
     cudaGraph_t graph = NULL;
-    cudaError_t err = cudaStreamEndCapture(g_decode_graph_stream, &graph);
-    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
+    cudaError_t err = cudaStreamEndCapture(cuda_decode_graph_stream(), &graph);
+    (void)cublasSetStream(cuda_cublas_for_tier(0), cuda_cublas_eager_stream());
     cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
     if (err != cudaSuccess || graph == NULL) {
         fprintf(stderr, "ds4: decode graph capture failed (il=%u island=%u): %s\n",
@@ -1143,7 +1270,7 @@ extern "C" int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) {
     }
     /* Capture recorded the work without executing it: launch now so this
      * token's island actually runs. */
-    err = cudaGraphLaunch(exec, g_decode_graph_stream);
+    err = cudaGraphLaunch(exec, cuda_decode_graph_stream());
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: decode graph first launch failed (il=%u island=%u): %s\n",
                 key->il, key->island, cudaGetErrorString(err));
@@ -1296,9 +1423,9 @@ extern "C" void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) {
     if (!g_decode_graph_capturing) return;
     g_decode_graph_capturing = 0;
     cudaGraph_t graph = NULL;
-    (void)cudaStreamEndCapture(g_decode_graph_stream, &graph);
+    (void)cudaStreamEndCapture(cuda_decode_graph_stream(), &graph);
     if (graph) (void)cudaGraphDestroy(graph);
-    (void)cublasSetStream(cuda_cublas_for_tier(0), NULL);
+    (void)cublasSetStream(cuda_cublas_for_tier(0), cuda_cublas_eager_stream());
     (void)cudaGetLastError();
     if (key) {
         cuda_decode_graph_entry *e = cuda_decode_graph_find(key);
@@ -1664,7 +1791,9 @@ static int cuda_q8_label_is_attention_output(const char *label) {
 }
 
 static int cuda_q8_use_dp4a(void) {
-    return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    static int use_dp4a = -1;
+    if (use_dp4a < 0) use_dp4a = getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
+    return use_dp4a;
 }
 
 static unsigned cuda_q8_exact_threads(uint64_t blocks) {
@@ -2706,6 +2835,13 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming),
                       "init event")) return 0;
         c->boundary_event = (void *)ev;
+        if (cuda_decode_stream_mode() &&
+            (!cuda_ok(cudaStreamCreateWithFlags(&g_decode_streams[i], cudaStreamNonBlocking),
+                      "init decode stream") ||
+             !cuda_ok(cudaEventCreateWithFlags(&g_decode_hop_ready[i], cudaEventDisableTiming),
+                      "init decode hop event") ||
+             !cuda_ok(cudaEventCreateWithFlags(&g_decode_hop_consumed[i], cudaEventDisableTiming),
+                      "init decode hop event"))) return 0;
         /* Per-device cuBLAS handle. */
         cublasHandle_t h = NULL;
         if (!cublas_ok(cublasCreate(&h), "init cublas")) return 0;
@@ -2870,6 +3006,7 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    ds4_gpu_qwen4_moe_doorbell_release();
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
@@ -2892,6 +3029,11 @@ extern "C" void ds4_gpu_cleanup(void) {
             (void)cudaStreamDestroy((cudaStream_t)c->stream);
             c->stream = NULL;
         }
+        if (g_decode_streams[i]) (void)cudaStreamDestroy(g_decode_streams[i]);
+        if (g_decode_hop_ready[i]) (void)cudaEventDestroy(g_decode_hop_ready[i]);
+        if (g_decode_hop_consumed[i]) (void)cudaEventDestroy(g_decode_hop_consumed[i]);
+        g_decode_streams[i] = NULL;
+        g_decode_hop_ready[i] = g_decode_hop_consumed[i] = NULL;
         if (c->cublas) {
             (void)cublasDestroy((cublasHandle_t)c->cublas);
             c->cublas = NULL;
@@ -2925,8 +3067,14 @@ extern "C" void ds4_gpu_cleanup(void) {
                 g_xdev_bounce[i][j] = NULL;
                 g_xdev_bounce_bytes[i][j] = 0;
             }
+            if (g_decode_hop_bounce[i][j]) {
+                (void)cudaFreeHost(g_decode_hop_bounce[i][j]);
+                g_decode_hop_bounce[i][j] = NULL;
+                g_decode_hop_bounce_bytes[i][j] = 0;
+            }
         }
     }
+    g_decode_stream_active = 0;
     cuda_stream_selected_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
@@ -3232,9 +3380,62 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
-                                cudaMemcpyHostToDevice),
-                     "tensor write");
+        /* A synchronous cudaMemcpy orders only against the legacy stream; in
+         * decode stream mode the copy has to queue behind the launches on
+         * the decode stream, and the host wait that the synchronous form
+         * implied follows it. */
+        if (g_decode_stream_active) {
+            cudaStream_t s = cuda_decode_stream();
+            ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                         cudaMemcpyHostToDevice, s),
+                         "tensor write") &&
+                 cuda_ok(cudaStreamSynchronize(s), "tensor write wait");
+        } else {
+            ok = cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes,
+                                    cudaMemcpyHostToDevice),
+                         "tensor write");
+        }
+    }
+    return ok;
+}
+
+/* The same write without the host waiting for the stream: the bytes go to a
+ * pinned slot and the copy queues on the legacy stream behind the launches
+ * already issued (a synchronous cudaMemcpy from pageable memory first drains
+ * the stream).  An event per slot keeps a slot from being rewritten before
+ * its copy has run.  Not for use while a decode graph is being captured. */
+#define CUDA_ASYNC_WRITE_SLOTS 4u
+static struct {
+    void       *host;
+    uint64_t    cap;
+    cudaEvent_t done;
+} g_async_write[CUDA_ASYNC_WRITE_SLOTS];
+static unsigned g_async_write_next;
+
+extern "C" int ds4_gpu_tensor_write_async(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (bytes == 0) return 1;
+    int d = ds4_tensor_device_idx(tensor);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        auto &slot = g_async_write[g_async_write_next++ % CUDA_ASYNC_WRITE_SLOTS];
+        ok = !slot.done || cuda_ok(cudaEventSynchronize(slot.done), "tensor write slot");
+        if (ok && slot.cap < bytes) {
+            if (slot.host) (void)cudaFreeHost(slot.host);
+            slot.host = NULL;
+            slot.cap = 0;
+            ok = cuda_ok(cudaMallocHost(&slot.host, (size_t)bytes), "tensor write staging");
+            if (ok) slot.cap = bytes;
+        }
+        if (ok && !slot.done)
+            ok = cuda_ok(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming), "tensor write event");
+        if (ok) {
+            memcpy(slot.host, data, (size_t)bytes);
+            ok = cuda_ok(cudaMemcpyAsync((char *)tensor->ptr + offset, slot.host, (size_t)bytes,
+                                         cudaMemcpyHostToDevice, 0),
+                         "tensor write async") &&
+                 cuda_ok(cudaEventRecord(slot.done, 0), "tensor write record");
+        }
     }
     return ok;
 }
@@ -3244,9 +3445,20 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     int d = ds4_tensor_device_idx(tensor);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
-                                cudaMemcpyDeviceToHost),
-                     "tensor read");
+        if (g_decode_stream_active) {
+            /* As in ds4_gpu_tensor_write: the read must follow the launches
+             * queued on the decode stream, which only a copy on that stream
+             * and a wait on it ensure. */
+            cudaStream_t s = cuda_decode_stream();
+            ok = cuda_ok(cudaMemcpyAsync(data, (const char *)tensor->ptr + offset, (size_t)bytes,
+                                         cudaMemcpyDeviceToHost, s),
+                         "tensor read") &&
+                 cuda_ok(cudaStreamSynchronize(s), "tensor read wait");
+        } else {
+            ok = cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes,
+                                    cudaMemcpyDeviceToHost),
+                         "tensor read");
+        }
     }
     return ok;
 }
@@ -3333,6 +3545,63 @@ extern "C" int ds4_gpu_moe_handoff_pack_tensor(
     return cuda_ok(cudaGetLastError(), "moe handoff pack launch");
 }
 
+/* The cross-device copy inside a bracketed decode forward (the residual's
+ * hop between tiers): it rides the two decode streams themselves, so the
+ * source finishes its launches before the copy out and the destination's
+ * launches wait on an event behind it, with no host wait on either side.
+ * The bounce path has a pinned buffer per pair of its own, and an event
+ * recorded after the destination has read it orders the next hop's write
+ * into it, where the shared bounce buffer needs a stream synchronize. */
+static int cuda_decode_hop_copy(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+                                uint64_t bytes, int sd, int dd) {
+    cudaStream_t s = g_decode_streams[sd], s2 = g_decode_streams[dd];
+    int peer = g_gpu_peer_ok[sd][dd];
+    if (g_xdev_force_cuda_peer)   peer = 1;
+    if (g_xdev_force_host_bounce) peer = 0;
+    int ok = 1;
+    if (!peer && g_decode_hop_bounce_bytes[sd][dd] < bytes) {
+        if (g_decode_hop_bounce[sd][dd]) {
+            ok = cuda_ok(cudaStreamSynchronize(s2), "decode hop bounce drain");
+            (void)cudaFreeHost(g_decode_hop_bounce[sd][dd]);
+            g_decode_hop_bounce[sd][dd] = NULL;
+            g_decode_hop_bounce_bytes[sd][dd] = 0;
+        }
+        if (ok) ok = cuda_ok(cudaMallocHost(&g_decode_hop_bounce[sd][dd], (size_t)bytes),
+                             "decode hop bounce alloc");
+        if (ok) g_decode_hop_bounce_bytes[sd][dd] = bytes;
+    }
+    if (ok) {
+        WITH_DEVICE(g_gpu[sd].device_id) {
+            if (peer) {
+                ok = cuda_ok(cudaMemcpyPeerAsync(dst->ptr, g_gpu[dd].device_id,
+                                                 src->ptr, g_gpu[sd].device_id, bytes, s),
+                             "decode hop peer copy");
+            } else {
+                ok = cuda_ok(cudaStreamWaitEvent(s, g_decode_hop_consumed[dd], 0),
+                             "decode hop bounce reuse wait") &&
+                     cuda_ok(cudaMemcpyAsync(g_decode_hop_bounce[sd][dd], src->ptr, bytes,
+                                             cudaMemcpyDeviceToHost, s),
+                             "decode hop bounce d2h");
+            }
+            if (ok) ok = cuda_ok(cudaEventRecord(g_decode_hop_ready[sd], s), "decode hop ready record");
+        }
+    }
+    if (ok) {
+        WITH_DEVICE(g_gpu[dd].device_id) {
+            ok = cuda_ok(cudaStreamWaitEvent(s2, g_decode_hop_ready[sd], 0), "decode hop dst wait");
+            if (ok && !peer) {
+                ok = cuda_ok(cudaMemcpyAsync(dst->ptr, g_decode_hop_bounce[sd][dd], bytes,
+                                             cudaMemcpyHostToDevice, s2),
+                             "decode hop bounce h2d") &&
+                     cuda_ok(cudaEventRecord(g_decode_hop_consumed[dd], s2),
+                             "decode hop consumed record");
+            }
+            if (ok && g_xdev_sync_debug) ok = cuda_ok(cudaStreamSynchronize(s2), "decode hop sync");
+        }
+    }
+    return ok;
+}
+
 /* Cross-device copy primitive. Path selection (highest priority first):
  *   DS4_FORCE_HOST_BOUNCE=1  -> always pinned-host bounce
  *   DS4_FORCE_CUDA_PEER=1    -> always cudaMemcpyPeerAsync (manual-testing
@@ -3353,7 +3622,8 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
     if (sd == dd) {
         int ok = 0;
         WITH_DEVICE(g_gpu[sd].device_id) {
-            cudaStream_t s = (cudaStream_t)g_gpu[sd].stream;
+            cudaStream_t s = g_decode_stream_active ? g_decode_streams[sd]
+                                                    : (cudaStream_t)g_gpu[sd].stream;
             ok = cuda_ok(cudaMemcpyAsync(dst->ptr, src->ptr, bytes,
                                          cudaMemcpyDeviceToDevice, s),
                           "xdev same-device copy");
@@ -3363,6 +3633,7 @@ static int ds4_gpu_tensor_copy_xdev_impl(ds4_gpu_tensor *dst,
         }
         return ok;
     }
+    if (g_decode_stream_active) return cuda_decode_hop_copy(dst, src, bytes, sd, dd);
 
     int peer = g_gpu_peer_ok[sd][dd];
     if (g_xdev_force_cuda_peer)   peer = 1;
@@ -3792,6 +4063,9 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) {
+    if (g_decode_stream_active) {
+        return cuda_decode_streams_sync("end commands decode stream");
+    }
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");
     }
@@ -15187,6 +15461,115 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
+/* Three Q8_0 projections of one quantized row in a single launch: a warp per
+ * output row, rows [0, q_dim) from wq, then kv_dim rows each from wk and wv.
+ * The row arithmetic is that of matmul_q8_0_preq_warp8_kernel. */
+__global__ static void matmul_q8_0_preq_warp8_qkv_kernel(
+        float *q_out,
+        float *k_out,
+        float *v_out,
+        const unsigned char *wq,
+        const unsigned char *wk,
+        const unsigned char *wv,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t q_dim,
+        uint64_t kv_dim,
+        uint64_t blocks,
+        int use_dp4a) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= q_dim + 2u * kv_dim) return;
+    const unsigned char *w = wq;
+    float *out = q_out;
+    if (row >= q_dim) {
+        row -= q_dim;
+        if (row >= kv_dim) {
+            row -= kv_dim;
+            w = wv;
+            out = v_out;
+        } else {
+            w = wk;
+            out = k_out;
+        }
+    }
+    const unsigned char *wr = w + row * blocks * 34;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        const int8_t *xqb = xq + b * 32;
+        int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+        acc += __half2float(*scale_h) * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+/* Kolibri-1 decode q/k/v: the activation is quantized once for the three
+ * weights instead of once per projection, then matmul_q8_0_preq_warp8_qkv_kernel
+ * covers all three.  This is the single-token path of
+ * cuda_matmul_q8_0_tensor_labeled without its aligned-weight and GEMM tiers,
+ * which Kolibri's shapes never take. */
+extern "C" int ds4_gpu_kolibri_qkv_q8_0_tensor(
+        ds4_gpu_tensor *q_out,
+        ds4_gpu_tensor *k_out,
+        ds4_gpu_tensor *v_out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t q_offset,
+        uint64_t k_offset,
+        uint64_t v_offset,
+        uint64_t in_dim,
+        uint64_t q_dim,
+        uint64_t kv_dim,
+        const ds4_gpu_tensor *x) {
+    if (!q_out || !k_out || !v_out || !x || !model_map || in_dim == 0 || q_dim == 0 || kv_dim == 0) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    if (q_dim > UINT64_MAX / row_bytes || kv_dim > UINT64_MAX / row_bytes ||
+        q_dim + 2u * kv_dim > UINT32_MAX) return 0;
+    const uint64_t q_bytes = q_dim * row_bytes, kv_bytes = kv_dim * row_bytes;
+    if (q_offset > model_size || k_offset > model_size || v_offset > model_size ||
+        q_bytes > model_size - q_offset || kv_bytes > model_size - k_offset ||
+        kv_bytes > model_size - v_offset) return 0;
+    if (x->bytes < in_dim * sizeof(float) || q_out->bytes < q_dim * sizeof(float) ||
+        k_out->bytes < kv_dim * sizeof(float) || v_out->bytes < kv_dim * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(q_out);
+    const char *wq = cuda_resolve_weight_ptr(model_map, q_offset, q_bytes, logical_tier, "q8_0");
+    const char *wk = cuda_resolve_weight_ptr(model_map, k_offset, kv_bytes, logical_tier, "q8_0");
+    const char *wv = cuda_resolve_weight_ptr(model_map, v_offset, kv_bytes, logical_tier, "q8_0");
+    if (!wq || !wk || !wv) return 0;
+    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    void *tmp = cuda_tmp_alloc_on(logical_tier, scale_offset + blocks * sizeof(float), "q8_0 prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    quantize_q8_0_f32_kernel<<<dim3((unsigned)blocks, 1, 1), 32, 0, cuda_decode_stream()>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "kolibri qkv q8_0 quantize launch")) return 0;
+    const unsigned rows = (unsigned)(q_dim + 2u * kv_dim);
+    matmul_q8_0_preq_warp8_qkv_kernel<<<(rows + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
+            (float *)q_out->ptr,
+            (float *)k_out->ptr,
+            (float *)v_out->ptr,
+            reinterpret_cast<const unsigned char *>(wq),
+            reinterpret_cast<const unsigned char *>(wk),
+            reinterpret_cast<const unsigned char *>(wv),
+            xq,
+            xscale,
+            in_dim,
+            q_dim,
+            kv_dim,
+            blocks,
+            cuda_q8_use_dp4a());
+    return cuda_ok(cudaGetLastError(), "kolibri qkv q8_0 warp launch");
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *values,
@@ -15983,17 +16366,35 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
-    const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+    /* Every dense projection of a decode step passes here; the switches are
+     * read once. */
+    static int env_read = 0;
+    static int env_serial_f16, env_serial_router, env_no_ordered, env_small_out, env_no_small_out,
+               env_small_batch, env_no_small_batch, env_no_cublas_one, env_cublas_one, env_no_cublas_batch;
+    if (!env_read) {
+        env_serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
+        env_serial_router = getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+        env_no_ordered = getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") != NULL;
+        env_small_out = getenv("DS4_CUDA_F16_SMALL_OUT") != NULL;
+        env_no_small_out = getenv("DS4_CUDA_NO_F16_SMALL_OUT") != NULL;
+        env_small_batch = getenv("DS4_CUDA_F16_SMALL_BATCH") != NULL;
+        env_no_small_batch = getenv("DS4_CUDA_NO_F16_SMALL_BATCH") != NULL;
+        env_no_cublas_one = getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") != NULL;
+        env_cublas_one = getenv("DS4_CUDA_F16_CUBLAS_ONE") != NULL;
+        env_no_cublas_batch = getenv("DS4_CUDA_NO_F16_CUBLAS_BATCH") != NULL;
+        env_read = 1;
+    }
+    const int serial_f16 = env_serial_f16;
     const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
     const int serial_router =
         !serial_f16 &&
         router_shape &&
-        getenv("DS4_CUDA_SERIAL_ROUTER") != NULL;
+        env_serial_router;
     const int ordered_router =
         !serial_f16 &&
         !serial_router &&
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL;
+        !env_no_ordered;
     const int small_out_one_token =
         !serial_f16 &&
         !serial_router &&
@@ -16001,9 +16402,9 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         n_tok == 1u &&
         out_dim <= 32u &&
         in_dim >= 8192u &&
-        getenv("DS4_CUDA_F16_SMALL_OUT") != NULL &&
-        getenv("DS4_CUDA_NO_ORDERED_F16_MATMUL") == NULL &&
-        getenv("DS4_CUDA_NO_F16_SMALL_OUT") == NULL;
+        env_small_out &&
+        !env_no_ordered &&
+        !env_no_small_out;
     if (small_out_one_token) {
         matmul_f16_small_out_hx_ordered_chunks_kernel<<<(unsigned)out_dim, 32, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -16019,8 +16420,8 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         n_tok > 1u &&
         out_dim <= 32u &&
         in_dim >= 4096u &&
-        (g_quality_mode || getenv("DS4_CUDA_F16_SMALL_BATCH") != NULL) &&
-        getenv("DS4_CUDA_NO_F16_SMALL_BATCH") == NULL;
+        (g_quality_mode || env_small_batch) &&
+        !env_no_small_batch;
     if (small_out_batch) {
         matmul_f16_small_out_batch_kernel<<<(unsigned)n_tok, 256, 0, cuda_decode_stream()>>>(
                 (float *)out->ptr,
@@ -16033,10 +16434,10 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     const int cublas_one_token =
         n_tok == 1u &&
-        getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") == NULL &&
-        (!g_quality_mode || getenv("DS4_CUDA_F16_CUBLAS_ONE") != NULL);
+        !env_no_cublas_one &&
+        (!g_quality_mode || env_cublas_one);
     const int cublas_batch =
-        n_tok > 1u && getenv("DS4_CUDA_NO_F16_CUBLAS_BATCH") == NULL;
+        n_tok > 1u && !env_no_cublas_batch;
     if (!serial_f16 && g_cublas_ready && (cublas_batch || cublas_one_token)) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc_on(logical_tier, xh_count * sizeof(__half), "f16 gemm activations");
@@ -16666,8 +17067,138 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, (uint64_t)n * sizeof(float), logical_tier, "rms_weight");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    rms_norm_weight_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    rms_norm_weight_kernel<<<rows, 256, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+
+/* Kolibri-1 decode sandwich on one row: x = rmsnorm(blk) * w_post, R += x,
+ * x = rmsnorm(R) * w_pre.  Per-thread loops and the block_sum_f32_256 tree
+ * are those of rms_norm_weight_kernel at 256 threads, and the normalized
+ * value is rounded before the add as the separate kernels round it through
+ * memory, so the three launches it replaces give the same bits. */
+__global__ static void kolibri_norm_add_norm_kernel(
+        float *x,
+        float *R,
+        const float *blk,
+        const float *w_post,
+        const float *w_pre,
+        uint32_t n,
+        float eps) {
+    __shared__ float partial[256];
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = blk[i];
+        sum += v * v;
+    }
+    sum = block_sum_f32_256(sum, partial);
+    float scale = rsqrtf(sum / (float)n + eps);
+    sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float r = R[i] + __fmul_rn(blk[i] * scale, w_post[i]);
+        R[i] = r;
+        sum += r * r;
+    }
+    sum = block_sum_f32_256(sum, partial);
+    scale = rsqrtf(sum / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        x[i] = R[i] * scale * w_pre[i];
+    }
+}
+
+/* Kolibri-1 decode MoE tail on one row: moe_out = shared + sum of the routed
+ * slots by their router weights (kolibri1_cuda::moe_sum), x = rmsnorm(moe_out)
+ * * w_post, R += x, and with w_pre the following pre-norm x = rmsnorm(R) *
+ * w_pre.  Same rounding discipline as kolibri_norm_add_norm_kernel. */
+__global__ static void kolibri_moe_sum_norm_add_norm_kernel(
+        float *x,
+        float *R,
+        float *moe_out,
+        const float *part,
+        const float *weights,
+        const float *w_post,
+        const float *w_pre,
+        uint32_t n_slots,
+        uint32_t n,
+        float eps) {
+    __shared__ float partial[256];
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float acc = part[(uint64_t)n_slots * n + i];
+        for (uint32_t s = 0; s < n_slots; s++)
+            acc += weights[s] * part[(uint64_t)s * n + i];
+        moe_out[i] = acc;
+        sum += acc * acc;
+    }
+    sum = block_sum_f32_256(sum, partial);
+    float scale = rsqrtf(sum / (float)n + eps);
+    sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float r = R[i] + __fmul_rn(moe_out[i] * scale, w_post[i]);
+        R[i] = r;
+        sum += r * r;
+    }
+    if (!w_pre) return;
+    sum = block_sum_f32_256(sum, partial);
+    scale = rsqrtf(sum / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        x[i] = R[i] * scale * w_pre[i];
+    }
+}
+
+extern "C" int ds4_gpu_kolibri_norm_add_norm_tensor(
+        ds4_gpu_tensor *x,
+        ds4_gpu_tensor *R,
+        const ds4_gpu_tensor *blk,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t post_offset,
+        uint64_t pre_offset,
+        uint32_t n,
+        float eps) {
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    if (!x || !R || !blk || !model_map || n == 0 ||
+        post_offset > model_size || model_size - post_offset < bytes ||
+        pre_offset > model_size || model_size - pre_offset < bytes ||
+        x->bytes < bytes || R->bytes < bytes || blk->bytes < bytes) return 0;
+    const int logical_tier = ds4_tensor_device_idx(x);
+    const float *w_post = (const float *)cuda_resolve_weight_ptr(model_map, post_offset, bytes, logical_tier, "rms_weight");
+    const float *w_pre = (const float *)cuda_resolve_weight_ptr(model_map, pre_offset, bytes, logical_tier, "rms_weight");
+    if (!w_post || !w_pre) return 0;
+    kolibri_norm_add_norm_kernel<<<1, 256, 0, cuda_decode_stream()>>>(
+            (float *)x->ptr, (float *)R->ptr, (const float *)blk->ptr, w_post, w_pre, n, eps);
+    return cuda_ok(cudaGetLastError(), "kolibri norm add norm launch");
+}
+
+/* x NULL leaves R summed without the following pre-norm, for a row that moves
+ * to another device or whose norm is not this layer's to run. */
+extern "C" int ds4_gpu_kolibri_moe_sum_norm_add_norm_tensor(
+        ds4_gpu_tensor *x,
+        ds4_gpu_tensor *R,
+        ds4_gpu_tensor *moe_out,
+        const ds4_gpu_tensor *part,
+        const ds4_gpu_tensor *weights,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t post_offset,
+        uint64_t pre_offset,
+        uint32_t n_slots,
+        uint32_t n,
+        float eps) {
+    const uint64_t bytes = (uint64_t)n * sizeof(float);
+    if (!R || !moe_out || !part || !weights || !model_map || n == 0 || n_slots == 0 ||
+        post_offset > model_size || model_size - post_offset < bytes ||
+        (x && (pre_offset > model_size || model_size - pre_offset < bytes || x->bytes < bytes)) ||
+        R->bytes < bytes || moe_out->bytes < bytes ||
+        part->bytes < (uint64_t)(n_slots + 1u) * bytes ||
+        weights->bytes < (uint64_t)n_slots * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(R);
+    const float *w_post = (const float *)cuda_resolve_weight_ptr(model_map, post_offset, bytes, logical_tier, "rms_weight");
+    const float *w_pre = x ? (const float *)cuda_resolve_weight_ptr(model_map, pre_offset, bytes, logical_tier, "rms_weight") : NULL;
+    if (!w_post || (x && !w_pre)) return 0;
+    kolibri_moe_sum_norm_add_norm_kernel<<<1, 256, 0, cuda_decode_stream()>>>(
+            x ? (float *)x->ptr : NULL, (float *)R->ptr, (float *)moe_out->ptr,
+            (const float *)part->ptr, (const float *)weights->ptr, w_post, w_pre, n_slots, n, eps);
+    return cuda_ok(cudaGetLastError(), "kolibri moe sum norm add norm launch");
 }
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
@@ -33806,19 +34337,25 @@ extern "C" void ds4_gpu_stream_expert_cache_readahead_async(const ds4_gpu_stream
                                                             const int32_t *, uint32_t) {
 }
 
-/* The engine sizes K/V rows from this switch, and the CUDA Qwen3.8 kernels
- * read them as half floats only: continuing would misread every row. */
+/* Qwen3.8 K/V rows as q8_0 (the Metal layout: D int8 values, then D/32 half
+ * scales); the attention kernels of ds4_qwen4_cuda.cuh read the switch. */
+static bool g_qwen4_kv_q8;
+
 extern "C" void ds4_gpu_qwen4_set_kv_q8(bool on) {
-    if (on) {
-        fprintf(stderr, "ds4: the q8_0 Qwen3.8 K/V cache is implemented for Metal only; "
-                        "unset DS4_QWEN4_KV_Q8 for CUDA\n");
-        exit(1);
-    }
+    g_qwen4_kv_q8 = on;
 }
 
-/* bytes of one (position, kv head) K or V row: half floats, see above */
+/* bytes of one (position, kv head) K or V row */
 extern "C" uint64_t ds4_gpu_qwen4_kv_row_bytes(uint32_t head_dim) {
-    return (uint64_t)head_dim * 2u;
+    return g_qwen4_kv_q8 ? (uint64_t)head_dim + head_dim / 16u : (uint64_t)head_dim * 2u;
+}
+
+/* Kolibri-1 K/V rows as q8_0 in the same layout instead of f32; the kernels
+ * of ds4_kolibri1_cuda.cuh read the switch. */
+static bool g_kolibri1_kv_q8;
+
+extern "C" void ds4_gpu_kolibri_set_kv_q8(bool on) {
+    g_kolibri1_kv_q8 = on;
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
