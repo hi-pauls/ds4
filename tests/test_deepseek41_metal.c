@@ -727,7 +727,13 @@ static int check_indexer_batch(void) {
         for (size_t i = 0; i < (size_t)ROWS * HEADS; i++) w[i] = bf16(random_value());
         CHECK(ds4_gpu_dsv41_quantize(qt, DIM, ROWS * HEADS, DS4_V41_FP4_E8M0));
         CHECK(ds4_gpu_dsv41_quantize(kt, DIM, KEYS, DS4_V41_FP4_E8M0));
-        if (range == 2) { q[0] = 1.0001f; k[67u * DIM] = 1.0003f; }
+        if (range == 2) {
+            /* The rounding kernels may still run; CUDA on Windows faults on a
+             * host write to managed memory until the device is idle. */
+            q = ds4_gpu_tensor_contents(qt); k = ds4_gpu_tensor_contents(kt);
+            CHECK(q && k);
+            q[0] = 1.0001f; k[67u * DIM] = 1.0003f;
+        }
         uint32_t *packed_guard = (uint32_t *)((char *)ds4_gpu_tensor_contents(pt) + packed_bytes);
         *packed_guard = 0xabcdef01;
         if (packed_available) CHECK(ds4_gpu_dsv41_indexer_pack(pt, qt, kt, KEYS, ROWS));
