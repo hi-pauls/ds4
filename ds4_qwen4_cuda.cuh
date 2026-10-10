@@ -4232,11 +4232,17 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
                                  moe_layer_share(c->slots) : 0;
     /* What is free goes evenly to the layers still to come, so the tier ends
      * up full whatever the earlier layers left over. */
+    /* Slots given up to a device are only freed by the next token's selection,
+     * and a prompt pass has none: free them here, behind the copies out of them. */
+    if (want_ram && !ram.released.empty() && moe_stream_wait(cuda_decode_stream(), "MoE RAM slot release")) {
+        ram.free_slots.insert(ram.free_slots.end(), ram.released.begin(), ram.released.end());
+        ram.released.clear();
+    }
     uint32_t layers_to_come = 0;
     for (uint32_t i = 0; i < layers; i++) layers_to_come += i >= g_moe_layer.ram_done.size() || !g_moe_layer.ram_done[i];
     uint32_t ram_left = want_ram && layers_to_come ? (uint32_t)(ram.free_slots.size() / layers_to_come) : 0;
     uint32_t next_free = 0;
-    bool any = false;
+    bool any = false, ram_moved = false;
     std::vector<std::pair<uint32_t, uint32_t>> order = moe_layer_ranked(layer, t->n_total_expert);
     std::vector<bool> ranked(t->n_total_expert, false);
     for (const auto &entry : order) ranked[entry.second] = true;
@@ -4262,6 +4268,7 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
                 ram.key[in_ram->second] = moe_stream_no_key;
                 ram.released.push_back(in_ram->second);
                 ram.slot_of.erase(in_ram);
+                ram_moved = true;
             }
         } else if (want_fixed && position < fixed_share && !c->slot_of.count(key)) {
             /* The top of the ranking belongs here even when a prompt pass on
@@ -4304,7 +4311,13 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
         }
     }
     g_moe_layer.fixed_done[layer] = g_moe_layer.fixed_done[layer] || want_fixed;
-    g_moe_layer.ram_done[layer] = g_moe_layer.ram_done[layer] || want_ram;
+    /* The tier was handed the top of the ranking while the device had no size
+     * and has just given it up: the slots that frees go to the rest of the
+     * layer on the next pass, or the CPU reads those from the file a use at a
+     * time (1.7 ms each on Kolibri-1 Q2). */
+    /* DS4_CUDA_MOE_STREAM_NO_RAM_REFILL=1 leaves the tier as the first pass filled it, for A/B. */
+    static const bool refill = getenv("DS4_CUDA_MOE_STREAM_NO_RAM_REFILL") == NULL;
+    g_moe_layer.ram_done[layer] = (g_moe_layer.ram_done[layer] || want_ram) && !(ram_moved && refill);
     return any;
 }
 
@@ -4604,6 +4617,8 @@ static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *count
                         ram.key[in_ram->second] = moe_stream_no_key;
                         ram.free_slots.push_back(in_ram->second);
                         ram.slot_of.erase(in_ram);
+                        if (t->layer < g_moe_layer.ram_done.size() && !getenv("DS4_CUDA_MOE_STREAM_NO_RAM_REFILL"))
+                            g_moe_layer.ram_done[t->layer] = false;
                     }
                 }
             }
@@ -4985,7 +5000,9 @@ static void moe_stream_stats(moe_stream_cache &c, int device, moe_stream_cache *
                     g_moe_cpu_pool.workers.size());
             g_moe_cpu.pairs = 0;
             g_moe_cpu.seconds = 0.0;
-            fprintf(stderr, "ds4: CUDA MoE RAM tier: %llu experts read from the file for the CPU, %.3f ms each\n",
+            fprintf(stderr, "ds4: CUDA MoE RAM tier: %zu of %u slots hold an expert; %llu experts read from the file "
+                            "for the CPU, %.3f ms each\n",
+                    g_moe_stream_ram.slot_of.size(), g_moe_stream_ram.slots,
                     (unsigned long long)g_moe_stream_ram.file_reads,
                     g_moe_stream_ram.file_reads ? 1e3 * g_moe_stream_ram.file_s / (double)g_moe_stream_ram.file_reads
                                                 : 0.0);
