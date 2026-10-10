@@ -62103,6 +62103,44 @@ static bool kolibri1_fuse_on(void) {
  * K/V caches (f32, or q8_0 rows on CUDA with DS4_KOLIBRI1_KV_Q8), span
  * attention, output projection.  The output lands in blk;
  * the caller norms it against post_attn_norm and folds it into R. */
+/* DS4_KOLIBRI1_STAGE_PROFILE=1 waits for the device after each stage and
+ * prints the mean milliseconds per decoded token every 50 tokens.  The
+ * attention figure is what the norms around its four named parts cost. */
+enum { kolibri1_prof_attn, kolibri1_prof_router, kolibri1_prof_stage, kolibri1_prof_experts,
+       kolibri1_prof_hop, kolibri1_prof_head, kolibri1_prof_qkv, kolibri1_prof_prep,
+       kolibri1_prof_full, kolibri1_prof_slide, kolibri1_prof_out, kolibri1_prof_count };
+static double g_kolibri1_prof[kolibri1_prof_count];
+static double g_kolibri1_prof_at;
+static uint32_t g_kolibri1_prof_tokens;
+
+static bool kolibri1_prof_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_KOLIBRI1_STAGE_PROFILE") != NULL;
+    return on != 0;
+}
+
+static void kolibri1_prof_mark(int stage) {
+    if (!kolibri1_prof_on()) return;
+    (void)ds4_gpu_synchronize();
+    const double now = now_sec();
+    if (stage >= 0) g_kolibri1_prof[stage] += now - g_kolibri1_prof_at;
+    g_kolibri1_prof_at = now;
+}
+
+static void kolibri1_prof_token(void) {
+    if (!kolibri1_prof_on() || ++g_kolibri1_prof_tokens < 50) return;
+    const double *p = g_kolibri1_prof;
+    fprintf(stderr, "ds4: Kolibri-1 ms/token: attention %.1f (+ projections %.1f, cache write %.1f, "
+                    "full layers %.1f, sliding layers %.1f, output %.1f), router %.1f, expert staging %.1f, "
+                    "experts %.1f, device hops %.1f, head %.1f\n",
+            20.0 * p[kolibri1_prof_attn], 20.0 * p[kolibri1_prof_qkv], 20.0 * p[kolibri1_prof_prep],
+            20.0 * p[kolibri1_prof_full], 20.0 * p[kolibri1_prof_slide], 20.0 * p[kolibri1_prof_out],
+            20.0 * p[kolibri1_prof_router], 20.0 * p[kolibri1_prof_stage], 20.0 * p[kolibri1_prof_experts],
+            20.0 * p[kolibri1_prof_hop], 20.0 * p[kolibri1_prof_head]);
+    memset(g_kolibri1_prof, 0, sizeof(g_kolibri1_prof));
+    g_kolibri1_prof_tokens = 0;
+}
+
 static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model *m,
                                      const ds4_layer_weights *l, uint32_t il,
                                      uint32_t pos0, uint32_t T) {
@@ -62133,54 +62171,27 @@ static bool kolibri1_graph_attention(ds4_kolibri1_gpu_graph *g, const ds4_model 
         ok = kolibri1_gemv(g->q, m, l->attn_q, g->x, T) &&
              kolibri1_gemv(kproj, m, l->attn_k, g->x, T) &&
              kolibri1_gemv(vproj, m, l->attn_v, g->x, T);
+    kolibri1_prof_mark(kolibri1_prof_qkv);
     ok = ok &&
               ds4_gpu_kolibri_attn_prep_tensor(g->q, g->layer_k_cache[il], g->layer_v_cache[il],
                                                g->q, kproj, vproj, m->map, m->size,
                                                l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                                T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                                                pos0, cache_rows, full ? 0u : 1u,
-                                               DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) &&
+                                               DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+    kolibri1_prof_mark(kolibri1_prof_prep);
+    ok = ok &&
               ds4_gpu_kolibri_attn_decode_tensor(g->attn_o, g->q, g->layer_k_cache[il], g->layer_v_cache[il],
                                                  T <= 2u ? g->attn_part : NULL, T,
                                                  DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0,
                                                  full ? 0u : DS4_N_SWA, cache_rows,
-                                                 1.0f / sqrtf((float)DS4_N_HEAD_DIM)) &&
-              kolibri1_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+                                                 1.0f / sqrtf((float)DS4_N_HEAD_DIM));
+    kolibri1_prof_mark(full ? kolibri1_prof_full : kolibri1_prof_slide);
+    ok = ok && kolibri1_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+    kolibri1_prof_mark(kolibri1_prof_out);
     ds4_gpu_tensor_free(kproj);
     ds4_gpu_tensor_free(vproj);
     return ok;
-}
-
-/* DS4_KOLIBRI1_STAGE_PROFILE=1 waits for the device after each stage and
- * prints the mean milliseconds per decoded token every 50 tokens. */
-enum { kolibri1_prof_attn, kolibri1_prof_router, kolibri1_prof_stage, kolibri1_prof_experts,
-       kolibri1_prof_hop, kolibri1_prof_head, kolibri1_prof_count };
-static double g_kolibri1_prof[kolibri1_prof_count];
-static double g_kolibri1_prof_at;
-static uint32_t g_kolibri1_prof_tokens;
-
-static bool kolibri1_prof_on(void) {
-    static int on = -1;
-    if (on < 0) on = getenv("DS4_KOLIBRI1_STAGE_PROFILE") != NULL;
-    return on != 0;
-}
-
-static void kolibri1_prof_mark(int stage) {
-    if (!kolibri1_prof_on()) return;
-    (void)ds4_gpu_synchronize();
-    const double now = now_sec();
-    if (stage >= 0) g_kolibri1_prof[stage] += now - g_kolibri1_prof_at;
-    g_kolibri1_prof_at = now;
-}
-
-static void kolibri1_prof_token(void) {
-    if (!kolibri1_prof_on() || ++g_kolibri1_prof_tokens < 50) return;
-    const double *p = g_kolibri1_prof;
-    fprintf(stderr, "ds4: Kolibri-1 ms/token: attention %.1f, router %.1f, expert staging %.1f, "
-                    "experts %.1f, device hops %.1f, head %.1f\n",
-            20.0 * p[0], 20.0 * p[1], 20.0 * p[2], 20.0 * p[3], 20.0 * p[4], 20.0 * p[5]);
-    memset(g_kolibri1_prof, 0, sizeof(g_kolibri1_prof));
-    g_kolibri1_prof_tokens = 0;
 }
 
 /* Every layer's MLP: sigmoid router with expert bias, per-(token, slot)
