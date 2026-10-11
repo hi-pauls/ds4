@@ -30,6 +30,8 @@
 typedef struct ds4_syscache_opt {
     uint64_t disk_budget_bytes;   /* 0 disables the cache */
     char    *disk_dir;            /* owned by caller; must outlive the cache */
+    uint64_t model_key;           /* the model the KV belongs to; entries of
+                                     another key are never loaded */
 } ds4_syscache_opt;
 
 typedef struct ds4_syscache {

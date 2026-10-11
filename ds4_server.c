@@ -1550,6 +1550,24 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
+/* Identity of the weights for the conversation and system-prompt disk
+ * caches, which servers of different models may share: FNV-1a over the
+ * model file's real path, size and mtime, so a variant of the same family
+ * (ds4 vs ds4-abliterated) or a file replaced in place gets its own key. */
+static uint64_t server_model_cache_key(const char *model_path) {
+    char resolved[PATH_MAX];
+    const char *path = model_path && realpath(model_path, resolved) ? resolved : model_path;
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = path ? path : ""; *p; p++) h = (h ^ (uint8_t)*p) * 1099511628211ULL;
+    struct stat st;
+    if (path && stat(path, &st) == 0) {
+        const uint64_t parts[2] = { (uint64_t)st.st_size, (uint64_t)st.st_mtime };
+        for (int i = 0; i < 2; i++)
+            for (int b = 0; b < 8; b++) h = (h ^ ((parts[i] >> (8 * b)) & 0xffu)) * 1099511628211ULL;
+    }
+    return h;
+}
+
 static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "kolibri-1") ||
@@ -13963,8 +13981,16 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
  * it, retaining image conditioning as well. */
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
+                                     bool resample, int last_token,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
+    /* A mode change only needs logits at the retained boundary. Replaying the
+     * previous token can cross before the verifier snapshot in exact mode. */
+    if (resample && ds4_session_rewind_speculative(slot->session, pos)) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return 0;
+    }
+    if (resample) pos--;
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
@@ -13973,6 +13999,8 @@ static int server_generation_rewind(server *s, server_slot *slot,
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
+    if (rc == 0 && resample)
+        rc = server_eval_token(s, slot, last_token, err, errlen);
     return rc;
 }
 
@@ -16146,16 +16174,17 @@ decode_again:
             }
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
-            /* Logits after a rewind belong to the discarded suffix. Re-eval
-             * the last kept token before sampling under a different mode. */
-            int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
-                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+            int pos = block_start + kept;
+            const double rewind_t0 = now_sec();
+            trace_event(s, trace_id, "speculative boundary rewind: from=%d to=%d",
+                        ds4_session_pos(slot->session), pos);
+            if (server_generation_rewind(s, slot, &j->req, pos,
+                    resample, kept ? toks[kept - 1] : 0, err, sizeof(err)) != 0) {
                 finish = "error";
                 stop_decode = true;
             } else {
-                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
-                            kept, ntok - kept, resample);
+                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d rewind_ms=%.3f",
+                            kept, ntok - kept, resample, (now_sec() - rewind_t0) * 1000.0);
             }
         }
         if (stop_decode) break;
@@ -18011,6 +18040,7 @@ int main(int argc, char **argv) {
             .ram_budget_bytes  = cfg.kv_conv_ram_mb  * 1024ULL * 1024ULL,
             .disk_budget_bytes = cfg.kv_conv_disk_mb * 1024ULL * 1024ULL,
             .disk_dir          = (char *)cfg.kv_conv_disk_dir,
+            .model_key         = server_model_cache_key(cfg.engine.model_path),
         };
         if (cco.ram_budget_bytes == 0) {
             server_log(DS4_LOG_DEFAULT,
@@ -18036,6 +18066,7 @@ int main(int argc, char **argv) {
             ds4_syscache_opt sco = {
                 .disk_budget_bytes = cfg.kv_conv_sys_disk_mb * 1024ULL * 1024ULL,
                 .disk_dir          = (char *)cfg.kv_conv_sys_disk_dir,
+                .model_key         = server_model_cache_key(cfg.engine.model_path),
             };
             if (!ds4_syscache_init(&s.syscache, &sco)) {
                 server_log(DS4_LOG_DEFAULT,

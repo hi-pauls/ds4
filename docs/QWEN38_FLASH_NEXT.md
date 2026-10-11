@@ -103,7 +103,10 @@ with `./download_model.sh qwen38-vision`, then use
 `/read image.png`; the server accepts `image_url` parts. Each image is resized to
 multiples of 32 pixels within 64 to 1024 tokens (`DS4_QWEN4_IMAGE_MAX_TOKENS`
 raises the cap), encoded on the GPU, and takes the model's 3D rope positions;
-live KV reuse keys on the image fingerprints. `make test-qwen4-vision`
+live KV reuse keys on the image fingerprints. On macOS, `DS4_QWEN4_VISION_CPU=1`
+encodes on the CPU through Accelerate instead and keeps the encoder out of GPU
+memory, for servers whose sessions fill the wired budget; it matches the GPU
+tower to a per-token cosine of 1.000000 and costs a few seconds per image. `make test-qwen4-vision`
 compares the tower with the Hugging Face implementation using the same GGUF
 weights, dequantized to float32. It separately reports GGUF-versus-original
 checkpoint quality and GPU-versus-original agreement. Both comparisons use

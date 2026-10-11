@@ -11,8 +11,8 @@
  *   - Writes to disk happen only on eviction (RAM budget exhausted) or on
  *     server shutdown — not per turn, not per request.
  *
- * Entries are keyed by the SHA-1 of the rendered prompt text, matching the
- * existing kvstore convention so on-disk snapshots stay interchangeable.
+ * Disk files are named by a djb2 hash of the rendered prompt text seeded with
+ * the model key, and carry that key; lookups match on the text itself.
  *
  * Thread model: caller synchronises access. ds4-server serialises
  * generate_job on a single worker, so no locking is needed inside this
@@ -60,6 +60,8 @@ typedef struct ds4_convcache_opt {
     uint64_t ram_budget_bytes;    /* required; 0 disables the cache entirely */
     uint64_t disk_budget_bytes;   /* 0 = no disk tier */
     char    *disk_dir;            /* owned by caller; must outlive the cache */
+    uint64_t model_key;           /* the model the KV belongs to; disk entries of
+                                     another key are never loaded */
 } ds4_convcache_opt;
 
 typedef struct ds4_convcache {
