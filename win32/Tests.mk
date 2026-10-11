@@ -18,7 +18,7 @@ TESTS_PLAIN := test_q4k_dot test_mxfp4_dot
 # Linked with a few engine objects, no backend.
 TESTS_CPU := test_layer_pack test_gpu_args test_prompt_prefix test_ssd_cache test_engram \
     test_image_decode test_deepseek4_vision_image test_engine_mgpu_placement test_sampling \
-    test_session_state
+    test_session_state test_cache_model_key
 # Linked with the whole engine and the CUDA backend.
 TESTS_ENGINE := ds4_test test_cli_printer
 
@@ -91,6 +91,7 @@ $(TESTS_OUT)/test_image_decode.exe $(TESTS_OUT)/test_deepseek4_vision_image.exe:
 $(TESTS_OUT)/test_engine_mgpu_placement.exe $(TESTS_OUT)/test_sampling.exe: $(TESTS_OUT)/ds4_cpu_test_hooks.o $(CPU_CORE_OBJS)
 # test_session_state.c includes ds4.c itself.
 $(TESTS_OUT)/test_session_state.exe: $(CPU_CORE_OBJS)
+$(TESTS_OUT)/test_cache_model_key.exe: $(addprefix $(OUT)/,ds4_convcache.o ds4_syscache.o) $(ZSTD_OBJS)
 
 $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CPU))): $(TESTS_OUT)/%.exe: $(TESTS_OUT)/%.o $(OUT)/win32/ds4_win32.o $(OUT)/ucrt.specs
 	$(TEST_LINK)
@@ -109,7 +110,9 @@ $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_ENGINE))): $(TESTS_OUT)/%.exe
 # test_cuda_ssd_cache keeps 8 GiB of the first card free, so on a machine whose
 # first card is smaller put a larger one in front with CUDA_VISIBLE_DEVICES.
 TESTS_CUDA := test_qwen4_cuda test_deepseek41_cuda test_cuda_ssd_cache test_cuda_q8_rows \
-    test_gpu_xdev test_gpu_model_cache test_gpu_lookup_cache_strict test_glm_attention
+    test_gpu_xdev test_gpu_model_cache test_gpu_lookup_cache_strict test_glm_attention \
+    test_cuda_embed test_cuda_ssd_batch test_cuda_tp test_cuda_dspark test_cuda_compressor \
+    test_cuda_mxfp4_split test_cuda_dspark_tp_split test_cuda_dspark_tp_markov test_cuda_tokentile
 CUDA_TEST_CFLAGS := -O3 -g -march=native -Wall -Wextra -std=c11 -D_GNU_SOURCE -D_UCRT -D_FILE_OFFSET_BITS=64 \
     -include win32/ds4_win32.h -include win32/ds4_test_win32.h -Iwin32/include -I. -MMD -MP
 # Three of them call the CUDA runtime directly: its headers and import library
@@ -124,13 +127,16 @@ CUDA_TEST_PROGRAMS := $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CUDA)))
 .PHONY: tests-cuda test-cuda
 tests-cuda: $(CUDA_TEST_PROGRAMS) $(TESTS_OUT)/libwinpthread-1.dll $(TESTS_OUT)/ds4_cuda.dll
 
+# A program that needs hardware this machine lacks says so and exits 77.
 test-cuda: tests-cuda
-	@failed=0; \
+	@failed=0; skipped=0; \
 	for t in $(TESTS_CUDA) test_kolibri1_cuda; do \
 	    printf '== %s\n' "$$t"; \
-	    $(TESTS_OUT)/$$t.exe || { failed=$$((failed + 1)); printf 'FAILED: %s\n' "$$t"; }; \
+	    $(TESTS_OUT)/$$t.exe; status=$$?; \
+	    if [ "$$status" -eq 77 ]; then skipped=$$((skipped + 1)); printf 'SKIPPED: %s\n' "$$t"; \
+	    elif [ "$$status" -ne 0 ]; then failed=$$((failed + 1)); printf 'FAILED: %s\n' "$$t"; fi; \
 	done; \
-	printf '%s CUDA test program(s) failed\n' "$$failed"; \
+	printf '%s CUDA test program(s) failed, %s skipped\n' "$$failed" "$$skipped"; \
 	[ "$$failed" -eq 0 ]
 
 $(TESTS_OUT)/test_qwen4_cuda.o: tests/test_qwen4_kernels.c
