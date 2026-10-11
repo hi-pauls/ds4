@@ -4210,7 +4210,7 @@ static bool moe_layer_pending(uint32_t layer, const moe_stream_cache &c) {
  * to the device cache c, to stay; the rest goes to the RAM tier as far as its
  * share reaches, so that later nothing comes from the disk.  c only takes
  * part once it is sized.  Returns whether anything was given a slot. */
-static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cache *c) {
+static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cache *c, bool prompt_pass) {
     moe_stream_ram &ram = g_moe_stream_ram;
     const uint32_t layer = t->layer, layers = g_moe_layer.complete ? g_moe_layer.layers : 0;
     g_moe_layer.ram_slot.assign(t->n_total_expert, -1);
@@ -4314,10 +4314,13 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
     /* The tier was handed the top of the ranking while the device had no size
      * and has just given it up: the slots that frees go to the rest of the
      * layer on the next pass, or the CPU reads those from the file a use at a
-     * time (1.7 ms each on Kolibri-1 Q2). */
+     * time (1.7 ms each on Kolibri-1 Q2).  Only in a prompt pass: while
+     * decoding, a refill reads the whole layer for it (0.7 GiB a layer on
+     * Qwen3.8, 20 s over the first tokens), where a use at a time reads
+     * just what is needed. */
     /* DS4_CUDA_MOE_STREAM_NO_RAM_REFILL=1 leaves the tier as the first pass filled it, for A/B. */
     static const bool refill = getenv("DS4_CUDA_MOE_STREAM_NO_RAM_REFILL") == NULL;
-    g_moe_layer.ram_done[layer] = (g_moe_layer.ram_done[layer] || want_ram) && !(ram_moved && refill);
+    g_moe_layer.ram_done[layer] = (g_moe_layer.ram_done[layer] || want_ram) && !(ram_moved && refill && prompt_pass);
     return any;
 }
 
@@ -4408,7 +4411,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
                 (void)cudaGetDevice(&device);
                 moe_stream_ram_init(g_moe_stream_ram, 2 * t->gate_expert_bytes + t->down_expert_bytes);
                 moe_stream_cache &c = g_moe_stream_caches[device];
-                const bool handing_out = moe_layer_plan(t, &c);
+                const bool handing_out = moe_layer_plan(t, &c, true);
                 /* A layer read ahead goes to the device as it is.  Not while
                  * its experts are still being handed to RAM and the fixed
                  * set: that happens in the reader below. */
@@ -4907,7 +4910,7 @@ static void moe_stream_handout(const ds4_gpu_stream_expert_table *t, moe_stream_
     moe_layer_visit(t->layer);
     moe_stream_ram_init(g_moe_stream_ram, c.slot_bytes);
 #ifdef _WIN32
-    if (!c.provisional && moe_layer_pending(t->layer, c) && moe_layer_reader_open() && moe_layer_plan(t, &c)) {
+    if (!c.provisional && moe_layer_pending(t->layer, c) && moe_layer_reader_open() && moe_layer_plan(t, &c, false)) {
         const cudaStream_t stream = cuda_decode_stream();
         const uint64_t gate = (uint64_t)t->n_total_expert * t->gate_expert_bytes;
         bool for_ram = false;
