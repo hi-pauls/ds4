@@ -2481,7 +2481,9 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     /* Large tensor/shard ranges rarely fit each other's remaining arena tail.
      * Allocate them directly so cached-byte budgets reflect resident memory. */
     if (need >= 256ull * 1048576ull) return need;
-    uint64_t mb = 1792;
+    /* With streamed experts every byte the last chunk leaves unused is taken
+     * from the expert cache: 0.86 GiB of a 16 GiB card at the usual size. */
+    uint64_t mb = g_ssd_streaming_mode ? 256 : 1792;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
