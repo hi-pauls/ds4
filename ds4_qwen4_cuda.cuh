@@ -3275,6 +3275,19 @@ static bool moe_stream_cache_init(moe_stream_cache &c, int device, uint64_t gate
     return true;
 }
 
+#ifdef _WIN32
+/* One expert part from the file into dst.  Through the mapping an expert
+ * the page cache has dropped arrives a page fault at a time, 5 to 9 ms for
+ * 1.4 MiB; one unbuffered read of the sectors around it is the drive's speed. */
+static bool moe_layer_reader_open(void);
+static bool moe_stream_file_read(char *dst, const char *map, uint64_t offset, uint64_t bytes);
+#else
+static bool moe_stream_file_read(char *dst, const char *map, uint64_t offset, uint64_t bytes) {
+    memcpy(dst, map + offset, bytes);
+    return true;
+}
+#endif
+
 /* The slot holding (layer, expert), loaded first when it is not cached.  The
  * victim is the least recently used slot that the open batch has not touched. */
 static int moe_stream_slot(moe_stream_cache &c, const ds4_gpu_stream_expert_table *t, uint32_t expert) {
@@ -3357,10 +3370,12 @@ static int moe_stream_slot(moe_stream_cache &c, const ds4_gpu_stream_expert_tabl
                 }
                 char *staged = c.stage + (uint64_t)c.stage_used++ * c.slot_bytes;
                 const char *map = (const char *)t->model_map;
-                memcpy(staged, map + t->gate_offset + (uint64_t)expert * c.gate_bytes, c.gate_bytes);
-                memcpy(staged + c.gate_bytes, map + t->up_offset + (uint64_t)expert * c.gate_bytes, c.gate_bytes);
-                memcpy(staged + 2 * c.gate_bytes, map + t->down_offset + (uint64_t)expert * c.down_bytes,
-                       c.down_bytes);
+                ok = ok && moe_stream_file_read(staged, map, t->gate_offset + (uint64_t)expert * c.gate_bytes,
+                                                c.gate_bytes) &&
+                     moe_stream_file_read(staged + c.gate_bytes, map, t->up_offset + (uint64_t)expert * c.gate_bytes,
+                                          c.gate_bytes) &&
+                     moe_stream_file_read(staged + 2 * c.gate_bytes, map,
+                                          t->down_offset + (uint64_t)expert * c.down_bytes, c.down_bytes);
                 source = staged;
             }
             const auto t1 = std::chrono::steady_clock::now();
@@ -3397,19 +3412,6 @@ static uint32_t moe_stream_coldest(const moe_stream_cache &c) {
         if (c.stamp[i] < g_moe_stream_clock && c.heat[i] < coldest) coldest = c.heat[i];
     return coldest;
 }
-
-#ifdef _WIN32
-/* One expert part from the file into dst.  Through the mapping an expert
- * the page cache has dropped arrives a page fault at a time, 5 to 9 ms for
- * 1.4 MiB; one unbuffered read of the sectors around it is the drive's speed. */
-static bool moe_layer_reader_open(void);
-static bool moe_stream_file_read(char *dst, const char *map, uint64_t offset, uint64_t bytes);
-#else
-static bool moe_stream_file_read(char *dst, const char *map, uint64_t offset, uint64_t bytes) {
-    memcpy(dst, map + offset, bytes);
-    return true;
-}
-#endif
 
 /* The RAM tier slot holding (layer, expert) for the CPU, read from the file
  * first when it is not there; -1 when every slot is in use by this batch. */
