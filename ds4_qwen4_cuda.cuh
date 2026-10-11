@@ -4241,6 +4241,16 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
     uint32_t layers_to_come = 0;
     for (uint32_t i = 0; i < layers; i++) layers_to_come += i >= g_moe_layer.ram_done.size() || !g_moe_layer.ram_done[i];
     uint32_t ram_left = want_ram && layers_to_come ? (uint32_t)(ram.free_slots.size() / layers_to_come) : 0;
+    /* The top of a layer's ranking is what a device takes over once it is
+     * sized.  Out of page-locked memory that copy runs at the link's rate,
+     * out of the rest at a quarter of it (13 s for Qwen3.8's 6.8 GiB), so
+     * the locked slots, the lowest numbers, go to the top of every layer. */
+    uint32_t locked_left = 0;
+    if (ram_left) {
+        std::sort(ram.free_slots.begin(), ram.free_slots.end(), std::greater<uint32_t>());
+        for (const uint32_t slot : ram.free_slots) locked_left += slot < ram.locked_slots;
+        locked_left /= layers_to_come;
+    }
     uint32_t next_free = 0;
     bool any = false, ram_moved = false;
     std::vector<std::pair<uint32_t, uint32_t>> order = moe_layer_ranked(layer, t->n_total_expert);
@@ -4298,8 +4308,11 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
             }
         } else if (!moe_layer_held(key)) {
             if (position >= fixed_share && ram_left && !ram.free_slots.empty()) {
-                const uint32_t slot = ram.free_slots.back();
-                ram.free_slots.pop_back();
+                const bool locked = locked_left && ram.free_slots.back() < ram.locked_slots;
+                const uint32_t slot = locked ? ram.free_slots.back() : ram.free_slots.front();
+                if (locked) ram.free_slots.pop_back();
+                else ram.free_slots.erase(ram.free_slots.begin());
+                locked_left -= locked;
                 ram.key[slot] = key;
                 ram.slot_of[key] = slot;
                 ram.uses[slot] = order[position].first;
@@ -4903,6 +4916,12 @@ extern "C" void ds4_gpu_qwen4_moe_stream_set_cpu(qwen4_cuda::moe_cpu_quantize_fn
 
 namespace qwen4_cuda {
 
+/* What handing out cost while decoding, for DS4_CUDA_MOE_STREAM_STATS. */
+static struct {
+    uint64_t whole_layers, from_file;
+    double seconds;
+} g_moe_handout;
+
 /* The first visit to a layer reads it once and hands its experts out: to
  * this device its share of the stored ranking, which with a helper it then
  * keeps (see moe_stream_place), and to the RAM tier the rest. */
@@ -4910,11 +4929,14 @@ static void moe_stream_handout(const ds4_gpu_stream_expert_table *t, moe_stream_
     moe_layer_visit(t->layer);
     moe_stream_ram_init(g_moe_stream_ram, c.slot_bytes);
 #ifdef _WIN32
+    const auto entered = std::chrono::steady_clock::now();
     if (!c.provisional && moe_layer_pending(t->layer, c) && moe_layer_reader_open() && moe_layer_plan(t, &c, false)) {
         const cudaStream_t stream = cuda_decode_stream();
         const uint64_t gate = (uint64_t)t->n_total_expert * t->gate_expert_bytes;
         bool for_ram = false;
         for (uint32_t e = 0; e < t->n_total_expert && !for_ram; e++) for_ram = g_moe_layer.ram_slot[e] >= 0;
+        g_moe_handout.whole_layers += for_ram;
+        for (uint32_t e = 0; e < t->n_total_expert && !for_ram; e++) g_moe_handout.from_file += g_moe_layer.fixed_slot[e] >= 0;
         if (for_ram) {
             ok = ok && moe_layer_read(NULL, t->gate_offset, gate, stream, t->gate_expert_bytes, 0) &&
                  moe_layer_read(NULL, t->up_offset, gate, stream, t->gate_expert_bytes, t->gate_expert_bytes) &&
@@ -4945,6 +4967,7 @@ static void moe_stream_handout(const ds4_gpu_stream_expert_table *t, moe_stream_
             ok = ok && cuda_ok(cudaStreamSynchronize(stream), "MoE fixed expert wait");
             c.stage_used = 0;
         }
+        g_moe_handout.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - entered).count();
     }
     g_moe_layer.ram_slot.clear();
     g_moe_layer.fixed_slot.clear();
@@ -4974,6 +4997,12 @@ static void moe_stream_stats(moe_stream_cache &c, int device, moe_stream_cache *
                 c.misses ? 1000.0 * c.host_s / (double)c.misses : 0.0,
                 c.misses ? 1000.0 * c.device_s / (double)c.misses : 0.0,
                 (unsigned long long)c.from_ram, (unsigned long long)c.helped, c.filled, c.slots);
+        if (g_moe_handout.seconds > 0.0) {
+            fprintf(stderr, "ds4: CUDA MoE hand-out while decoding: %.1f s for %llu whole layers read for the RAM tier "
+                            "and %llu experts read for this device\n", g_moe_handout.seconds,
+                    (unsigned long long)g_moe_handout.whole_layers, (unsigned long long)g_moe_handout.from_file);
+            g_moe_handout = {};
+        }
         fprintf(stderr, "ds4: CUDA MoE per-layer wait: %.3f ms over %llu layers\n",
                 g_moe_stream.waits ? 1000.0 * g_moe_stream.wait_s / (double)g_moe_stream.waits : 0.0,
                 (unsigned long long)g_moe_stream.waits);
