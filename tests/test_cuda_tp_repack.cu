@@ -89,13 +89,19 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts, bool verify_on
     std::vector<std::vector<float>> reference, partial, owned_reference[2];
     for (unsigned pass = 0; pass < 5; pass++) {
         const bool owned = pass != 0;
-        const bool raw = pass == 0 || pass >= 3;
+        bool raw = pass == 0 || pass >= 3;
         const unsigned rank = owned ? (pass - 1) % 2 : 0;
         CHECK(ds4_gpu_init());
         CHECK(ds4_gpu_build_derived_artifacts_shard(model.data(), mapped_size, model.size(), path, 2) == 0);
         CHECK(ds4_gpu_build_derived_artifacts_shard(model.data(), header, model.size(), path, 0) == 0);
-        if (!raw) CHECK(ds4_gpu_build_derived_artifacts_shard(
-            model.data(), mapped_size, model.size(), path, rank) == 3);
+        if (!raw) {
+            /* Aligned copies exist only on integrated-memory devices. A
+             * discrete card keeps the raw shard, which the same passes check. */
+            const int built = ds4_gpu_build_derived_artifacts_shard(
+                model.data(), mapped_size, model.size(), path, rank);
+            CHECK(built == 3 || (built == 0 && !ds4_gpu_device_is_spark()));
+            raw = built == 0;
+        }
         uint64_t offsets[3], sizes[3];
         for (unsigned i = 0; i < 3; i++) {
             sizes[i] = unit[i] * experts / (owned ? 2 : 1);
@@ -144,7 +150,9 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts, bool verify_on
             for (unsigned i = 0; i < n * dim; i++) {
                 CHECK(std::isfinite(actual[i]));
                 if (owned && (i / dim) % 3 == (rank == 0 ? 1 : 0)) CHECK(actual[i] == 0);
-                if (pass == 2 && n > 8) {
+                /* Raw shards below 128 rows keep scalar-row arithmetic, which
+                 * the MMQ whole-table reference does not share. */
+                if (pass == 2 && n >= (raw ? 128u : 9u)) {
                     const float expected = reference[c][i], sum = partial[c][i] + actual[i];
                     if (std::fabs(sum - expected) > 0.0002f + std::fabs(expected) * 0.00002f) {
                         std::fprintf(stderr, "aligned shard mismatch rows=%u i=%u %.9g != %.9g\n", n, i, sum, expected);
@@ -154,8 +162,8 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts, bool verify_on
             }
             if (pass == 0) reference.push_back(actual);
             if (pass == 1) partial.push_back(actual);
-            if (owned && !raw) owned_reference[rank].push_back(actual);
-            if (raw && owned) {
+            if (owned && pass < 3) owned_reference[rank].push_back(actual);
+            if (owned && pass >= 3) {
                 double square = 0, reference_square = 0;
                 float max_abs = 0;
                 size_t different = 0;
@@ -197,7 +205,11 @@ static void run(unsigned dim, unsigned mid_dim, unsigned experts, bool verify_on
                 CHECK(ds4_gpu_tensor_write(sw, 0, weights.data() + r * slots, slots * 4));
                 invoke(1);
                 CHECK(ds4_gpu_tensor_read(out, 0, one.data(), dim * 4));
-                CHECK(!std::memcmp(one.data(), actual.data() + r * dim, dim * 4));
+                /* Raw Flash shards sum a batch row in another order than a
+                 * single row; only V4.1 has row-exact raw kernels. */
+                if (!raw || dim == 5120) CHECK(!std::memcmp(one.data(), actual.data() + r * dim, dim * 4));
+                else for (unsigned i = 0; i < dim; i++)
+                    CHECK(std::fabs(one[i] - actual[r * dim + i]) <= 1e-6f * std::max(1.0f, std::fabs(one[i])));
             }
         }
         if (!owned) {

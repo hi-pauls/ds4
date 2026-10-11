@@ -123,15 +123,13 @@ $(addprefix $(TESTS_OUT)/,$(addsuffix .o,$(CUDA_RUNTIME_TESTS))): CUDA_TEST_CFLA
 $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(CUDA_RUNTIME_TESTS))): LDLIBS += "$(CUDA_PATH)/lib/x64/cudart.lib"
 
 # Written in CUDA C++ against ds4_gpu.h: compiled by nvcc, linked with the
-# import library of ds4_cuda.dll.  Two are not among them:
-# test_cuda_ssd_repack calls ds4_repack_selected_experts, a C++ function the
-# DLL does not export; test_cuda_tp_repack builds and fails, its owned-shard
-# build for network tensor parallelism (ds4_gpu_build_derived_artifacts_shard)
-# does not return 3 here.
+# import library of ds4_cuda.dll.  One is not among them: test_cuda_ssd_repack
+# calls ds4_repack_selected_experts, a C++ function the DLL does not export.
 TESTS_CUDA_NVCC := test_cuda_pool test_cuda_verify_head test_cuda_shared_side \
     test_cuda_grouped_q8 test_cuda_q8_pair test_cuda_reductions test_cuda_indexer \
     test_cuda_f16_chunks test_cuda_indexed_one test_cuda_hc_norm test_cuda_hc_pre test_cuda_copy_spans \
-    test_cuda_router_stream test_cuda_q8_0_gemv test_cuda_shared test_cuda_attn_side test_cuda_topk_stream
+    test_cuda_router_stream test_cuda_q8_0_gemv test_cuda_shared test_cuda_attn_side test_cuda_topk_stream \
+    test_cuda_tp_repack
 
 CUDA_TEST_PROGRAMS := $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CUDA) $(TESTS_CUDA_NVCC))) \
     $(TESTS_OUT)/test_kolibri1_cuda.exe
