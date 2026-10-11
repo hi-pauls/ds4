@@ -308,6 +308,13 @@ static void cuda_scratch_retention_init(int tier) {
     cudaMemPool_t pool;
     uint64_t previous;
     uint64_t retained = 64ull << 20;
+#ifdef _WIN32
+    /* Under WDDM a release threshold on the default pool makes page-locked
+     * host memory count against the device: 5.5 GiB locked for the expert
+     * RAM tier took 3.7 GiB of a 16 GiB card. DS4_CUDA_SCRATCH_RETENTION=1
+     * asks for it anyway. */
+    if (!getenv("DS4_CUDA_SCRATCH_RETENTION")) return;
+#endif
     /* The default zero threshold discards MMQ scratch at every TP gate.
      * Retain a small working set, not the largest prefill allocation. */
     if (cudaDeviceGetDefaultMemPool(&pool, g_gpu[tier].device_id) == cudaSuccess &&
