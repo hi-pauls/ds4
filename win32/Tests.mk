@@ -122,17 +122,31 @@ CUDA_RUNTIME_TESTS := test_gpu_xdev test_gpu_model_cache test_gpu_lookup_cache_s
 $(addprefix $(TESTS_OUT)/,$(addsuffix .o,$(CUDA_RUNTIME_TESTS))): CUDA_TEST_CFLAGS += -I"$(CUDA_PATH)/include"
 $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(CUDA_RUNTIME_TESTS))): LDLIBS += "$(CUDA_PATH)/lib/x64/cudart.lib"
 
-CUDA_TEST_PROGRAMS := $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CUDA))) $(TESTS_OUT)/test_kolibri1_cuda.exe
+# Written in CUDA C++ against ds4_gpu.h: compiled by nvcc, linked with the
+# import library of ds4_cuda.dll.  Two are not among them:
+# test_cuda_ssd_repack calls ds4_repack_selected_experts, a C++ function the
+# DLL does not export; test_cuda_tp_repack builds and fails, its owned-shard
+# build for network tensor parallelism (ds4_gpu_build_derived_artifacts_shard)
+# does not return 3 here.
+TESTS_CUDA_NVCC := test_cuda_pool test_cuda_verify_head test_cuda_shared_side \
+    test_cuda_grouped_q8 test_cuda_q8_pair test_cuda_reductions test_cuda_indexer \
+    test_cuda_f16_chunks test_cuda_indexed_one test_cuda_hc_norm test_cuda_hc_pre test_cuda_copy_spans \
+    test_cuda_router_stream test_cuda_q8_0_gemv test_cuda_shared test_cuda_attn_side test_cuda_topk_stream
+
+CUDA_TEST_PROGRAMS := $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CUDA) $(TESTS_CUDA_NVCC))) \
+    $(TESTS_OUT)/test_kolibri1_cuda.exe
 
 .PHONY: tests-cuda test-cuda
 tests-cuda: $(CUDA_TEST_PROGRAMS) $(TESTS_OUT)/libwinpthread-1.dll $(TESTS_OUT)/ds4_cuda.dll
 
 # A program that needs hardware this machine lacks says so and exits 77.
+# test_cuda_pool checks the scratch retention, which Windows only has on request.
 test-cuda: tests-cuda
 	@failed=0; skipped=0; \
-	for t in $(TESTS_CUDA) test_kolibri1_cuda; do \
+	for t in $(TESTS_CUDA) $(TESTS_CUDA_NVCC) test_kolibri1_cuda; do \
 	    printf '== %s\n' "$$t"; \
-	    $(TESTS_OUT)/$$t.exe; status=$$?; \
+	    if [ "$$t" = test_cuda_pool ]; then DS4_CUDA_SCRATCH_RETENTION=1 $(TESTS_OUT)/$$t.exe; \
+	    else $(TESTS_OUT)/$$t.exe; fi; status=$$?; \
 	    if [ "$$status" -eq 77 ]; then skipped=$$((skipped + 1)); printf 'SKIPPED: %s\n' "$$t"; \
 	    elif [ "$$status" -ne 0 ]; then failed=$$((failed + 1)); printf 'FAILED: %s\n' "$$t"; fi; \
 	done; \
@@ -151,6 +165,11 @@ CUDA_TEST_STACK := 8388608
 
 $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CUDA))): $(TESTS_OUT)/%.exe: $(TESTS_OUT)/%.o $(OUT)/win32/ds4_win32.o $(CUDA_DLL) $(OUT)/ucrt.specs
 	$(CC) $(LDFLAGS) -Wl,--stack,$(CUDA_TEST_STACK) -o $@ $(filter %.o,$^) $(CUDA_DLL) $(LDLIBS)
+
+$(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CUDA_NVCC))): $(TESTS_OUT)/%.exe: tests/%.cu ds4_gpu.h \
+        win32/msvc/ds4_test_msvc.h $(CUDA_DLL)
+	@mkdir -p $(@D)
+	$(VCENV) nvcc $(NVCCFLAGS) -include win32/msvc/ds4_test_msvc.h -o $@ $< $(OUT)/ds4_cuda.lib
 
 # Kernels only, compiled and linked by nvcc itself.
 $(TESTS_OUT)/test_kolibri1_cuda.exe: tests/test_kolibri1_cuda.cu ds4_kolibri1_cuda.cuh
