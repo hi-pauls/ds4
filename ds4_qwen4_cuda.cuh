@@ -2765,10 +2765,9 @@ struct moe_cpu_pool {
                  * device for the thread that feeds it.  With the slow cores
                  * busy elsewhere a thread placed on one waited a scheduler
                  * slice, 15 ms where the work takes 0.2 (700 ms a token
-                 * against 47).  DS4_CUDA_MOE_STREAM_ALL_CORES=1 leaves the
-                 * process where the system puts it. */
-                if (best && fast_mask && !getenv("DS4_CUDA_MOE_STREAM_ALL_CORES") &&
-                    SetProcessAffinityMask(GetCurrentProcess(), fast_mask))
+                 * against 47).  With the slow cores idle the process left
+                 * to the scheduler still took 0.26 ms an expert against 0.11. */
+                if (best && fast_mask && SetProcessAffinityMask(GetCurrentProcess(), fast_mask))
                     fprintf(stderr, "ds4: process kept on the %u fast cores (affinity %llx)\n", fast,
                             (unsigned long long)fast_mask);
             }
