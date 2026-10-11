@@ -4425,34 +4425,50 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
                 moe_stream_ram_init(g_moe_stream_ram, 2 * t->gate_expert_bytes + t->down_expert_bytes);
                 moe_stream_cache &c = g_moe_stream_caches[device];
                 const bool handing_out = moe_layer_plan(t, &c, true);
-                /* A layer read ahead goes to the device as it is.  Not while
-                 * its experts are still being handed to RAM and the fixed
-                 * set: that happens in the reader below. */
+                /* A layer read ahead goes to the device as it is, and what the
+                 * plan hands to RAM and to the fixed set is copied out of the
+                 * same region: sending such a pass through the reader below
+                 * gave up the read-ahead and cost it 20 s more on Qwen3.8. */
                 const char *ahead[3] = {NULL, NULL, NULL};
-                const bool was_ahead = !handing_out && moe_layer_ahead_take(t, ahead);
+                const bool was_ahead = moe_layer_ahead_take(t, ahead);
                 moe_layer_ahead_next(t);
                 if (was_ahead) {
                     /* What this device's cache holds is still copied on the
-                     * device; the read-ahead supplies the runs in between. */
+                     * device; the read-ahead supplies the runs in between.  A
+                     * fixed slot given out just now holds nothing yet. */
                     const uint64_t expert[3] = {t->gate_expert_bytes, t->gate_expert_bytes, t->down_expert_bytes};
                     const uint64_t part[3] = {0, t->gate_expert_bytes, 2 * t->gate_expert_bytes};
                     char *to[3] = {g_moe_layer.buffer, g_moe_layer.buffer + gate, g_moe_layer.buffer + 2 * gate};
+                    const auto cached_slot = [&](uint32_t e) {
+                        const auto slot = c.slot_of.find((uint64_t)t->layer << 32 | e);
+                        return slot != c.slot_of.end() && g_moe_layer.fixed_slot[e] < 0 ? (int)slot->second : -1;
+                    };
                     ok = true;
                     for (uint32_t e = 0; e < t->n_total_expert && ok;) {
-                        const auto slot = c.slot_of.find((uint64_t)t->layer << 32 | e);
+                        const int slot = cached_slot(e);
                         uint32_t end = e + 1;
-                        if (slot == c.slot_of.end())
-                            while (end < t->n_total_expert && !c.slot_of.count((uint64_t)t->layer << 32 | end)) end++;
+                        if (slot < 0)
+                            while (end < t->n_total_expert && cached_slot(end) < 0) end++;
                         for (int i = 0; i < 3 && ok; i++) {
-                            const bool cached = slot != c.slot_of.end();
-                            const char *from = cached ? c.gate + (uint64_t)slot->second * c.slot_bytes + part[i]
-                                                      : ahead[i] + (uint64_t)e * expert[i];
+                            const char *from = slot >= 0 ? c.gate + (uint64_t)slot * c.slot_bytes + part[i]
+                                                         : ahead[i] + (uint64_t)e * expert[i];
                             ok = cuda_ok(cudaMemcpyAsync(to[i] + (uint64_t)e * expert[i], from,
                                                          (uint64_t)(end - e) * expert[i],
-                                                         cached ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+                                                         slot >= 0 ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
                                                          stream), "MoE layer load");
                         }
                         e = end;
+                    }
+                    for (uint32_t e = 0; e < t->n_total_expert && ok && handing_out; e++) {
+                        const int ram_slot = g_moe_layer.ram_slot[e], fixed_slot = g_moe_layer.fixed_slot[e];
+                        for (int i = 0; i < 3 && ok && (ram_slot >= 0 || fixed_slot >= 0); i++) {
+                            const char *from = ahead[i] + (uint64_t)e * expert[i];
+                            if (ram_slot >= 0) memcpy(g_moe_stream_ram.at((uint32_t)ram_slot) + part[i], from, expert[i]);
+                            if (fixed_slot >= 0)
+                                ok = cuda_ok(cudaMemcpyAsync(c.gate + (uint64_t)fixed_slot * c.slot_bytes + part[i], from,
+                                                             expert[i], cudaMemcpyHostToDevice, stream),
+                                             "MoE fixed expert load");
+                        }
                     }
                 } else {
                 /* An expert this device's cache holds is copied from there, on
