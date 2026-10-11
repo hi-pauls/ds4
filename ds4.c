@@ -62906,9 +62906,9 @@ static void kolibri1_graph_transfer_scratch(ds4_kolibri1_gpu_graph *dst, ds4_kol
 
 static uint64_t kolibri1_graph_scratch_bytes(const ds4_kolibri1_gpu_graph *g) {
     uint64_t total = 0;
-#define DS4_KOLIBRI1_SCRATCH_COUNT(field_) total += ds4_gpu_tensor_bytes(g->field_);
-    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_COUNT)
-#undef DS4_KOLIBRI1_SCRATCH_COUNT
+#define DS4_KOLIBRI1_SCRATCH_BYTES(field_) total += ds4_gpu_tensor_bytes(g->field_);
+    DS4_KOLIBRI1_SCRATCH_FIELDS(DS4_KOLIBRI1_SCRATCH_BYTES)
+#undef DS4_KOLIBRI1_SCRATCH_BYTES
     return total;
 }
 
