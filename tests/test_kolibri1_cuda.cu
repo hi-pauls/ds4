@@ -229,19 +229,16 @@ static void test_softmax_piece(unsigned T, unsigned pos0, unsigned piece) {
     cudaFree(ml); cudaFree(out); cudaFree(col);
 }
 
-/* The kernels the backend picks, so DS4_KOLIBRI1_OLD_ATTN=1 checks the
- * previous q8 tiled kernel and merge instead. */
+/* The kernels the backend picks. */
 template<bool Q8>
 static void launch_attn(bool tiles, const attn_args &a, unsigned T, const float *q, const float *kc, const float *vc,
                         float *out, float *part) {
-    const auto q8_tiles = attn_old_kernels() ? attn_decode_tiles_q8 : attn_decode_tiles_q8_pipe;
-    if (tiles) (Q8 ? q8_tiles : attn_decode_tiles)<<<dim3(a.n_splits, HKV, T), 32 * ATTN_NSG>>>(a, q, kc, vc, out, part);
+    if (tiles) (Q8 ? attn_decode_tiles_q8_pipe : attn_decode_tiles)<<<dim3(a.n_splits, HKV, T), 32 * ATTN_NSG>>>(a, q, kc, vc, out, part);
     else attn_decode<Q8><<<dim3(a.n_splits, HKV, T), 32 * ATTN_NSG>>>(a, q, kc, vc, out, part);
 }
 
 static void launch_merge(const attn_args &a, unsigned T, const float *part, float *out) {
-    if (attn_old_kernels()) attn_merge<<<dim3(H, T), 32>>>(a, part, out);
-    else attn_merge_wide<<<dim3(H, T), ATTN_MERGE_THREADS>>>(a, part, out);
+    attn_merge_wide<<<dim3(H, T), ATTN_MERGE_THREADS>>>(a, part, out);
 }
 
 /* tiles takes attn_decode_tiles, which only does full context with splits. */
@@ -332,8 +329,8 @@ static void bench_attn(unsigned pos0, unsigned window, unsigned cache_rows, bool
     check_cuda(cudaEventSynchronize(t1), "bench");
     float ms = 0;
     check_cuda(cudaEventElapsedTime(&ms, t0, t1), "event");
-    printf("kolibri1-cuda: bench %-6s %s%s keys=%6u splits=%3u %9.1f us/launch\n", tiles ? "tiles" : "decode",
-           fmt == KV_F32 ? "f32" : "q8 ", attn_old_kernels() ? " (old)" : "", window ? window : pos0 + T, a.n_splits,
+    printf("kolibri1-cuda: bench %-6s %s keys=%6u splits=%3u %9.1f us/launch\n", tiles ? "tiles" : "decode",
+           fmt == KV_F32 ? "f32" : "q8 ", window ? window : pos0 + T, a.n_splits,
            1000.0 * ms / launches);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
     cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(out); cudaFree(part);

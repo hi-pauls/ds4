@@ -622,37 +622,10 @@ __global__ void __launch_bounds__(128) attn_decode_tiles_q8_pipe(attn_args a, co
     }
 }
 
-/* Combines the split partials of one (head, token). */
-__global__ void attn_merge(attn_args a, const float *part, float *out) {
-    const unsigned h = blockIdx.x, tok = blockIdx.y, lane = threadIdx.x;
-    if (h >= a.n_head || tok >= a.n_tokens) return;
-    const unsigned Hkv = a.n_head_kv, D = a.head_dim, group = a.n_head / Hkv;
-    const unsigned kvh = h / group, g = h % group;
-    const uint64_t stride = (uint64_t)group * (2u + D);
-    const float *base = part + (((uint64_t)tok * Hkv + kvh) * a.n_splits * group + g) * (2u + D);
-    float mm = -3.0e38f;
-    for (unsigned s = 0; s < a.n_splits; s++) mm = fmaxf(mm, base[s * stride]);
-    float ll = 0.0f, o[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    for (unsigned s = 0; s < a.n_splits; s++) {
-        const float *p = base + s * stride;
-        const float c = p[1] > 0.0f ? expf(p[0] - mm) : 0.0f;
-        ll += p[1] * c;
-        for (unsigned j = 0; j < 4u; j++) {
-            const unsigned d = lane * 4u + j;
-            if (d < D) o[j] += p[2u + d] * c;
-        }
-    }
-    const float inv = ll > 0.0f ? 1.0f / ll : 0.0f;
-    float *dst = out + ((uint64_t)tok * a.n_head + h) * D;
-    for (unsigned j = 0; j < 4u; j++) {
-        const unsigned d = lane * 4u + j;
-        if (d < D) dst[d] = o[j] * inv;
-    }
-}
-
-/* attn_merge with the splits spread over the warps of a block instead of
- * walked by one warp, whose serial loads were most of its time at 256
- * splits; the sums run per warp and then across the warps. */
+/* Combines the split partials of one (head, token), the splits spread over
+ * the warps of a block: one warp walking them spent most of its time on
+ * serial loads at 256 splits.  The sums run per warp and then across the
+ * warps. */
 __global__ void __launch_bounds__(ATTN_MERGE_THREADS) attn_merge_wide(attn_args a, const float *part, float *out) {
     constexpr unsigned NW = ATTN_MERGE_THREADS / 32u;
     const unsigned h = blockIdx.x, tok = blockIdx.y, tid = threadIdx.x, warp = tid / 32u, lane = tid & 31u;
@@ -699,12 +672,6 @@ __global__ void __launch_bounds__(ATTN_MERGE_THREADS) attn_merge_wide(attn_args 
             if (d < D) dst[d] = o[j] * inv;
         }
     }
-}
-
-/* DS4_KOLIBRI1_OLD_ATTN=1 keeps attn_decode_tiles_q8 and attn_merge for A/B. */
-static bool attn_old_kernels(void) {
-    static const bool old = getenv("DS4_KOLIBRI1_OLD_ATTN") != NULL;
-    return old;
 }
 
 __device__ __forceinline__ bool router_better(float v, int i, float bv, int bi) {
@@ -802,22 +769,12 @@ static attn_prep_args make_attn_prep_args(unsigned T, unsigned H, unsigned Hkv, 
     return a;
 }
 
-/* DS4_KOLIBRI1_ATTN_SPLITS=N lowers either kernel's limit for A/B. */
-static unsigned attn_split_limit(unsigned most) {
-    static const unsigned asked = [] {
-        const char *set = getenv("DS4_KOLIBRI1_ATTN_SPLITS");
-        return set ? (unsigned)strtoul(set, NULL, 10) : 0u;
-    }();
-    return asked && asked < most ? asked : most;
-}
-
 static attn_args make_attn_args(unsigned T, unsigned H, unsigned Hkv, unsigned D, unsigned pos0,
                                 unsigned window, unsigned cache_rows, bool split, float scale) {
     const unsigned n_keys = window ? std::min(pos0 + T, window) : pos0 + T;   /* the last token's span */
     unsigned n_splits = split ? (n_keys + 31u) / 32u : 1u;
     if (n_splits < 1u) n_splits = 1u;
-    const unsigned limit = attn_split_limit(ATTN_MAX_SPLITS);
-    if (n_splits > limit) n_splits = limit;
+    if (n_splits > ATTN_MAX_SPLITS) n_splits = ATTN_MAX_SPLITS;
     const attn_args a = { T, H, Hkv, D, pos0, window, cache_rows, n_splits, (n_keys + n_splits - 1u) / n_splits, scale };
     return a;
 }
@@ -826,7 +783,7 @@ static attn_args make_attn_args(unsigned T, unsigned H, unsigned Hkv, unsigned D
  * can be short. */
 static attn_args make_attn_tile_args(unsigned T, unsigned H, unsigned Hkv, unsigned D, unsigned pos0, float scale) {
     const unsigned n_keys = pos0 + T;
-    const unsigned most = std::min((n_keys + ATTN_TILE - 1u) / ATTN_TILE, attn_split_limit(ATTN_TILE_MAX_SPLITS));
+    const unsigned most = std::min((n_keys + ATTN_TILE - 1u) / ATTN_TILE, ATTN_TILE_MAX_SPLITS);
     const unsigned keys = ((n_keys + most - 1u) / most + ATTN_TILE - 1u) / ATTN_TILE * ATTN_TILE;
     const attn_args a = { T, H, Hkv, D, pos0, 0u, 0u, (n_keys + keys - 1u) / keys, keys, scale };
     return a;
@@ -1088,15 +1045,11 @@ extern "C" int ds4_gpu_kolibri_attn_decode_tensor(
         !qwen4_cuda::tensor(q, qb) || !qwen4_cuda::tensor(k_cache, cb) || !qwen4_cuda::tensor(v_cache, cb) ||
         !qwen4_cuda::tensor(out, qb) ||
         (part && !qwen4_cuda::tensor(part, ds4_gpu_kolibri_attn_part_floats(T, H, D) * 4))) return 0;
-    /* DS4_KOLIBRI1_NO_ATTN_TILES=1 keeps attn_decode on full layers for A/B.
-     * The tiled kernel reads K as float4. */
-    static const bool tiled = getenv("DS4_KOLIBRI1_NO_ATTN_TILES") == NULL;
-    const bool tiles = tiled && !window && !cache_rows && part && !((uintptr_t)k_cache->ptr & 15u);
+    /* The tiled kernel reads K as float4. */
+    const bool tiles = !window && !cache_rows && part && !((uintptr_t)k_cache->ptr & 15u);
     const attn_args a = tiles ? make_attn_tile_args(T, H, Hkv, D, pos0, scale)
                               : make_attn_args(T, H, Hkv, D, pos0, window, cache_rows, part != NULL, scale);
-    /* DS4_KOLIBRI1_NO_ATTN_PRODUCTS=1 keeps the per-token kernel for A/B. */
-    static const bool products = getenv("DS4_KOLIBRI1_NO_ATTN_PRODUCTS") == NULL;
-    if (products && !window && !cache_rows && !part && T >= 64 && !g_decode_graph_capturing) {
+    if (!window && !cache_rows && !part && T >= 64 && !g_decode_graph_capturing) {
         if ((q8 ? attn_batch_products_q8 : attn_batch_products)(
                 (float *)out->ptr, (const float *)q->ptr, (const float *)k_cache->ptr,
                 (const float *)v_cache->ptr, T, H, Hkv, D, pos0, scale)) return 1;
@@ -1107,16 +1060,14 @@ extern "C" int ds4_gpu_kolibri_attn_decode_tensor(
                             "expect it to be slow\n", T, pos0 + T);
         }
     }
-    const bool old = attn_old_kernels();
-    const auto kernel = tiles ? (q8 ? (D == 128 && !old ? attn_decode_tiles_q8_pipe : attn_decode_tiles_q8) : attn_decode_tiles)
+    const auto kernel = tiles ? (q8 ? (D == 128 ? attn_decode_tiles_q8_pipe : attn_decode_tiles_q8) : attn_decode_tiles)
                               : (q8 ? attn_decode<true> : attn_decode<false>);
     kernel<<<dim3(a.n_splits, Hkv, T), 32 * ATTN_NSG, 0, cuda_decode_stream()>>>(
         a, (const float *)q->ptr, (const float *)k_cache->ptr, (const float *)v_cache->ptr,
         (float *)out->ptr, a.n_splits > 1 ? (float *)part->ptr : NULL);
     if (!qwen4_cuda::launched()) return 0;
     if (a.n_splits == 1) return 1;
-    if (old) attn_merge<<<dim3(H, T), 32, 0, cuda_decode_stream()>>>(a, (const float *)part->ptr, (float *)out->ptr);
-    else attn_merge_wide<<<dim3(H, T), ATTN_MERGE_THREADS, 0, cuda_decode_stream()>>>(a, (const float *)part->ptr, (float *)out->ptr);
+    attn_merge_wide<<<dim3(H, T), ATTN_MERGE_THREADS, 0, cuda_decode_stream()>>>(a, (const float *)part->ptr, (float *)out->ptr);
     return qwen4_cuda::launched();
 }
 

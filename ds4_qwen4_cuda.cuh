@@ -4,7 +4,6 @@
 #include "ds4_qwen4_vision.h"
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
-#define DS4_MOE_DOORBELL_X86 1
 #endif
 
 namespace qwen4_cuda {
@@ -710,55 +709,6 @@ __device__ __forceinline__ int moe_pair_id(const int *selected, const int *table
     return e;
 }
 
-template<unsigned TYPE, bool DOWN>
-__global__ void moe_mv(float *out, const float *x, const int *selected, const int *table, int *mapped,
-        const char *w0, const char *w1, const char *sh0, const char *sh1,
-        unsigned shared_type, unsigned NE, unsigned NT, unsigned NS, unsigned K, unsigned M,
-        uint64_t rb, uint64_t srb, uint64_t estride) {
-    const unsigned row = blockIdx.x * 4 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z;
-    __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
-    __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
-    if (TYPE == 16) {
-        for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) grid_table[i] = cuda_iq2xxs_grid[i];
-        for (unsigned i = threadIdx.x; i < 128; i += blockDim.x) sign_table[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
-    }
-    if (row >= M) return;
-    const bool shared = slot == NS;
-    const unsigned stride = NS + (shared_type != UINT_MAX);
-    const uint64_t pair = (uint64_t)t * stride + slot;
-    const float *xt = x + (DOWN ? pair : t) * K;
-    float a = 0, b = 0;
-    if (shared) {
-        for (unsigned i = threadIdx.x & 31; i < K; i += 32) {
-            a += scalar(sh0 + row * srb, i, shared_type) * xt[i];
-            if (!DOWN) b += scalar(sh1 + row * srb, i, shared_type) * xt[i];
-        }
-        a = sum(a); b = sum(b);
-    } else {
-        const int e = moe_pair_id(selected, table, mapped, (uint64_t)t * NS + slot, NT, !blockIdx.x && !threadIdx.x);
-        if (e >= 0 && (unsigned)e < NE) {
-            const uint64_t off = (uint64_t)e * estride + row * rb;
-            if ((TYPE == 16 || TYPE == 10 || TYPE == 12 || TYPE == 39) && !((uintptr_t)xt&15)) {
-                for (unsigned i = (threadIdx.x&31)*4; i < K; i += 128) {
-                    const float4 xv = *(const float4 *)(xt+i);
-                    const float4 av = value4<TYPE>(w0+off,i,grid_table,sign_table);
-                    a += av.x*xv.x; a += av.y*xv.y; a += av.z*xv.z; a += av.w*xv.w;
-                    if (!DOWN) {
-                        const float4 bv = value4<TYPE>(w1+off,i,grid_table,sign_table);
-                        b += bv.x*xv.x; b += bv.y*xv.y; b += bv.z*xv.z; b += bv.w*xv.w;
-                    }
-                }
-                a = sum(a); b = sum(b);
-            } else {
-                a = dot<TYPE>(w0+off,xt,K,grid_table,sign_table);
-                if (!DOWN) b = dot<TYPE>(w1+off,xt,K,grid_table,sign_table);
-            }
-        }
-    }
-    if (!(threadIdx.x & 31)) out[pair * M + row] = DOWN ? a : silu(a) * b;
-}
-
 /* Four 2-bit values of a Q2_K word against x, each scale * q - min as
  * value4 forms it; q becomes a float by exponent bias, which is exact and
  * spares the conversion instruction. */
@@ -911,10 +861,9 @@ __device__ __forceinline__ void plain_rows(const char *r0, const char *r1, const
     }
 }
 
-/* moe_mv for single tokens: eight rows to a block, the shared expert
- * through a path chosen once per row, Q2_K and IQ2_XXS decoded a block
- * header per 16 values.  Every product is the one moe_mv forms; only the
- * order they are summed in differs.  DS4_CUDA_MOE_OLD_MV=1 keeps moe_mv. */
+/* The routed experts' rows against x: eight rows to a block, the shared
+ * expert through a path chosen once per row, Q2_K and IQ2_XXS decoded a
+ * block header per 16 values. */
 template<unsigned TYPE, bool DOWN>
 __global__ void moe_mv_rows(float *out, const float *x, const int *selected, const int *table, int *mapped,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
@@ -976,53 +925,6 @@ __global__ void moe_merge(float *part, const float *ext, const int *selected, un
     if (d < M && selected[pair] < 0) part[((uint64_t)t * stride + slot) * M + d] = ext[pair * M + d];
 }
 
-/* The device side of the doorbell (see moe_doorbell_device): the router's
- * ids with their slots, and the layer input when some pair has no slot, go
- * to the mapped block, then the ring.  The system fence is what orders those
- * stores before the ring for a reader on the host; without it the host sees
- * the ring and reads a payload that has not landed.  The ring is this
- * record's own number, stored, not counted up. */
-__global__ void moe_doorbell_publish(const int *selected, const int *table, unsigned NT, unsigned NS,
-        const float *x, unsigned K, int *ids_out, float *x_out, unsigned *need, unsigned *seq, unsigned value) {
-    int miss = 0;
-    if (threadIdx.x < NS) {
-        const int e = selected[threadIdx.x];
-        const int slot = (unsigned)e < NT ? table[e] : -1;
-        ids_out[threadIdx.x] = e;
-        ids_out[NS + threadIdx.x] = slot;
-        miss = slot < 0;
-    }
-    if (__syncthreads_or(miss)) {
-        for (unsigned i = threadIdx.x; i < K; i += blockDim.x) x_out[i] = x[i];
-        if (!threadIdx.x) *need = 1;
-    } else if (!threadIdx.x) *need = 0;
-    __threadfence_system();
-    __syncthreads();
-    if (!threadIdx.x) *(volatile unsigned *)seq = value;
-}
-
-/* One thread holds the stream until the host has served this record, or
- * until the host has let every wait out with UINT32_MAX; a record the host
- * is not needed for passes at once.  While one of these is queued nothing
- * may block the host (see moe_doorbell_service). */
-__global__ void moe_doorbell_wait(const unsigned *flag, const unsigned *need, unsigned want) {
-    if (*need)
-        while (*(volatile const unsigned *)flag < want) {
-#if __CUDA_ARCH__ >= 700
-            __nanosleep(200);
-#endif
-        }
-    __threadfence_system();
-}
-
-/* moe_merge with the rows read where the host left them, in the mapped block. */
-__global__ void moe_doorbell_merge(float *part, const volatile float *ext, const int *selected, unsigned NS,
-        unsigned stride, unsigned M) {
-    const unsigned slot = blockIdx.y, t = blockIdx.z, d = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t pair = (uint64_t)t * NS + slot;
-    if (d < M && selected[pair] < 0) part[((uint64_t)t * stride + slot) * M + d] = ext[pair * M + d];
-}
-
 /* Arithmetic for its own sake: see moe_stream_keep_awake. */
 __global__ void keep_awake(unsigned iterations, unsigned *sink) {
     unsigned v = threadIdx.x;
@@ -1038,16 +940,12 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
      * is not one expert's rows: the streaming arena keeps gate, up and down
      * of an expert together.  table, when given, maps sel through
      * moe_pair_id and the kernel leaves the slots in mapped. */
-    static const bool old = getenv("DS4_CUDA_MOE_OLD_MV") != NULL;
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const uint64_t es = expert_stride ? expert_stride : (uint64_t)M * rb;
-    const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T), rows((M + 7) / 8, NS + (st != UINT_MAX), T);
+    const dim3 rows((M + 7) / 8, NS + (st != UINT_MAX), T);
 #define QWEN_MOE_ARGS out,x,sel,table,mapped,w0,w1,s0,s1,st,NE,NT,NS,K,M,rb,srb,es
 #define QWEN_MOE(TYPE) case TYPE: \
-    if (old) { \
-        if (down) moe_mv<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
-        else moe_mv<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
-    } else if (down) moe_mv_rows<TYPE, true><<<rows,256,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
+    if (down) moe_mv_rows<TYPE, true><<<rows,256,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
     else moe_mv_rows<TYPE, false><<<rows,256,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
     break
     switch (type) {
@@ -2755,7 +2653,6 @@ static struct {
      * the selection's read-back and leaves the rest to _down_tensor, which
      * settles it once the kernels are queued (see moe_stream_settle). */
     bool deferred;
-    bool doorbell;                        /* deferred through the doorbell: the host serves it when it rings */
     ds4_gpu_stream_expert_table table;    /* the caller's copy may not outlive _begin */
     uint32_t T, NS;
     moe_stream_cache *candidate;          /* the helper, if any, before it has a share */
@@ -2914,47 +2811,6 @@ static bool moe_stream_wait(cudaStream_t stream, const char *what);
 static bool moe_stream_ram_settle(uint32_t ram_slot);
 static void moe_stream_promote_drained(void);
 
-/* DS4_CUDA_MOE_STREAM_PROBE: the time one empty round trip to the current
- * device takes, the floor under every per-layer wait there. */
-static void moe_stream_probe(int device) {
-    void *word = NULL, *host = NULL;
-    if (cudaMalloc(&word, 64) == cudaSuccess && cudaMallocHost(&host, 64) == cudaSuccess) {
-        const unsigned rounds = 500;
-        const auto t0 = std::chrono::steady_clock::now();
-        for (unsigned i = 0; i < rounds; i++) {
-            (void)cudaMemcpyAsync(host, word, 64, cudaMemcpyDeviceToHost, cuda_decode_stream());
-            (void)moe_stream_wait(cuda_decode_stream(), "MoE round trip probe");
-        }
-        fprintf(stderr, "ds4: CUDA device %d empty round trip: %.3f ms\n", device,
-                1000.0 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / rounds);
-    }
-    /* And what the link moves: one large block from page-locked and one from
-     * ordinary host memory. */
-    const uint64_t block = 256ull << 20;
-    void *far = NULL, *locked = NULL;
-    char *plain = (char *)malloc(block);
-    if (plain && cudaMalloc(&far, block) == cudaSuccess && cudaMallocHost(&locked, block) == cudaSuccess) {
-        memset(plain, 1, block);
-        memset(locked, 1, block);
-        double rate[2] = {0.0, 0.0};
-        for (int kind = 0; kind < 2; kind++) {
-            (void)cudaMemcpy(far, kind ? plain : locked, block, cudaMemcpyHostToDevice);
-            const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < 4; i++) (void)cudaMemcpy(far, kind ? plain : locked, block, cudaMemcpyHostToDevice);
-            rate[kind] = 4.0 * (double)block / 1073741824.0 /
-                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        }
-        fprintf(stderr, "ds4: CUDA device %d host-to-device: %.2f GiB/s from page-locked memory, %.2f from ordinary\n",
-                device, rate[0], rate[1]);
-    }
-    free(plain);
-    (void)cudaFree(far);
-    (void)cudaFreeHost(locked);
-    (void)cudaFree(word);
-    (void)cudaFreeHost(host);
-    (void)cudaGetLastError();
-}
-
 /* A blocking wait gives the thread up to the scheduler, which on Windows
  * costs most of a millisecond however short the work; with
  * DS4_CUDA_MOE_STREAM_SPIN the thread polls for a few milliseconds first. */
@@ -2984,18 +2840,10 @@ static bool moe_stream_event_wait(cudaEvent_t event, const char *what) {
  * trip, paid only by a layer the CPU route or the helper has a share of.
  * x was complete when the selection was, so nothing new is waited for. */
 static bool moe_stream_fetch_input(const float *x, uint64_t bytes) {
-    if (!g_moe_stream.input_ready) {
-        /* On the decode stream a synchronous cudaMemcpy would not queue
-         * behind the kernels that wrote x; a copy on that stream does. */
-        const cudaStream_t stream = cuda_decode_stream();
+    if (!g_moe_stream.input_ready)
         g_moe_stream.input_ready =
             moe_stream_grow(g_moe_stream.host_x, g_moe_stream.host_x_cap, bytes, true, "MoE expert input staging") &&
-            (g_decode_stream_active ?
-                 cuda_ok(cudaMemcpyAsync(g_moe_stream.host_x, x, bytes, cudaMemcpyDeviceToHost, stream),
-                         "MoE expert input read") &&
-                 cuda_ok(cudaStreamSynchronize(stream), "MoE expert input wait") :
-                 cuda_ok(cudaMemcpy(g_moe_stream.host_x, x, bytes, cudaMemcpyDeviceToHost), "MoE expert input read"));
-    }
+            cuda_ok(cudaMemcpy(g_moe_stream.host_x, x, bytes, cudaMemcpyDeviceToHost), "MoE expert input read");
     return g_moe_stream.input_ready;
 }
 
@@ -3971,7 +3819,7 @@ static bool moe_layer_read(char *device, uint64_t file_off, uint64_t bytes, cuda
  * layer's experts are read by a second thread while the devices work on the
  * current one: a pass then costs the longer of the two, not their sum.  Two
  * page-locked regions alternate, since the device copies out of one are still
- * queued when the next read starts.  DS4_CUDA_MOE_STREAM_NO_AHEAD=1 turns it off. */
+ * queued when the next read starts. */
 struct moe_layer_ahead {
     std::mutex lock;
     std::condition_variable wake, done;
@@ -4056,11 +3904,10 @@ static bool moe_layer_ahead_take(const ds4_gpu_stream_expert_table *t, const cha
 
 /* Notes this layer's place in the file and has the one after it read. */
 static void moe_layer_ahead_next(const ds4_gpu_stream_expert_table *t) {
-    static const bool off = getenv("DS4_CUDA_MOE_STREAM_NO_AHEAD") != NULL;
     moe_layer_ahead &a = g_moe_ahead;
     const uint64_t gate = (uint64_t)t->n_total_expert * t->gate_expert_bytes;
     const uint64_t bytes = 2 * gate + (uint64_t)t->n_total_expert * t->down_expert_bytes + 6 * moe_layer_sector;
-    if (!off && !a.unavailable && !a.started && g_model_fd >= 0) {
+    if (!a.unavailable && !a.started && g_model_fd >= 0) {
         a.file = ReOpenFile((HANDLE)_get_osfhandle(g_model_fd), GENERIC_READ,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
@@ -4333,9 +4180,7 @@ static bool moe_layer_plan(const ds4_gpu_stream_expert_table *t, moe_stream_cach
      * decoding, a refill reads the whole layer for it (0.7 GiB a layer on
      * Qwen3.8, 20 s over the first tokens), where a use at a time reads
      * just what is needed. */
-    /* DS4_CUDA_MOE_STREAM_NO_RAM_REFILL=1 leaves the tier as the first pass filled it, for A/B. */
-    static const bool refill = getenv("DS4_CUDA_MOE_STREAM_NO_RAM_REFILL") == NULL;
-    g_moe_layer.ram_done[layer] = (g_moe_layer.ram_done[layer] || want_ram) && !(ram_moved && refill && prompt_pass);
+    g_moe_layer.ram_done[layer] = (g_moe_layer.ram_done[layer] || want_ram) && !(ram_moved && prompt_pass);
     return any;
 }
 
@@ -4354,9 +4199,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
     using namespace qwen4_cuda;
     int resident = 0, device = -1;
     g_moe_layer.buffer = NULL;
-    /* DS4_CUDA_MOE_STREAM_NO_LAYER=1 keeps the per-token expert path for A/B. */
-    static const bool off = getenv("DS4_CUDA_MOE_STREAM_NO_LAYER") != NULL;
-    if (!off && g_ssd_streaming_mode && t && t->model_map && cudaGetDevice(&device) == cudaSuccess &&
+    if (g_ssd_streaming_mode && t && t->model_map && cudaGetDevice(&device) == cudaSuccess &&
         !g_moe_layer_devices[device].unavailable) {
         moe_layer_device &here = g_moe_layer_devices[device];
         const uint64_t gate = (uint64_t)t->n_total_expert * t->gate_expert_bytes;
@@ -4476,10 +4319,8 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
                 /* An expert this device's cache holds is copied from there, on
                  * the device; one in the page-locked part of the RAM tier
                  * comes from RAM; runs of the others are read from the file.
-                 * The rest of the RAM tier is not a source unless
-                 * DS4_CUDA_MOE_STREAM_LAYER_FROM_RAM asks: copies from memory
+                 * The rest of the RAM tier is not a source: copies from memory
                  * that is not page-locked measured a quarter of the rate. */
-                static const bool ram_source = getenv("DS4_CUDA_MOE_STREAM_LAYER_FROM_RAM") != NULL;
                 const moe_stream_ram &ram = g_moe_stream_ram;
                 std::vector<int> cached(t->n_total_expert, -1), in_ram(t->n_total_expert, -1);
                 for (uint32_t e = 0; e < t->n_total_expert; e++) {
@@ -4488,7 +4329,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
                         cached[e] = (int)slot->second;
                     else if (const auto slot = ram.slot_of.find(key);
                              slot != ram.slot_of.end() && g_moe_layer.ram_slot[e] < 0 &&
-                             (ram_source || slot->second < ram.locked_slots))
+                             slot->second < ram.locked_slots)
                         in_ram[e] = (int)slot->second;
                 }
                 /* With DS4_CUDA_MOE_STREAM_STATS: where a pass took its experts from. */
@@ -4651,8 +4492,7 @@ static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *count
                         ram.key[in_ram->second] = moe_stream_no_key;
                         ram.free_slots.push_back(in_ram->second);
                         ram.slot_of.erase(in_ram);
-                        if (t->layer < g_moe_layer.ram_done.size() && !getenv("DS4_CUDA_MOE_STREAM_NO_RAM_REFILL"))
-                            g_moe_layer.ram_done[t->layer] = false;
+                        if (t->layer < g_moe_layer.ram_done.size()) g_moe_layer.ram_done[t->layer] = false;
                     }
                 }
             }
@@ -4771,9 +4611,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer_remote(const ds4_gpu_stream_expert
         const ds4_gpu_tensor *weights, uint32_t T, uint32_t NS, uint32_t K, uint32_t F, uint32_t E,
         uint32_t gate_type, uint32_t down_type) {
     using namespace qwen4_cuda;
-    /* DS4_CUDA_MOE_STREAM_NO_REMOTE=1 keeps large batches on the graph's device for A/B. */
-    static const bool wanted = getenv("DS4_CUDA_MOE_STREAM_HELPER") != NULL &&
-                               getenv("DS4_CUDA_MOE_STREAM_NO_REMOTE") == NULL && !g_moe_split;
+    static const bool wanted = getenv("DS4_CUDA_MOE_STREAM_HELPER") != NULL && !g_moe_split;
     int done = 0, device = -1, count = 0, helper = -1;
     const auto entered = std::chrono::steady_clock::now();
     const uint32_t NE = t ? t->n_total_expert : 0;
@@ -4994,16 +4832,6 @@ static void moe_stream_handout(const ds4_gpu_stream_expert_table *t, moe_stream_
 #endif
 }
 
-/* DS4_CUDA_MOE_STREAM_TRACE names a file that receives "layer expert" for
- * every routed expert use, for sizing a hot set from real traffic. */
-static FILE *moe_stream_trace(void) {
-    static FILE *trace = getenv("DS4_CUDA_MOE_STREAM_TRACE") ?
-                         fopen(getenv("DS4_CUDA_MOE_STREAM_TRACE"), "w") : NULL;
-    return trace;
-}
-
-static void moe_doorbell_stats(void);
-
 /* DS4_CUDA_MOE_STREAM_STATS=N reports misses and their cost every N uses. */
 static void moe_stream_stats(moe_stream_cache &c, int device, moe_stream_cache *h) {
     static const uint64_t stats_every = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_STATS", 0) >> 20;
@@ -5041,7 +4869,6 @@ static void moe_stream_stats(moe_stream_cache &c, int device, moe_stream_cache *
             for (double &seconds : g_moe_prof.seconds) seconds = 0.0;
             g_moe_prof.layers = 0;
         }
-        moe_doorbell_stats();
         if (g_moe_cpu.pairs) {
             fprintf(stderr, "ds4: CUDA MoE CPU path: %llu uses, %.3f ms each, %.3f ms of thread time each on %zu "
                             "workers\n", (unsigned long long)g_moe_cpu.pairs,
@@ -5087,8 +4914,6 @@ static bool moe_stream_place(const ds4_gpu_stream_expert_table *t, moe_stream_ca
     g_moe_stream_ram.free_slots.insert(g_moe_stream_ram.free_slots.end(), g_moe_stream_ram.released.begin(),
                                        g_moe_stream_ram.released.end());
     g_moe_stream_ram.released.clear();
-    if (FILE *trace = moe_stream_trace())
-        for (uint64_t i = 0; i < pairs; i++) fprintf(trace, "%u %d\n", t->layer, ids[i]);
     bool ok = true;
     int *helper_ids = h ? g_moe_stream.host_helper_ids : NULL;
     for (uint64_t i = 0; helper_ids && i < pairs; i++) helper_ids[i] = -1;
@@ -5127,8 +4952,7 @@ static bool moe_stream_place(const ds4_gpu_stream_expert_table *t, moe_stream_ca
      * for an expert with a full percent more uses than the one it replaces
      * (2020 against 2000), and at least four more while the counts are still
      * small: two of similar use would trade places for ever. */
-    static const uint64_t promotions_set = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_PROMOTIONS", 0) >> 20;
-    uint64_t promotions = promotions_set ? promotions_set : pairs / 8 + 1;
+    uint64_t promotions = pairs / 8 + 1;
     const uint32_t promotion_floor = 4;
     for (uint64_t i = 0; i < pairs && ok; i++) {
         /* An id outside the layer stays negative, which the kernels skip. */
@@ -5223,507 +5047,6 @@ static bool moe_stream_place(const ds4_gpu_stream_expert_table *t, moe_stream_ca
     return ok;
 }
 
-/* DS4_KOLIBRI1_DOORBELL=1: a decoded token's expert stages without a host
- * wait per layer.  The selection reaches the host by a kernel, through
- * page-locked memory mapped into both address spaces, and a one-thread
- * kernel behind the layer's mid and down holds the stream until the host
- * has answered, so a device's whole run of layers is queued at once and the
- * host serves the rings in order: the bookkeeping, and the CPU route for a
- * pair whose expert the device does not hold.  Residency is static for the
- * token: no slot or table row changes while a kernel that reads it may be
- * queued, the loads the selections earn are made once the token's streams
- * are idle (moe_doorbell_apply), and a pair without a slot this token goes
- * to the CPU this token.  Needs the decode streams, the CPU route and the
- * RAM tier; anything else keeps the per-layer path. */
-struct moe_doorbell_device {
-    char *host = NULL, *dev = NULL;       /* one mapped block, as the host and as the device address it */
-    unsigned *need = NULL;                /* device memory, a word per record: the layer needs the host */
-    int *mirror = NULL;                   /* page-locked copy of the slot table; stale rows go out of it whole */
-    uint64_t mirror_cap = 0;
-    uint32_t records = 0;                 /* layers the block has room for */
-    unsigned NS = 0, K = 0;
-    uint64_t x_base = 0, ext_base = 0;
-    int tier = -1;
-    uint32_t count = 0;                   /* records queued this token */
-    bool pending = false;                 /* copies on the decode stream the host has not waited out */
-    volatile uint32_t *seq() const { return (volatile uint32_t *)host; }
-    volatile uint32_t *flag() const { return (volatile uint32_t *)(host + 128); }
-    int *ids(uint32_t i) const { return (int *)(host + 256) + (uint64_t)i * 2 * NS; }
-    const int *slots(uint32_t i) const { return ids(i) + NS; }
-    float *x(uint32_t i) const { return (float *)(host + x_base) + (uint64_t)i * K; }
-    float *ext(uint32_t i) const { return (float *)(host + ext_base) + (uint64_t)i * NS * K; }
-    unsigned *d_seq() const { return (unsigned *)dev; }
-    unsigned *d_flag() const { return (unsigned *)(dev + 128); }
-    int *d_ids(uint32_t i) const { return (int *)(dev + 256) + (uint64_t)i * 2 * NS; }
-    float *d_x(uint32_t i) const { return (float *)(dev + x_base) + (uint64_t)i * K; }
-    const float *d_ext(uint32_t i) const { return (const float *)(dev + ext_base) + (uint64_t)i * NS * K; }
-};
-
-struct moe_doorbell_record {
-    int device;
-    uint32_t index;                       /* its ring value less one */
-    ds4_gpu_stream_expert_table table;
-    unsigned NS, M, mid_type, mid_K, mid_M, down_type;
-};
-
-static struct {
-    std::unordered_map<int, moe_doorbell_device> devices;   /* by CUDA device */
-    std::vector<moe_doorbell_record> records;               /* this token's layers, in ring order */
-    size_t served;
-    std::vector<std::pair<size_t, uint32_t>> loads;         /* record, expert: residency changes for the token's end */
-    bool armed;                           /* this token goes through the doorbell */
-    bool released;                        /* every flag is UINT32_MAX: the token is abandoned */
-    double limit_ms;
-    std::chrono::steady_clock::time_point token_at, drained_at;
-    double ring_s, cpu_s, book_s, sync_s, apply_s;          /* this token */
-    double sum_s[6];                      /* queueing, rings, CPU, bookkeeping, final wait, loads; since the last line */
-    uint64_t tokens, layers, host_layers, redone;
-} g_moe_doorbell;
-
-static bool moe_doorbell_on(void) {
-    static const bool on = [] { const char *s = getenv("DS4_KOLIBRI1_DOORBELL"); return s && s[0] == '1'; }();
-    return on;
-}
-
-static void moe_doorbell_fence(void) {
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-#ifdef DS4_MOE_DOORBELL_X86
-    _mm_sfence();
-#endif
-}
-
-/* Every wait kernel of every device out, whatever it waited for: a spin
- * kernel that outlives the host's interest in it, or the process, leaves a
- * Windows GPU lost until a power cycle.  Runs on every failure, at cleanup
- * and from atexit, and must stay free of CUDA calls for the last of those. */
-static void moe_doorbell_release(void) {
-    for (auto &entry : g_moe_doorbell.devices)
-        if (entry.second.host) *entry.second.flag() = UINT32_MAX;
-    moe_doorbell_fence();
-}
-
-/* The token is abandoned: the waits are let out, the streams drained, and
- * the caller runs the token again on the per-layer path. */
-static void moe_doorbell_abandon(const char *why) {
-    moe_doorbell_release();
-    if (!g_moe_doorbell.released) {
-        g_moe_doorbell.released = true;
-        for (auto &entry : g_moe_doorbell.devices) {
-            const moe_doorbell_device &db = entry.second;
-            if (db.host && db.tier >= 0 && g_decode_streams[db.tier]) {
-                if (const cudaError_t err = cudaStreamSynchronize(g_decode_streams[db.tier]); err != cudaSuccess)
-                    fprintf(stderr, "ds4: CUDA MoE doorbell: device %d: %s\n", entry.first, cudaGetErrorString(err));
-            }
-        }
-        fprintf(stderr, "ds4: CUDA MoE doorbell: %s; the token runs again on the per-layer path\n", why);
-    }
-    /* Nothing is left for moe_stream_settle: the open layer has no event. */
-    if (g_moe_stream.doorbell) g_moe_stream.deferred = false;
-    g_moe_stream.doorbell = false;
-}
-
-/* A doorbell record's expert copies ride its device's decode stream, which
- * cuda_decode_stream finds through the current tier: this puts that tier in
- * place and the caller's back. */
-struct moe_doorbell_on_tier {
-    int tier, device = -1;
-    explicit moe_doorbell_on_tier(int t) : tier(g_current_logical_tier) {
-        (void)cudaGetDevice(&device);
-        if (t >= 0 && t != tier) {
-            (void)cudaSetDevice(g_gpu[t].device_id);
-            g_current_logical_tier = t;
-        }
-    }
-    ~moe_doorbell_on_tier() {
-        if (device >= 0) (void)cudaSetDevice(device);
-        g_current_logical_tier = tier;
-    }
-};
-
-static bool moe_doorbell_alloc(moe_doorbell_device &db, uint32_t records, unsigned NS, unsigned K) {
-    const uint64_t x_base = (256 + (uint64_t)records * 2 * NS * 4 + 15) & ~15ull;
-    const uint64_t ext_base = x_base + (((uint64_t)records * K * 4 + 15) & ~15ull);
-    const uint64_t bytes = ext_base + (uint64_t)records * NS * K * 4;
-    void *host = NULL, *dev = NULL, *need = NULL;
-    const bool ok = cuda_ok(cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable),
-                            "MoE doorbell block") &&
-                    cuda_ok(cudaHostGetDevicePointer(&dev, host, 0), "MoE doorbell device address") &&
-                    cuda_ok(cudaMalloc(&need, (uint64_t)records * 4), "MoE doorbell need words");
-    if (ok) {
-        static bool at_exit = false;
-        memset(host, 0, bytes);
-        db.host = (char *)host;
-        db.dev = (char *)dev;
-        db.need = (unsigned *)need;
-        db.records = records;
-        db.NS = NS;
-        db.K = K;
-        db.x_base = x_base;
-        db.ext_base = ext_base;
-        if (!at_exit) {
-            at_exit = true;
-            atexit(moe_doorbell_release);
-        }
-    } else {
-        (void)cudaFreeHost(host);
-        (void)cudaFree(need);
-    }
-    return ok;
-}
-
-/* Every stale row of the device's slot table, out of the mirror in one go:
- * the per-layer ring (moe_stream_table_row) relies on a wait every few
- * layers that a doorbell token does not make. */
-static bool moe_doorbell_rows(moe_stream_cache &c, moe_doorbell_device &db) {
-    bool ok = true;
-    const uint64_t cells = (uint64_t)c.table_layers * c.table_experts;
-    if (cells && db.mirror_cap < cells) {
-        void *grown = NULL;
-        (void)cudaFreeHost(db.mirror);
-        db.mirror = NULL;
-        db.mirror_cap = 0;
-        ok = cuda_ok(cudaMallocHost(&grown, cells * 4), "MoE doorbell slot table mirror");
-        if (ok) {
-            db.mirror = (int *)grown;
-            db.mirror_cap = cells;
-        }
-    }
-    std::vector<bool> stale(c.table_layers, false);
-    bool any = false;
-    for (uint32_t layer = 0; ok && layer < c.table_layers; layer++) {
-        stale[layer] = c.table_gen[layer] != c.generation;
-        any = any || stale[layer];
-        if (stale[layer])
-            for (uint32_t e = 0; e < c.table_experts; e++) db.mirror[(uint64_t)layer * c.table_experts + e] = -1;
-    }
-    if (ok && any) {
-        for (uint32_t s = 0; s < c.slots; s++) {
-            const uint32_t layer = (uint32_t)(c.key[s] >> 32), e = (uint32_t)c.key[s];
-            if (layer < c.table_layers && stale[layer] && e < c.table_experts)
-                db.mirror[(uint64_t)layer * c.table_experts + e] = (int)s;
-        }
-        for (uint32_t layer = 0; ok && layer < c.table_layers; layer++) {
-            if (stale[layer]) {
-                ok = cuda_ok(cudaMemcpyAsync(c.table + (uint64_t)layer * c.table_experts,
-                                             db.mirror + (uint64_t)layer * c.table_experts,
-                                             (uint64_t)c.table_experts * 4, cudaMemcpyHostToDevice,
-                                             cuda_decode_stream()), "MoE doorbell slot table row");
-                if (ok) c.table_gen[layer] = c.generation;
-            }
-        }
-        db.pending = true;
-    }
-    return ok;
-}
-
-/* The host side of one record: what moe_stream_place does for a layer, less
- * anything that changes residency, which is noted for the token's end; the
- * CPU route for the pairs the device gave no slot; then the flag. */
-static bool moe_doorbell_serve(size_t at, moe_doorbell_record &r, moe_doorbell_device &db, const char **failed) {
-    const auto t0 = std::chrono::steady_clock::now();
-    moe_stream_cache &c = g_moe_stream_caches[r.device];
-    moe_stream_ram &ram = g_moe_stream_ram;
-    const ds4_gpu_stream_expert_table *t = &r.table;
-    const int *ids = db.ids(r.index), *slots = db.slots(r.index);
-    static const uint64_t promotions_set = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_PROMOTIONS", 0) >> 20;
-    const uint32_t promotion_floor = 4;
-    uint64_t promotions = promotions_set ? promotions_set : r.NS / 8 + 1;
-    double cpu_s = 0.0;
-    bool ok = true;
-    g_moe_stream_clock++;
-    if (FILE *trace = moe_stream_trace())
-        for (unsigned i = 0; i < r.NS; i++) fprintf(trace, "%u %d\n", t->layer, ids[i]);
-    g_moe_stream.cpu_pairs.clear();
-    g_moe_stream.cpu_slots.clear();
-    g_moe_stream.cpu_done = false;
-    g_moe_stream_by_use = true;
-    if (g_moe_stream_clock % 4096 == 0) {
-        for (auto &entry : g_moe_stream_caches)
-            for (uint32_t &uses : entry.second.heat) uses >>= 1;
-        for (uint32_t &uses : ram.uses) uses >>= 1;
-    }
-    for (unsigned i = 0; i < r.NS; i++) {
-        if (ids[i] >= 0 && (uint32_t)ids[i] < t->n_total_expert) {
-            const uint64_t key = (uint64_t)t->layer << 32 | (uint32_t)ids[i];
-            g_moe_layer_heat[key]++;
-            if (const auto mine = c.slot_of.find(key); mine != c.slot_of.end()) c.stamp[mine->second] = g_moe_stream_clock;
-        }
-    }
-    for (unsigned i = 0; i < r.NS && ok; i++) {
-        if (ids[i] >= 0 && (uint32_t)ids[i] < t->n_total_expert) {
-            const uint64_t key = (uint64_t)t->layer << 32 | (uint32_t)ids[i];
-            /* The slot the kernel used decides, not the host's view: a pair
-             * the device computed as a zero row is the host's to fill. */
-            if (slots[i] >= 0) {
-                if (const auto mine = c.slot_of.find(key); mine != c.slot_of.end()) c.heat[mine->second]++;
-            } else {
-                const int ram_slot = moe_stream_ram_hold(ram, c, t, (uint32_t)ids[i]);
-                if (ram_slot < 0) {
-                    *failed = "the RAM tier had no slot for an expert the CPU route needs";
-                    ok = false;
-                } else {
-                    const bool full = c.filled == c.slots;
-                    bool load = !full;
-                    g_moe_stream.cpu_pairs.push_back(i);
-                    g_moe_stream.cpu_slots.push_back((uint32_t)ram_slot);
-                    if (full && promotions) {
-                        const uint32_t heat = ram.uses[ram_slot], coldest = moe_stream_coldest(c);
-                        load = coldest != UINT32_MAX && heat >= coldest + promotion_floor &&
-                               (uint64_t)heat * 100u >= (uint64_t)coldest * 101u;
-                        promotions -= load;
-                    }
-                    if (load) g_moe_doorbell.loads.emplace_back(at, (uint32_t)ids[i]);
-                }
-            }
-        } else if (slots[i] < 0) {
-            /* An id outside the layer is a zero row on the per-layer path too. */
-            memset(db.ext(r.index) + (uint64_t)i * r.M, 0, (uint64_t)r.M * 4);
-        }
-    }
-    if (ok && !g_moe_stream.cpu_pairs.empty()) {
-        float *const staged = g_moe_stream.host_x;
-        const auto c0 = std::chrono::steady_clock::now();
-        g_moe_stream.host_x = db.x(r.index);
-        g_moe_stream.mid_type = r.mid_type;
-        g_moe_stream.mid_K = r.mid_K;
-        g_moe_stream.mid_M = r.mid_M;
-        ok = moe_stream_cpu_compute(c, r.down_type, r.NS, r.M);
-        g_moe_stream.host_x = staged;
-        if (!ok) *failed = "the CPU route could not evaluate the layer's experts";
-        for (size_t j = 0; ok && j < g_moe_stream.cpu_pairs.size(); j++)
-            memcpy(db.ext(r.index) + g_moe_stream.cpu_pairs[j] * r.M, g_moe_cpu.out + j * r.M, (uint64_t)r.M * 4);
-        cpu_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
-        g_moe_doorbell.host_layers++;
-    }
-    g_moe_stream.cpu_pairs.clear();
-    g_moe_stream.cpu_slots.clear();
-    g_moe_stream.cpu_done = false;
-    c.uses += r.NS;
-    moe_stream_stats(c, r.device, NULL);
-    if (ok) {
-        moe_doorbell_fence();
-        *db.flag() = r.index + 1;
-    }
-    g_moe_doorbell.cpu_s += cpu_s;
-    g_moe_doorbell.book_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - cpu_s;
-    return ok;
-}
-
-/* Serves the records that have rung, in order; drain waits for each ring
- * instead of returning at the first one still to come.  A failure lets every
- * wait out (moe_doorbell_abandon).  While a record is unserved the host may
- * not block on any stream: the device holds its stream for the host, and a
- * host that waits for the device then waits for itself until Windows kills
- * the context two seconds on. */
-static bool moe_doorbell_service(bool drain) {
-    bool ok = true, more = true;
-    const char *failed = NULL;
-    while (ok && more && g_moe_doorbell.served < g_moe_doorbell.records.size()) {
-        moe_doorbell_record &r = g_moe_doorbell.records[g_moe_doorbell.served];
-        moe_doorbell_device &db = g_moe_doorbell.devices[r.device];
-        const uint32_t want = r.index + 1;
-        if (*db.seq() < want) {
-            more = drain;
-            if (drain) {
-                const auto from = std::chrono::steady_clock::now();
-                auto last_flush = from;
-                uint32_t spins = 0;
-                while (ok && *db.seq() < want) {
-#ifdef DS4_MOE_DOORBELL_X86
-                    _mm_pause();
-#endif
-                    if ((++spins & 1023u) == 0) {
-                        const auto now = std::chrono::steady_clock::now();
-                        if (now - last_flush > std::chrono::milliseconds(2)) {
-                            /* A slow ring: submit once more, and notice a stream that faulted or ran dry. */
-                            last_flush = now;
-                            const cudaError_t q = cudaStreamQuery(g_decode_streams[db.tier]);
-                            if (q != cudaErrorNotReady && *db.seq() < want) {
-                                failed = q == cudaSuccess ? "a layer's stream ran dry without ringing" : cudaGetErrorString(q);
-                                ok = false;
-                            }
-                        }
-                        if (ok && std::chrono::duration<double, std::milli>(now - from).count() > g_moe_doorbell.limit_ms) {
-                            failed = "a layer rang too late (DS4_KOLIBRI1_DOORBELL_TIMEOUT_MS)";
-                            ok = false;
-                        }
-                    }
-                }
-                g_moe_doorbell.ring_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - from).count();
-            }
-        }
-        if (ok && more) {
-            const auto from = std::chrono::steady_clock::now();
-            ok = moe_doorbell_serve(g_moe_doorbell.served, r, db, &failed);
-            if (ok && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count() >
-                          g_moe_doorbell.limit_ms) {
-                failed = "a layer's service took too long (DS4_KOLIBRI1_DOORBELL_TIMEOUT_MS)";
-                ok = false;
-            }
-            g_moe_doorbell.served++;
-        }
-    }
-    if (!ok) moe_doorbell_abandon(failed ? failed : "a layer's service failed");
-    return ok;
-}
-
-/* Whether this layer's _begin would block on a stream: the cache or the
- * slot table to size, a layer's first visit (moe_stream_handout waits for
- * its reads), the block to allocate.  All of that is safe once every
- * record so far is served. */
-static bool moe_doorbell_blocking(const ds4_gpu_stream_expert_table *t, const moe_stream_cache &c, int device) {
-    const auto found = g_moe_doorbell.devices.find(device);
-    const moe_doorbell_device *db = found == g_moe_doorbell.devices.end() ? NULL : &found->second;
-    return !c.slots || c.provisional || c.tail_busy || c.table_experts != t->n_total_expert ||
-           c.table_layers <= t->layer || !db || !db->host || db->pending ||
-           db->mirror_cap < (uint64_t)c.table_layers * c.table_experts || moe_layer_pending(t->layer, c);
-}
-
-/* Whether the armed doorbell takes this layer; when it cannot, the token
- * stays on the per-layer path if nothing is queued yet, or is abandoned. */
-static bool moe_doorbell_take(const moe_stream_cache &c, const moe_stream_cache *h, const ds4_gpu_tensor *input,
-                              uint64_t input_bytes, uint32_t T, uint32_t NS) {
-    bool take = g_moe_doorbell.armed && !g_moe_doorbell.released;
-    if (take) {
-        static const bool cpu_wanted = getenv("DS4_CUDA_MOE_STREAM_CPU") != NULL;
-        const char *why = NULL;
-        if (T != 1 || NS > 256) why = "it serves single tokens of up to 256 routed experts";
-        else if (h) why = "a helper device is in use";
-        else if (!cpu_wanted) why = "DS4_CUDA_MOE_STREAM_CPU is not set";
-        else if (!g_moe_cpu.rows) why = "the CPU route has no kernels for these expert types";
-        else if (c.provisional) why = "the expert cache is still provisional";
-        else if (g_moe_stream_ram.slots < NS) why = "the RAM tier (DS4_CUDA_MOE_STREAM_RAM_MIB) is too small";
-        else if (!input || !tensor(input, input_bytes)) why = "no layer input was announced";
-        if (why) {
-            take = false;
-            if (!g_moe_doorbell.records.empty()) moe_doorbell_abandon(why);
-            else {
-                static bool said = false;
-                g_moe_doorbell.armed = false;
-                if (!said) fprintf(stderr, "ds4: CUDA MoE doorbell stays off: %s\n", why);
-                said = true;
-            }
-        }
-    }
-    return take;
-}
-
-/* The publish kernel behind the router, and the record the host serves. */
-static bool moe_doorbell_layer_begin(const ds4_gpu_stream_expert_table *t, moe_stream_cache &c, int device,
-                                     const ds4_gpu_tensor *selected, const ds4_gpu_tensor *input, uint32_t NS,
-                                     cudaStream_t stream) {
-    moe_doorbell_device &db = g_moe_doorbell.devices[device];
-    const unsigned K = g_moe_stream.input_width;
-    const char *failed = NULL;
-    bool ok = true;
-    if (db.host && (db.NS != NS || db.K != K)) failed = "the layer shape changed";
-    else if (!db.host) ok = moe_doorbell_alloc(db, moe_stream_table_layers, NS, K);
-    if (ok && !failed) {
-        ok = moe_stream_table_alloc(c, t->layer, t->n_total_expert, stream) && moe_doorbell_rows(c, db) &&
-             moe_stream_grow(g_moe_cpu.out, g_moe_cpu.out_cap, (uint64_t)NS * K * 4, true, "MoE CPU output");
-        /* The rows above must have landed before the kernels that map through
-         * them; the wait for them is safe once every record so far is served. */
-        if (ok && db.pending) {
-            ok = moe_doorbell_service(true) && cuda_ok(cudaStreamSynchronize(stream), "MoE doorbell copies wait");
-            db.pending = false;
-        }
-        if (ok && db.count >= db.records) failed = "the device runs more layers than the block has room for";
-    }
-    if (ok && !failed) {
-        const uint32_t i = db.count++;
-        db.tier = g_current_logical_tier;
-        moe_doorbell_publish<<<1, 256, 0, stream>>>((const int *)selected->ptr,
-            c.table + (uint64_t)t->layer * c.table_experts, c.table_experts, NS, (const float *)input->ptr, K,
-            db.d_ids(i), db.d_x(i), db.need + i, db.d_seq(), i + 1);
-        ok = launched() != 0;
-        if (ok) {
-            moe_doorbell_record r = {};
-            r.device = device;
-            r.index = i;
-            r.table = *t;
-            r.NS = NS;
-            g_moe_doorbell.records.push_back(r);
-        }
-    }
-    if (failed) {
-        moe_doorbell_abandon(failed);
-        ok = false;
-    }
-    return ok;
-}
-
-/* Behind the down kernel: the wait for the host, the merge of its rows, and
- * the submit so that the device starts on the layer now. */
-static bool moe_doorbell_layer_end(float *part, unsigned stride, unsigned down_type, unsigned NS, unsigned M,
-                                   cudaStream_t stream) {
-    moe_doorbell_record &r = g_moe_doorbell.records.back();
-    moe_doorbell_device &db = g_moe_doorbell.devices[r.device];
-    const moe_stream_cache &c = g_moe_stream_caches[r.device];
-    bool ok = true;
-    if (M != db.K) {
-        moe_doorbell_abandon("the experts' output is not the width of the layer input");
-        ok = false;
-    } else {
-        r.M = M;
-        r.down_type = down_type;
-        r.mid_type = g_moe_stream.mid_type;
-        r.mid_K = g_moe_stream.mid_K;
-        r.mid_M = g_moe_stream.mid_M;
-        moe_doorbell_wait<<<1, 1, 0, stream>>>(db.d_flag(), db.need + r.index, r.index + 1);
-        ok = launched() != 0;
-        if (ok) {
-            moe_doorbell_merge<<<dim3((M + 255) / 256, NS, 1), 256, 0, stream>>>(part, db.d_ext(r.index), c.selected,
-                                                                                 NS, stride, M);
-            ok = launched() != 0;
-        }
-        (void)cudaStreamQuery(stream);
-    }
-    g_moe_stream.deferred = false;
-    g_moe_stream.doorbell = false;
-    return ok;
-}
-
-/* The residency changes the token's selections earned, now that its streams
- * are idle: each on its device's decode stream, ahead of the next token's
- * kernels, which wait for them in moe_doorbell_layer_begin along with the
- * rows they make stale. */
-static bool moe_doorbell_apply(void) {
-    bool ok = true;
-    if (!g_moe_doorbell.loads.empty()) {
-        moe_stream_ram &ram = g_moe_stream_ram;
-        g_moe_stream_clock++;
-        /* The staging ring and the released RAM slots fed copies queued at
-         * the last token's end; this token's final wait has run them. */
-        for (auto &entry : g_moe_stream_caches) entry.second.stage_used = 0;
-        ram.free_slots.insert(ram.free_slots.end(), ram.released.begin(), ram.released.end());
-        ram.released.clear();
-        for (size_t i = 0; i < g_moe_doorbell.loads.size() && ok; i++) {
-            const moe_doorbell_record &r = g_moe_doorbell.records[g_moe_doorbell.loads[i].first];
-            moe_doorbell_device &db = g_moe_doorbell.devices[r.device];
-            moe_stream_cache &c = g_moe_stream_caches[r.device];
-            const moe_doorbell_on_tier here(db.tier);
-            ok = moe_stream_slot(c, &r.table, g_moe_doorbell.loads[i].second) >= 0;
-            db.pending = true;
-        }
-    }
-    return ok;
-}
-
-static void moe_doorbell_stats(void) {
-    if (g_moe_doorbell.tokens) {
-        const double n = (double)g_moe_doorbell.tokens;
-        fprintf(stderr, "ds4: CUDA MoE doorbell, ms per token over %llu tokens: queueing %.1f, rings %.1f, CPU %.1f, "
-                        "bookkeeping %.1f, final wait %.1f, loads %.1f; %.1f of %.1f layers needed the host; "
-                        "%llu tokens redone\n", (unsigned long long)g_moe_doorbell.tokens,
-                1e3 * g_moe_doorbell.sum_s[0] / n, 1e3 * g_moe_doorbell.sum_s[1] / n, 1e3 * g_moe_doorbell.sum_s[2] / n,
-                1e3 * g_moe_doorbell.sum_s[3] / n, 1e3 * g_moe_doorbell.sum_s[4] / n, 1e3 * g_moe_doorbell.sum_s[5] / n,
-                (double)g_moe_doorbell.host_layers / n, (double)g_moe_doorbell.layers / n,
-                (unsigned long long)g_moe_doorbell.redone);
-        for (double &s : g_moe_doorbell.sum_s) s = 0.0;
-        g_moe_doorbell.tokens = g_moe_doorbell.layers = g_moe_doorbell.host_layers = g_moe_doorbell.redone = 0;
-    }
-}
-
 /* Settles what _begin deferred, once the kernels are queued: waits for the
  * selection, then the bookkeeping.  That may load experts the kernels have
  * already run without, as zero rows like any expert the device lacks; redo
@@ -5749,12 +5072,8 @@ static bool moe_stream_settle(bool *redo) {
 extern "C" void ds4_gpu_qwen4_moe_stream_end(void) {
     using namespace qwen4_cuda;
     /* A layer whose down kernel never ran still settles, so the clock and
-     * the stamps stay in step with what was selected.  A doorbell record
-     * rings regardless; the host serves it then. */
-    if (g_moe_stream.deferred && g_moe_stream.doorbell) {
-        g_moe_stream.deferred = false;
-        g_moe_stream.doorbell = false;
-    } else if (g_moe_stream.deferred) {
+     * the stamps stay in step with what was selected. */
+    if (g_moe_stream.deferred) {
         bool redo = false;
         (void)moe_stream_settle(&redo);
     }
@@ -5784,10 +5103,6 @@ extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table 
     }
     moe_stream_cache &c = g_moe_stream_caches[device];
     const uint32_t min_slots = pairs < t->n_total_expert ? (uint32_t)pairs : t->n_total_expert;
-    /* With doorbell records unserved nothing below may wait for a stream;
-     * where this layer's setup would, they are served first. */
-    if (g_moe_doorbell.armed && !g_moe_doorbell.released && g_moe_doorbell.served < g_moe_doorbell.records.size() &&
-        moe_doorbell_blocking(t, c, device) && !moe_doorbell_service(true)) return 0;
     /* A layer number that does not go up starts the next forward. */
     if (c.slots && c.provisional && t->layer <= c.last_layer) {
         moe_stream_cache_release(c);
@@ -5832,13 +5147,6 @@ extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table 
     /* No large batch is open now: the layer buffers' slots hold experts again. */
     if (c.tail_busy) moe_stream_tail_release(c);
     if (h && h->tail_busy) moe_stream_tail_release(*h);
-    static bool probed = getenv("DS4_CUDA_MOE_STREAM_PROBE") == NULL;
-    if (!probed && h) {
-        probed = true;
-        moe_stream_probe(device);
-        if (cudaSetDevice(helper_device) == cudaSuccess) moe_stream_probe(helper_device);
-        (void)cudaSetDevice(device);
-    }
     if (h && !h->slots) {
         h->resized = true;
         ok = cuda_ok(cudaSetDevice(helper_device), "MoE helper device") &&
@@ -5859,38 +5167,27 @@ extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table 
     }
     /* The layer input is wanted on the host by a helper for nearly every
      * layer, so with one it rides on the selection's wait; the CPU route
-     * alone wants it rarely and reads it then (moe_stream_fetch_input).
-     * DS4_CUDA_MOE_STREAM_EAGER_INPUT=1 reads it every layer regardless. */
-    static const bool eager_input = getenv("DS4_CUDA_MOE_STREAM_EAGER_INPUT") != NULL;
-    const bool read_input = input && tensor(input, input_bytes) && (h || eager_input);
-    /* DS4_CUDA_MOE_STREAM_NO_TABLE=1 maps the selection on the host before
-     * the kernels are queued, as every batch and the provisional arena
-     * still do.  Otherwise a single token's kernels map the router's ids
+     * alone wants it rarely and reads it then (moe_stream_fetch_input). */
+    const bool read_input = input && tensor(input, input_bytes) && h;
+    /* A batch and the provisional arena map the selection on the host before
+     * the kernels are queued.  A single token's kernels map the router's ids
      * through the slot table and run while the host does the bookkeeping
      * (moe_stream_settle); whatever changes the table meanwhile goes out
      * ahead of them here. */
-    static const bool table_off = getenv("DS4_CUDA_MOE_STREAM_NO_TABLE") != NULL;
     const cudaStream_t stream = cuda_decode_stream();
-    const bool deferred = !table_off && T == 1 && !c.provisional;
-    /* Through the doorbell (DS4_KOLIBRI1_DOORBELL=1) the selection goes out
-     * by a kernel and nothing is read back here; the layer's record is
-     * served when it rings (moe_doorbell_service). */
-    const bool doorbell = ok && deferred && moe_doorbell_take(c, h, input, input_bytes, T, NS);
-    if (g_moe_doorbell.released) return 0;
+    const bool deferred = T == 1 && !c.provisional;
     if (ok && deferred) {
         moe_stream_handout(t, c, ok);
-        if (doorbell) ok = ok && moe_doorbell_layer_begin(t, c, device, selected, input, NS, stream);
-        else ok = ok && moe_stream_table_row(c, t->layer, t->n_total_expert, stream) &&
-                  (c.selected_event ||
-                   cuda_ok(cudaEventCreateWithFlags(&c.selected_event, cudaEventDisableTiming), "MoE selection event"));
+        ok = ok && moe_stream_table_row(c, t->layer, t->n_total_expert, stream) &&
+             (c.selected_event ||
+              cuda_ok(cudaEventCreateWithFlags(&c.selected_event, cudaEventDisableTiming), "MoE selection event"));
     }
     const auto wait_from = std::chrono::steady_clock::now();
     ok = ok &&
          moe_stream_grow(g_moe_stream.host_ids, g_moe_stream.host_ids_cap, pairs * 4, true,
                          "MoE expert cache selection staging") &&
-         (doorbell ||
-          cuda_ok(cudaMemcpyAsync(g_moe_stream.host_ids, selected->ptr, pairs * 4, cudaMemcpyDeviceToHost, stream),
-                  "MoE expert cache selection read")) &&
+         cuda_ok(cudaMemcpyAsync(g_moe_stream.host_ids, selected->ptr, pairs * 4, cudaMemcpyDeviceToHost, stream),
+                 "MoE expert cache selection read") &&
          (!read_input ||
           (moe_stream_grow(g_moe_stream.host_x, g_moe_stream.host_x_cap, input_bytes, true,
                            "MoE expert input staging") &&
@@ -5898,9 +5195,8 @@ extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table 
                    "MoE expert input read")));
     g_moe_stream.input_ready = ok && read_input;
     if (ok && deferred) {
-        ok = doorbell || cuda_ok(cudaEventRecord(c.selected_event, stream), "MoE selection mark");
+        ok = cuda_ok(cudaEventRecord(c.selected_event, stream), "MoE selection mark");
         g_moe_stream.deferred = ok;
-        g_moe_stream.doorbell = ok && doorbell;
         g_moe_stream.table = *t;
         g_moe_stream.T = T;
         g_moe_stream.NS = NS;
@@ -6010,9 +5306,7 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
                                streamed && !deferred ? stream->selected : (const int *)sel->ptr,
                                w,NULL,sw,NULL,type,st,streamed ? stream->slots : NE,T,NS,K,M,true,
                                streamed ? stream->slot_bytes : 0,table,NULL,deferred ? stream->table_experts : 0);
-    if (done && deferred && g_moe_stream.doorbell) {
-        done = moe_doorbell_layer_end((float *)part->ptr,NO,type,NS,M,cuda_decode_stream());
-    } else if (done && deferred) {
+    if (done && deferred) {
         bool redo = false;
         done = moe_stream_settle(&redo);
         const auto &m = g_moe_stream.mid;
@@ -6050,114 +5344,6 @@ extern "C" int ds4_gpu_qwen4_moe_down_tensor(ds4_gpu_tensor *part, const ds4_gpu
     }
     moe_prof_lap(moe_prof_down);
     return done;
-}
-
-/* The doorbell's brackets round a decoded token (see moe_doorbell_device).
- * _begin arms it for a single-token forward on the decode streams and says
- * whether it did; _service serves the layers that have rung; _finish, before
- * the host waits for any stream, serves the rest, or when the token failed
- * lets every wait out, and returns 0 when the token is to run again on the
- * per-layer path; _end, once the streams are idle, makes the residency
- * changes the token earned. */
-extern "C" int ds4_gpu_qwen4_moe_doorbell_begin(void) {
-    using namespace qwen4_cuda;
-    bool armed = false;
-    if (moe_doorbell_on()) {
-        static bool said = false;
-        const char *why = !g_decode_stream_active ? "DS4_CUDA_DECODE_STREAM=1 is not set" :
-                          !g_ssd_streaming_mode ? "the experts are not streamed" :
-                          getenv("DS4_CUDA_MOE_STREAM_NO_TABLE") ? "DS4_CUDA_MOE_STREAM_NO_TABLE is set" : NULL;
-        if (why && !said) fprintf(stderr, "ds4: CUDA MoE doorbell stays off: %s\n", why);
-        said = said || why != NULL;
-        armed = why == NULL;
-    }
-    g_moe_doorbell.records.clear();
-    g_moe_doorbell.loads.clear();
-    g_moe_doorbell.served = 0;
-    g_moe_doorbell.released = false;
-    g_moe_doorbell.ring_s = g_moe_doorbell.cpu_s = g_moe_doorbell.book_s = 0.0;
-    g_moe_doorbell.sync_s = g_moe_doorbell.apply_s = 0.0;
-    if (armed) {
-        static const double limit = [] {
-            const char *s = getenv("DS4_KOLIBRI1_DOORBELL_TIMEOUT_MS");
-            return s && s[0] ? strtod(s, NULL) : 500.0;
-        }();
-        g_moe_doorbell.limit_ms = limit;
-        g_moe_doorbell.records.reserve(2 * moe_stream_table_layers);
-        /* The last token's loads and the rows they made stale, waited out now
-         * on each device, while no wait kernel is queued anywhere. */
-        for (auto &entry : g_moe_doorbell.devices) {
-            moe_doorbell_device &db = entry.second;
-            if (db.host && db.tier >= 0 && armed) {
-                const moe_doorbell_on_tier here(db.tier);
-                armed = moe_doorbell_rows(g_moe_stream_caches[entry.first], db);
-                if (armed && db.pending) armed = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "MoE doorbell loads wait");
-                db.pending = !armed;
-                *db.seq() = 0;
-                *db.flag() = 0;
-                db.count = 0;
-            }
-        }
-        moe_doorbell_fence();
-        g_moe_doorbell.token_at = std::chrono::steady_clock::now();
-    }
-    g_moe_doorbell.armed = armed;
-    return armed;
-}
-
-extern "C" int ds4_gpu_qwen4_moe_doorbell_service(void) {
-    using namespace qwen4_cuda;
-    return !g_moe_doorbell.armed || (!g_moe_doorbell.released && moe_doorbell_service(false));
-}
-
-extern "C" int ds4_gpu_qwen4_moe_doorbell_finish(int ok) {
-    using namespace qwen4_cuda;
-    int done = 1;
-    if (g_moe_doorbell.armed) {
-        if (g_moe_doorbell.released) done = 0;
-        else if (ok) done = moe_doorbell_service(true);
-        else {
-            moe_doorbell_abandon("the token failed before its layers were served");
-            done = 0;
-        }
-        g_moe_doorbell.drained_at = std::chrono::steady_clock::now();
-    }
-    return done;
-}
-
-extern "C" void ds4_gpu_qwen4_moe_doorbell_end(int ok) {
-    using namespace qwen4_cuda;
-    if (g_moe_doorbell.armed) {
-        const auto at = std::chrono::steady_clock::now();
-        g_moe_doorbell.sync_s = std::chrono::duration<double>(at - g_moe_doorbell.drained_at).count();
-        if (ok && !g_moe_doorbell.released) {
-            (void)moe_doorbell_apply();
-            const auto now = std::chrono::steady_clock::now();
-            g_moe_doorbell.apply_s = std::chrono::duration<double>(now - at).count();
-            const double wall = std::chrono::duration<double>(now - g_moe_doorbell.token_at).count();
-            const double served = g_moe_doorbell.ring_s + g_moe_doorbell.cpu_s + g_moe_doorbell.book_s +
-                                  g_moe_doorbell.sync_s + g_moe_doorbell.apply_s;
-            g_moe_doorbell.sum_s[0] += wall - served;
-            g_moe_doorbell.sum_s[1] += g_moe_doorbell.ring_s;
-            g_moe_doorbell.sum_s[2] += g_moe_doorbell.cpu_s;
-            g_moe_doorbell.sum_s[3] += g_moe_doorbell.book_s;
-            g_moe_doorbell.sum_s[4] += g_moe_doorbell.sync_s;
-            g_moe_doorbell.sum_s[5] += g_moe_doorbell.apply_s;
-            g_moe_doorbell.tokens++;
-            g_moe_doorbell.layers += g_moe_doorbell.records.size();
-        } else if (g_moe_doorbell.released) {
-            g_moe_doorbell.redone++;
-        }
-        g_moe_doorbell.armed = false;
-        g_moe_doorbell.released = false;
-        g_moe_doorbell.records.clear();
-        g_moe_doorbell.loads.clear();
-        g_moe_doorbell.served = 0;
-    }
-}
-
-extern "C" void ds4_gpu_qwen4_moe_doorbell_release(void) {
-    qwen4_cuda::moe_doorbell_release();
 }
 
 extern "C" int ds4_gpu_qwen4_moe_reduce_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *part,

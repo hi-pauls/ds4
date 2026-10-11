@@ -178,15 +178,6 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
-/* CUDA, DS4_CUDA_DECODE_STREAM=1: brackets a single-token forward whose
- * launches then ride a non-blocking stream per device, with the host waits
- * on that stream (ds4_gpu_end_commands, tensor read/write, the cross-device
- * copy).  enter returns 0 when the mode is off, and then nothing changes.
- * flush submits the launches queued so far (DS4_CUDA_DECODE_FLUSH=0 off). */
-int  ds4_gpu_decode_stream_enter(void);
-void ds4_gpu_decode_stream_leave(void);
-int  ds4_gpu_decode_stream_active(void);
-void ds4_gpu_decode_stream_flush(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -559,20 +550,6 @@ void ds4_gpu_qwen4_moe_stream_set_reclaim(uint64_t bytes);
  * among that many layers from the first token on, and no device helps
  * another (DS4_CUDA_MOE_STREAM_HELPER is ignored). */
 void ds4_gpu_qwen4_moe_stream_set_device_layers(int logical_tier, uint32_t layers);
-/* CUDA, DS4_KOLIBRI1_DOORBELL=1 on top of DS4_CUDA_DECODE_STREAM=1: a
- * single-token forward's expert stages hand the selection to the host from
- * the device and wait for its answer on the device, so a whole run of
- * layers is queued without a host wait per layer.  begin arms it for the
- * token and returns whether it did; service, after each layer, serves the
- * layers that have rung; finish must come before the host waits for any
- * stream and returns 0 when the token is to be run again without the
- * doorbell; end follows that wait.  release lets every device wait out and
- * belongs on every shutdown path. */
-int  ds4_gpu_qwen4_moe_doorbell_begin(void);
-int  ds4_gpu_qwen4_moe_doorbell_service(void);
-int  ds4_gpu_qwen4_moe_doorbell_finish(int ok);
-void ds4_gpu_qwen4_moe_doorbell_end(int ok);
-void ds4_gpu_qwen4_moe_doorbell_release(void);
 #endif
 #endif
 #ifdef __APPLE__

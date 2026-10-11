@@ -62860,10 +62860,6 @@ static void kolibri1_graph_store_tier(ds4_kolibri1_gpu_graph *g, int tier) {
 
 static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
     if (!g) return;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    /* No doorbell wait kernel may outlive the graph that queued it. */
-    ds4_gpu_qwen4_moe_doorbell_release();
-#endif
     if (g->owns_scratch) {
         if (g->n_tiers) {
             for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
@@ -63276,51 +63272,35 @@ static bool kolibri1_graph_enter_tier(ds4_kolibri1_gpu_graph *g, int tier, uint3
         if (left < entered) ds4_gpu_qwen4_moe_stream_keep_awake();
     }
 #endif
-    /* On the decode streams (DS4_CUDA_DECODE_STREAM=1) the copy orders itself
-     * between the two devices' streams and no side waits for the other. */
-    bool streamed = false;
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    streamed = ds4_gpu_decode_stream_active() != 0;
-#endif
     if (hop && carry) {
         ds4_gpu_tensor *from = g->R;
         ds4_gpu_tensor *to = g->tier_scratch[tier][0];
         const uint64_t bytes = (uint64_t)rows * DS4_N_EMBD * sizeof(float);
-        if (streamed) ok = ds4_gpu_tensor_copy_xdev(to, from, bytes) != 0;
-        else ok = ds4_gpu_synchronize() != 0 && ds4_gpu_tensor_copy_xdev(to, from, bytes) != 0 &&
-                  ds4_gpu_synchronize() != 0;
+        ok = ds4_gpu_synchronize() != 0 && ds4_gpu_tensor_copy_xdev(to, from, bytes) != 0 &&
+             ds4_gpu_synchronize() != 0;
     }
     if (ok && (hop || !carry)) {
         kolibri1_graph_bind_tier(g, tier);
-        ok = ds4_gpu_set_current_device(tier) == 0 &&
-             (!(hop && carry) || streamed || ds4_gpu_synchronize() != 0);
+        ok = ds4_gpu_set_current_device(tier) == 0 && (!(hop && carry) || ds4_gpu_synchronize() != 0);
     }
     return ok;
 }
 
 /* Forward T tokens at pos0.  Norms run in-place through x as scratch: each
  * sandwich norm normalizes its sublayer output, adds it to R, and the next
- * pre-norm reads R again — the exact CPU reference order.  redo is set when
- * a pass through the doorbell was abandoned and the caller is to run the
- * same token again without it. */
-static bool kolibri1_graph_forward_pass(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                        const int *tokens, uint32_t T, float *logits_out, bool allow_doorbell,
-                                        bool *redo) {
+ * pre-norm reads R again — the exact CPU reference order. */
+static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                          const int *tokens, uint32_t T, float *logits_out) {
+    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    for (uint32_t t = 0; t < T; t++) {
+        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
+            fprintf(stderr, "ds4: Kolibri-1 token id %d is outside the vocabulary\n", tokens[t]);
+            return false;
+        }
+    }
     const uint32_t pos0 = g->pos;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    /* DS4_CUDA_DECODE_STREAM=1: the single-token step runs on the per-device
-     * decode streams until the leave below; the prompt path stays as it is.
-     * DS4_KOLIBRI1_DOORBELL=1 on top of it queues a device's whole run of
-     * layers and serves their expert stages from the host as they ring, so
-     * nothing here may wait for a stream between the first layer and the
-     * finish below (the stage profile does, and keeps the doorbell off). */
-    const bool streamed = T == 1u && ds4_gpu_decode_stream_enter() != 0;
     const bool fused = T == 1u && kolibri1_fuse_on();
-    const bool doorbell = allow_doorbell && streamed && !kolibri1_prof_on() &&
-                          ds4_gpu_qwen4_moe_doorbell_begin() != 0;
-#else
-    (void)allow_doorbell;
-    (void)redo;
 #endif
     bool ok = kolibri1_graph_enter_tier(g, g->layer_tier[0], T, false) &&
               kolibri1_graph_stage_inputs(g, m, w, tokens, T) &&
@@ -63377,10 +63357,6 @@ static bool kolibri1_graph_forward_pass(ds4_kolibri1_gpu_graph *g, const ds4_mod
                                                              DS4_N_EMBD, T, DS4_RMS_EPS) &&
                          ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
         }
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        if (streamed) ds4_gpu_decode_stream_flush();
-        if (ok && doorbell && !ds4_gpu_qwen4_moe_doorbell_service()) ok = false;
-#endif
     }
     /* Final norm and head on the last row; callers read one logit row. */
     if (ok) ok = kolibri1_graph_enter_tier(g, g->head_tier, T, true);
@@ -63393,16 +63369,7 @@ static bool kolibri1_graph_forward_pass(ds4_kolibri1_gpu_graph *g, const ds4_mod
                                              w->output_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS));
         if (ok) ok = kolibri1_gemv(g->logits, m, w->output, g->x, 1);
         ds4_gpu_tensor_free(last_R);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        if (streamed) ds4_gpu_decode_stream_flush();
-#endif
     }
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (doorbell && !ds4_gpu_qwen4_moe_doorbell_finish(ok)) {
-        ok = false;
-        *redo = true;
-    }
-#endif
     if (!ds4_gpu_end_commands()) ok = false;
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, DS4_N_VOCAB * sizeof(float)) != 0;
@@ -63415,27 +63382,6 @@ static bool kolibri1_graph_forward_pass(ds4_kolibri1_gpu_graph *g, const ds4_mod
                         "experts %.2f, device hops %.2f, head %.2f\n", T, pos0, p[0], p[1], p[2], p[3], p[4], p[5]);
         memset(g_kolibri1_prof, 0, sizeof(g_kolibri1_prof));
     }
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (doorbell) ds4_gpu_qwen4_moe_doorbell_end(ok);
-    if (streamed) ds4_gpu_decode_stream_leave();
-#endif
-    return ok;
-}
-
-static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                          const int *tokens, uint32_t T, float *logits_out) {
-    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
-    for (uint32_t t = 0; t < T; t++) {
-        if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
-            fprintf(stderr, "ds4: Kolibri-1 token id %d is outside the vocabulary\n", tokens[t]);
-            return false;
-        }
-    }
-    bool redo = false;
-    bool ok = kolibri1_graph_forward_pass(g, m, w, tokens, T, logits_out, true, &redo);
-    /* An abandoned doorbell pass left the K/V rows of this position half
-     * written; the pass without it writes them again. */
-    if (!ok && redo) ok = kolibri1_graph_forward_pass(g, m, w, tokens, T, logits_out, false, &redo);
     if (ok) g->pos += T;
     return ok;
 }
