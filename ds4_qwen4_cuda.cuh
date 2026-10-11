@@ -2682,7 +2682,7 @@ static struct {
     std::vector<float> gate, up, mid;
     float *out;                           /* page-locked, cpu pair major */
     uint64_t out_cap;
-    uint64_t pairs;                       /* since the last stats line */
+    uint64_t pairs, layers;               /* since the last stats line */
     double seconds;
 } g_moe_cpu;
 
@@ -3360,6 +3360,7 @@ static bool moe_stream_cpu_compute(const moe_stream_cache &c, unsigned down_type
     });
     g_moe_stream.cpu_done = true;
     g_moe_cpu.pairs += n;
+    g_moe_cpu.layers++;
     g_moe_cpu.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
@@ -4869,12 +4870,12 @@ static void moe_stream_stats(moe_stream_cache &c, int device, moe_stream_cache *
             g_moe_prof.layers = 0;
         }
         if (g_moe_cpu.pairs) {
-            fprintf(stderr, "ds4: CUDA MoE CPU path: %llu uses, %.3f ms each, %.3f ms of thread time each on %zu "
-                            "workers\n", (unsigned long long)g_moe_cpu.pairs,
-                    1000.0 * g_moe_cpu.seconds / (double)g_moe_cpu.pairs,
+            fprintf(stderr, "ds4: CUDA MoE CPU path: %llu uses in %llu layers, %.3f ms each, %.3f ms of thread time "
+                            "each on %zu workers\n", (unsigned long long)g_moe_cpu.pairs,
+                    (unsigned long long)g_moe_cpu.layers, 1000.0 * g_moe_cpu.seconds / (double)g_moe_cpu.pairs,
                     1e-6 * (double)g_moe_cpu_pool.busy_ns.exchange(0) / (double)g_moe_cpu.pairs,
                     g_moe_cpu_pool.workers.size());
-            g_moe_cpu.pairs = 0;
+            g_moe_cpu.pairs = g_moe_cpu.layers = 0;
             g_moe_cpu.seconds = 0.0;
             fprintf(stderr, "ds4: CUDA MoE RAM tier: %zu of %u slots hold an expert; %llu experts read from the file "
                             "for the CPU, %.3f ms each\n",
@@ -4886,8 +4887,8 @@ static void moe_stream_stats(moe_stream_cache &c, int device, moe_stream_cache *
             g_moe_stream_ram.file_s = 0.0;
         }
         if (h && h->hops) {
-            fprintf(stderr, "ds4: CUDA MoE helper, ms per layer: mid %.3f, down launch %.3f, wait and read %.3f, "
-                            "write back %.3f\n",
+            fprintf(stderr, "ds4: CUDA MoE helper, ms per layer over %llu layers: mid %.3f, down launch %.3f, wait "
+                            "and read %.3f, write back %.3f\n", (unsigned long long)h->hops,
                     1000.0 * h->hop_s[3] / (double)h->hops, 1000.0 * h->hop_s[0] / (double)h->hops,
                     1000.0 * h->hop_s[1] / (double)h->hops, 1000.0 * h->hop_s[2] / (double)h->hops);
             h->hops = 0;
