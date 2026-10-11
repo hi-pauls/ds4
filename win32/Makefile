@@ -67,7 +67,7 @@ clean:
 $(OUT)/ds4.exe: $(addprefix $(OUT)/,ds4_cli.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o)
 $(OUT)/ds4-server.exe: $(addprefix $(OUT)/,ds4_server.o ds4_help.o ds4_kvstore.o ds4_convcache.o ds4_syscache.o rax.o ds4_gpu_args.o) $(ZSTD_OBJS)
 $(OUT)/ds4-bench.exe: $(addprefix $(OUT)/,ds4_bench.o ds4_help.o ds4_gpu_args.o)
-$(OUT)/ds4-eval.exe: $(addprefix $(OUT)/,ds4_eval.o ds4_eval_cases.o ds4_help.o)
+$(OUT)/ds4-eval.exe: $(addprefix $(OUT)/,ds4_eval.o ds4_eval_cases.o ds4_help.o ds4_gpu_args.o)
 
 $(PROGRAMS): $(CORE_OBJS) $(CUDA_DLL) $(OUT)/ucrt.specs
 	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^) $(CUDA_DLL) $(LDLIBS)

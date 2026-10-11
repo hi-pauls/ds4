@@ -1,6 +1,8 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_eval_cases.h"
+#include "ds4_gpu_args.h"
+#include "ds4_gpu_mgpu.h"
 #include "ds4_help.h"
 #include "ds4_tp.h"
 
@@ -1174,6 +1176,8 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *gpu_vram_arg;
+    const char *gpu_devices_arg;
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
@@ -1659,6 +1663,10 @@ static eval_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-vram")) {
+            c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--gpu-devices")) {
+            c.gpu_devices_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -4809,11 +4817,29 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) {
+    int opened = 0;
+    if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
+        ds4_gpu_config gpu_cfg = {0};
+        bool skip_cuda = false;
+        char errbuf[256];
+        if (parse_gpu_vram_arg(cfg.gpu_vram_arg, cfg.gpu_devices_arg, &gpu_cfg, &skip_cuda,
+                               errbuf, sizeof(errbuf)) != 0) {
+            fprintf(stderr, "ds4-eval: %s\n", errbuf);
+            opened = 2;
+        } else {
+            opt.backend = skip_cuda ? DS4_BACKEND_CPU : DS4_BACKEND_CUDA;
+            opened = skip_cuda ? ds4_engine_open(&engine, &opt)
+                               : ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg);
+            if (opened != 0) opened = 1;
+        }
+    } else if (ds4_engine_open(&engine, &opt) != 0) {
+        opened = 1;
+    }
+    if (opened != 0) {
         if (trace) fclose(trace);
         free(case_sequence);
         free(cases);
-        return 1;
+        return opened;
     }
 
     int max_prompt_tokens = 0;
