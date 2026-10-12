@@ -3997,6 +3997,9 @@ static void moe_stats_load(void) {
         } else {
             fprintf(stderr, "ds4: %s is not a complete expert use count file; ignored\n", g_moe_stats_file.c_str());
         }
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "ds4: expert use counts in %s cannot be read (%s); running without the ranking\n",
+                g_moe_stats_file.c_str(), strerror(errno));
     }
 }
 
