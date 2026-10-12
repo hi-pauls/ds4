@@ -60931,9 +60931,31 @@ static uint32_t qwen4_ctx_initial_rows(uint32_t ctx_max, uint32_t cap_tokens) {
  * into them, reported so the CUDA expert cache does not size itself into it
  * (it takes what is free at the first decoded token and never gives it back:
  * a prompt then failed 8192 rows in, "context pool exhausted"). */
+/* DS4_QWEN4_POOL_TIGHT=1, single device with streamed experts: the expert
+ * cache may take the memory the pool's unclaimed rows would need, because a
+ * session that grows drops that cache and has it sized again (as every long
+ * prompt does anyway), and sessions grow 2048 rows at a time instead of
+ * doubling, so a context holds what it uses.  Without it 2 GiB of a 16 GiB
+ * card stay idle for a 163840 row pool. */
+static bool qwen4_pool_tight(const ds4_qwen4_gpu_graph *g) {
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("DS4_QWEN4_POOL_TIGHT");
+        wanted = env && atoi(env) != 0;
+    }
+    return wanted && g->pool_used && !g->n_tiers;
+#else
+    (void)g;
+    return false;
+#endif
+}
+
 static void qwen4_graph_pool_report(const ds4_qwen4_gpu_graph *g) {
 #if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
-    if (g->pool_used && !g->n_tiers) {
+    if (qwen4_pool_tight(g)) {
+        ds4_gpu_qwen4_moe_stream_context_reserve(0);
+    } else if (g->pool_used && !g->n_tiers) {
         uint64_t layers = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) layers += g->layer_k_cache[il] != NULL;
         const uint64_t row = layers * (2u * qwen4_kv_pos_bytes() + DS4_N_INDEXER_HEAD_DIM / 2u) + 16u;
@@ -61065,12 +61087,23 @@ static bool qwen4_graph_reserve(ds4_qwen4_gpu_graph *g, uint32_t need) {
             g->pool_reclaim(g->pool_ud, need - g->ctx_cap - free_rows, g);
             free_rows = g->pool_limit > *g->pool_used ? g->pool_limit - *g->pool_used : 0u;
         }
-        const uint64_t step = g->ctx_cap < 131072u ? g->ctx_cap : 65536u;
+        const bool tight = qwen4_pool_tight(g);
+        const uint64_t step = tight ? 2048u : g->ctx_cap < 131072u ? g->ctx_cap : 65536u;
         uint64_t want = (uint64_t)g->ctx_cap + step > need ? (uint64_t)g->ctx_cap + step : need;
         want = (want + 1023u) & ~(uint64_t)1023u;
         if (want > g->ctx_max) want = g->ctx_max;
         if (want - g->ctx_cap > free_rows) want = (uint64_t)g->ctx_cap + free_rows;
-        if (want >= need) ok = qwen4_graph_resize(g, (uint32_t)want, g->ctx_cap);
+        /* DS4_QWEN4_POOL_TIGHT=2 never tries beside the expert cache, so the
+         * way through its release can be run on demand. */
+        const char *tight_env = tight ? getenv("DS4_QWEN4_POOL_TIGHT") : NULL;
+        if (want >= need && !(tight_env && atoi(tight_env) == 2)) ok = qwen4_graph_resize(g, (uint32_t)want, g->ctx_cap);
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+        if (!ok && want >= need && tight) {
+            fprintf(stderr, "ds4: Qwen3.8 session context takes its rows back from the expert cache\n");
+            ds4_gpu_qwen4_moe_stream_release();
+            ok = qwen4_graph_resize(g, (uint32_t)want, g->ctx_cap);
+        }
+#endif
         g->pool_refused = !ok;
         if (!ok) {
             fprintf(stderr, "ds4: Qwen3.8 context pool exhausted: a session needs %u rows, "
