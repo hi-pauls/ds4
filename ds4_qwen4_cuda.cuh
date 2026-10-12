@@ -3079,6 +3079,7 @@ static void moe_stream_tail_release(moe_stream_cache &c) {
  * device outright, DS4_CUDA_MOE_STREAM_CACHE_MIB the size and
  * DS4_CUDA_MOE_STREAM_RESERVE_MIB the reserve. */
 static uint64_t g_moe_stream_context_reserve;   /* see ds4_gpu_qwen4_moe_stream_context_reserve */
+static uint64_t g_moe_reclaim_bytes;            /* see ds4_gpu_qwen4_moe_stream_set_reclaim */
 
 static bool moe_stream_cache_init(moe_stream_cache &c, int device, uint64_t gate_bytes,
                                   uint64_t down_bytes, uint32_t min_slots, uint32_t layer_experts,
@@ -4444,7 +4445,10 @@ static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *count
         /* No room for the cache now only means nothing is kept: generation
          * sizes it again when it starts.  One attempt per forward. */
         static uint64_t refused = UINT64_MAX;
-        if (!c.slots && refused != g_moe_layer.forwards) {
+        /* Not while the graph still holds transients it gives up when it
+         * decodes: a cache sized beside them keeps that size, and what they
+         * free then stays idle (5.7 of 16 GiB on a server session). */
+        if (!c.slots && refused != g_moe_layer.forwards && !g_moe_reclaim_bytes) {
             c.resized = true;
             if (!moe_stream_cache_init(c, device, t->gate_expert_bytes, t->down_expert_bytes, 16, t->n_total_expert,
                                        true)) {
@@ -4508,10 +4512,6 @@ static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *count
         }
     }
     return ok;
-}
-
-namespace qwen4_cuda {
-static uint64_t g_moe_reclaim_bytes;
 }
 
 extern "C" void ds4_gpu_qwen4_moe_stream_set_reclaim(uint64_t bytes) {

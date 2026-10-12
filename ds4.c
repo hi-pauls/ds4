@@ -61692,19 +61692,31 @@ static bool qwen4_graph_release_expert_caches(ds4_qwen4_gpu_graph *g) {
  * shrinks the transients before the expert cache is sized, a large prompt
  * drops that cache and grows them back.  Prompts of up to a few small chunks
  * stay on the small transients, so a short follow-up turn keeps the cache. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static bool qwen4_shared_scratch_resize(ds4_engine *e, uint32_t new_cap);
+static bool qwen4_shared_scratch_alone(const ds4_engine *e, const ds4_qwen4_gpu_graph *g);
+#endif
+
 static bool qwen4_graph_scratch_for(ds4_qwen4_gpu_graph *g, uint32_t tokens) {
     static int enabled = -1;
     if (enabled < 0) enabled = getenv("DS4_QWEN4_KEEP_SCRATCH") == NULL;
     bool ok = true;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (enabled && g_qwen4_stream_layers && g->owns_scratch) {
-        if (!g->cap_tokens_full) g->cap_tokens_full = g->cap_tokens;
-        const uint32_t small = g->cap_tokens_full < qwen4_decode_scratch_tokens ? g->cap_tokens_full
-                                                                               : qwen4_decode_scratch_tokens;
-        if (tokens > 4u * small && g->cap_tokens < g->cap_tokens_full) {
-            ok = qwen4_graph_release_expert_caches(g) && qwen4_graph_scratch_resize(g, g->cap_tokens_full);
-        } else if (tokens == 1u && g->cap_tokens > small) {
-            ok = qwen4_graph_scratch_resize(g, small);
+    /* A pooled server session borrows the engine's transients: those are
+     * resized for every borrower at once, and shrunk only while no other
+     * session is busy, whose prompt chunk they would be pulled from under. */
+    ds4_engine *e = !g->owns_scratch && g->pool_ud ? (ds4_engine *)g->pool_ud : NULL;
+    ds4_qwen4_gpu_graph *owner = g->owns_scratch ? g : e ? e->qwen4_shared_workspace : NULL;
+    if (enabled && g_qwen4_stream_layers && owner) {
+        if (!owner->cap_tokens_full) owner->cap_tokens_full = owner->cap_tokens;
+        const uint32_t small = owner->cap_tokens_full < qwen4_decode_scratch_tokens ? owner->cap_tokens_full
+                                                                                   : qwen4_decode_scratch_tokens;
+        if (tokens > 4u * small && owner->cap_tokens < owner->cap_tokens_full) {
+            ok = qwen4_graph_release_expert_caches(g) &&
+                 (e ? qwen4_shared_scratch_resize(e, owner->cap_tokens_full)
+                    : qwen4_graph_scratch_resize(g, g->cap_tokens_full));
+        } else if (tokens == 1u && owner->cap_tokens > small && (!e || qwen4_shared_scratch_alone(e, g))) {
+            ok = e ? qwen4_shared_scratch_resize(e, small) : qwen4_graph_scratch_resize(g, small);
             /* A cache sized during the prompt, beside the full transients,
              * keeps that size.  Split over two cards, the smaller one would
              * decode with most of its memory idle: let the first token size
@@ -61714,8 +61726,8 @@ static bool qwen4_graph_scratch_for(ds4_qwen4_gpu_graph *g, uint32_t tokens) {
         }
         /* What decoding will get back, for a helper deciding during the
          * prompt which experts this device is going to pin. */
-        ds4_gpu_qwen4_moe_stream_set_reclaim(g->cap_tokens > small ?
-            qwen4_graph_scratch_bytes(g) / g->cap_tokens * (g->cap_tokens - small) : 0u);
+        ds4_gpu_qwen4_moe_stream_set_reclaim(owner->cap_tokens > small ?
+            qwen4_graph_scratch_bytes(owner) / owner->cap_tokens * (owner->cap_tokens - small) : 0u);
     }
 #else
     (void)g;
@@ -78642,6 +78654,43 @@ void ds4_engine_set_evict_hook(ds4_engine *e, ds4_session_evict_fn fn, void *ud)
     (void)ud;
 #endif
 }
+
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* The engine's shared transients again, for forwards of up to new_cap tokens;
+ * every pooled session holds copies of their handles and is rebound. */
+static bool qwen4_shared_scratch_resize(ds4_engine *e, uint32_t new_cap) {
+    ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
+    const bool ok = qwen4_graph_scratch_resize(arena, new_cap);
+    for (uint32_t i = 0; i < 64u; i++) {
+        ds4_session *s = e->qwen4_pooled[i];
+        if (s && !s->qwen4_graph.owns_scratch) {
+            ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+#define QWEN4_BORROW(field_) g->field_ = arena->field_;
+            DS4_QWEN4_SCRATCH_FIELDS(QWEN4_BORROW)
+#undef QWEN4_BORROW
+            g->host_row = arena->host_row;
+            g->cap_tokens = new_cap;
+            free(g->host_pos3);
+            free(g->pf_ids);
+            free(g->pf_rows);
+            g->pf_ids = NULL;
+            g->pf_rows = NULL;
+            g->pf_count = 0;
+            g->host_pos3 = xmalloc((size_t)new_cap * 4u * sizeof(uint32_t));
+        }
+    }
+    return ok;
+}
+
+static bool qwen4_shared_scratch_alone(const ds4_engine *e, const ds4_qwen4_gpu_graph *g) {
+    bool alone = true;
+    for (uint32_t i = 0; i < 64u && alone; i++) {
+        const ds4_session *s = e->qwen4_pooled[i];
+        alone = !s || &s->qwen4_graph == g || __atomic_load_n(&s->qwen4_idle, __ATOMIC_ACQUIRE);
+    }
+    return alone;
+}
+#endif
 
 void ds4_session_set_idle(ds4_session *s, bool idle) {
     if (!s) return;
