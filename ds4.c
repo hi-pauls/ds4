@@ -78738,7 +78738,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          * previous sessions closed) and keeps private transients otherwise. */
         const uint32_t block_cap = (uint32_t)ctx_size / 4u + 1u;
         const bool share = e->share_session_prefill_workspace &&
-                           e->backend == DS4_BACKEND_METAL;
+                           (e->backend == DS4_BACKEND_METAL ||
+                            (e->backend == DS4_BACKEND_CUDA && !e->multi_tier));
         const bool arena_fits = e->qwen4_shared_workspace &&
             e->qwen4_shared_workspace->cap_tokens >= cap_tokens &&
             e->qwen4_shared_workspace->n_block_cap >= block_cap;
