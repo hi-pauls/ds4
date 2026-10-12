@@ -338,6 +338,7 @@ typedef struct {
     uint32_t pos;
     int use_sel;
     uint32_t ik_ring;   /* the session's raw indexer key ring rows, 0 for one row per position */
+    uint64_t kv_stride; /* the session's K/V position pitch (DS4_KV_FRONT), 0 for packed rows */
 } ds4_gpu_qwen4_attn_row;
 #define DS4_GPU_QWEN4_ATTN_ROW_BYTES 64u   /* one staged table entry */
 /* One session of a decode batch for the GDN rows kernels: its state and

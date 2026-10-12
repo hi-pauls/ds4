@@ -954,7 +954,6 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
     require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
-#ifndef __APPLE__
     {   /* DS4_KV_FRONT: the same rows, as the second of three layers sharing a
          * buffer, must give both kernels the bytes the packed caches gave */
         const uint64_t pb = Hkv * ds4_gpu_qwen4_kv_row_bytes(D), kvs = 3u * 2u * pb, bytes = (uint64_t)cap * kvs;
@@ -979,7 +978,6 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
         ds4_gpu_tensor_free(so_ref); ds4_gpu_tensor_free(so_new);
         ds4_gpu_tensor_free(fk); ds4_gpu_tensor_free(fv); ds4_gpu_tensor_free(front);
     }
-#endif
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
         require_ok(isfinite(got[i]) && isfinite(ref[i]), "finite attention output");
@@ -1232,15 +1230,10 @@ static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
  * expand / attention and compare against a reference that recomputes the
  * selection.  k_blocks is small so the sparse path is exercised early. */
 /* DS4_KV_FRONT: test_attention keeps its K/V rows as the last of this many
- * layers sharing one buffer; 0 leaves them packed.  CUDA only. */
+ * layers sharing one buffer; 0 leaves them packed. */
 static uint32_t g_test_kv_spread;
-#ifdef __APPLE__
-#define attn_prep_kvs(kvs, ...) ds4_gpu_qwen4_attn_prep_tensor(__VA_ARGS__)
-#define attn_decode_kvs(kvs, ...) ds4_gpu_qwen4_attn_decode_tensor(__VA_ARGS__)
-#else
 #define attn_prep_kvs(kvs, ...) ds4_gpu_qwen4_attn_prep_strided_tensor(__VA_ARGS__, kvs)
 #define attn_decode_kvs(kvs, ...) ds4_gpu_qwen4_attn_decode_strided_tensor(__VA_ARGS__, kvs)
-#endif
 
 static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t n_rot,
                            uint32_t Hi, uint32_t Di, uint32_t k_blocks, uint32_t n_pos) {
@@ -1583,7 +1576,7 @@ static void test_attention_rows(arena_t *a) {
     /* path B: the rows kernels */
     ds4_gpu_tensor *table = ds4_gpu_tensor_alloc((uint64_t)R * DS4_GPU_QWEN4_ATTN_ROW_BYTES);
     ds4_gpu_tensor *partR = upload(NULL, ds4_gpu_qwen4_attn_part_floats(R, H, D));
-    ds4_gpu_qwen4_attn_row rows[4];
+    ds4_gpu_qwen4_attn_row rows[4] = {{0}};
     for (uint32_t r = 0; r < R; r++) {
         rows[r].k_cache = kc[1][r]; rows[r].v_cache = vc[1][r]; rows[r].ik_cache = ikc[1][r]; rows[r].block_key = bk[1][r];
         rows[r].pos3 = pos3[r]; rows[r].pos = pos_of[r]; rows[r].use_sel = pos_of[r] >= sparse_pos;
@@ -4075,7 +4068,7 @@ int main(void) {
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
     test_attention_rows(&arena);
-#else
+#endif
     g_test_kv_spread = 3;
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
@@ -4084,7 +4077,6 @@ int main(void) {
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
     g_test_kv_spread = 0;
-#endif
     ds4_gpu_qwen4_set_kv_q8(false);
     g_test_kv_q8 = false;
     printf("routed experts\n");

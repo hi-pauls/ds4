@@ -60697,18 +60697,6 @@ static bool qwen4_graph_alloc_scratch(ds4_qwen4_gpu_graph *g, int tier, uint64_t
  * output head last) when the layers are spread over n_gpus CUDA devices, and
  * NULL for one device.  A split graph owns its transients, keeps private
  * recurrent state and runs without the MTP block. */
-#ifdef __APPLE__
-/* Metal has no spread K/V rows yet, so kv_stride stays 0 there. */
-#define ds4_gpu_qwen4_attn_prep_strided_tensor(q, gate, kc, vc, iqo, ikc, qg, kp, vp, iq, ik, pos3, map, size, qo, \
-                                               ko, io, T, H, Hkv, D, nrot, Hi, Di, pos0, cap, ring, base, eps, kvs) \
-    ds4_gpu_qwen4_attn_prep_tensor(q, gate, kc, vc, iqo, ikc, qg, kp, vp, iq, ik, pos3, map, size, qo, ko, io, T, H, \
-                                   Hkv, D, nrot, Hi, Di, pos0, cap, ring, base, eps)
-#define ds4_gpu_qwen4_attn_decode_strided_tensor(out, q, gate, kc, vc, sel, count, part, T, H, Hkv, D, pos0, sparse, \
-                                                 stride, scale, kvs) \
-    ds4_gpu_qwen4_attn_decode_tensor(out, q, gate, kc, vc, sel, count, part, T, H, Hkv, D, pos0, sparse, stride, scale)
-#define ds4_gpu_tensor_copy_rows(dst, dst_offset, dst_pitch, src, src_offset, src_pitch, row_bytes, rows) 0
-#endif
-
 /* Points the K/V caches of the layers in has (NULL: those that have caches
  * now) at their rows in front.  Nothing changes unless every view exists. */
 static bool qwen4_kv_front_bind(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *front, const bool *has) {
@@ -60855,7 +60843,6 @@ private_state:
 #undef QWEN4_ALLOC
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
     const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
-#ifndef __APPLE__
     bool has_kv[DS4_MAX_LAYER] = {false};
     uint64_t kv_layers = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -60870,7 +60857,6 @@ private_state:
         fprintf(stderr, "ds4: Qwen3.8 K/V rows from the front of one buffer: %llu layers, %llu bytes a position, "
                 "%u rows\n", (unsigned long long)kv_layers, (unsigned long long)g->kv_stride, ctx_cap);
     }
-#endif
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             if (state_pool && hist_pool) {
@@ -85128,6 +85114,7 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
         rows[i].v_cache = r->layer_v_cache[il];
         rows[i].ik_cache = r->layer_ik_cache[il];
         rows[i].ik_ring = r->ik_ring;
+        rows[i].kv_stride = r->kv_stride;
         rows[i].block_key = r->layer_block_key[il];
         rows[i].pos3 = r->pos3;
         rows[i].pos = r->pos;
@@ -85475,6 +85462,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                     e->v_cache = r->layer_v_cache[il];
                     e->ik_cache = r->layer_ik_cache[il];
                     e->ik_ring = r->ik_ring;
+                    e->kv_stride = r->kv_stride;
                     e->block_key = r->layer_block_key[il];
                     e->pos3 = r->pos3;
                     e->pos = r->pos + t;
@@ -85525,6 +85513,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
             e->v_cache = r->layer_v_cache[il];
             e->ik_cache = r->layer_ik_cache[il];
             e->ik_ring = r->ik_ring;
+            e->kv_stride = r->kv_stride;
             e->block_key = r->layer_block_key[il];
             e->pos3 = r->pos3;
             e->pos = idx0[i] + t;
