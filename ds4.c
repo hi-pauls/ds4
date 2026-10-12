@@ -60855,13 +60855,13 @@ private_state:
 #undef QWEN4_ALLOC
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
     const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
+#ifndef __APPLE__
     bool has_kv[DS4_MAX_LAYER] = {false};
     uint64_t kv_layers = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         has_kv[il] = !ds4_qwen4_layer_is_linear(il) && (mtp || !ds4_qwen4_layer_is_nextn(il));
         kv_layers += has_kv[il];
     }
-#ifndef __APPLE__
     const char *front = getenv("DS4_KV_FRONT");
     if (ok && front && atoi(front) != 0 && !g->n_tiers && kv_layers) {
         g->kv_stride = (kv_layers * 2u * qwen4_kv_pos_bytes() + 15u) & ~(uint64_t)15u;
