@@ -500,6 +500,10 @@ void ds4_gpu_qwen4_moe_stream_set_cpu(ds4_gpu_moe_cpu_quantize_fn quantize,
  * after the next _begin will read, so _begin can fetch it for a second
  * device or the CPU in the wait it makes anyway. Optional. */
 void ds4_gpu_qwen4_moe_stream_input(const ds4_gpu_tensor *x, uint32_t width);
+/* CUDA: bytes the sessions' context may still take on the graph's device,
+ * where a context pool grows on demand. The expert cache sizes itself once,
+ * from what is free at the first decoded token, and leaves this much. */
+void ds4_gpu_qwen4_moe_stream_context_reserve(uint64_t bytes);
 /* CUDA: the model file the expert use counts belong to. They are read from
  * and, at exit, written to <model_path>.expert-uses, and decide which experts
  * a device is given at load. */

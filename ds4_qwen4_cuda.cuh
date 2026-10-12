@@ -3078,11 +3078,15 @@ static void moe_stream_tail_release(moe_stream_cache &c) {
  * second one starts.  --ssd-streaming-cache-experts sets the slot count per
  * device outright, DS4_CUDA_MOE_STREAM_CACHE_MIB the size and
  * DS4_CUDA_MOE_STREAM_RESERVE_MIB the reserve. */
+static uint64_t g_moe_stream_context_reserve;   /* see ds4_gpu_qwen4_moe_stream_context_reserve */
+
 static bool moe_stream_cache_init(moe_stream_cache &c, int device, uint64_t gate_bytes,
-                                  uint64_t down_bytes, uint32_t min_slots, uint32_t layer_experts) {
+                                  uint64_t down_bytes, uint32_t min_slots, uint32_t layer_experts,
+                                  bool runs_graph) {
     size_t free_bytes = 0, total_bytes = 0;
     if (!cuda_ok(cudaMemGetInfo(&free_bytes, &total_bytes), "MoE expert cache memory query")) return false;
-    const uint64_t reserve = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RESERVE_MIB", 512ull << 20);
+    const uint64_t reserve = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RESERVE_MIB", 512ull << 20) +
+                             (runs_graph ? g_moe_stream_context_reserve : 0);
     const uint64_t budget = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_CACHE_MIB",
                                                free_bytes > reserve ? free_bytes - reserve : 0);
     const uint64_t slot_bytes = 2 * gate_bytes + down_bytes;
@@ -4224,7 +4228,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
             here.cap = 0;
             own.resized = true;
             if (moe_stream_cache_init(own, device, t->gate_expert_bytes, t->down_expert_bytes, tail + 16,
-                                      t->n_total_expert)) {
+                                      t->n_total_expert, false)) {
                 own.tail_slots = tail;
                 here.buffer = own.gate + (uint64_t)(own.slots - tail) * slot_bytes;
                 here.cap = 2 * gate + down;
@@ -4399,6 +4403,10 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer(const ds4_gpu_stream_expert_table 
     return resident;
 }
 
+extern "C" void ds4_gpu_qwen4_moe_stream_context_reserve(uint64_t bytes) {
+    qwen4_cuda::g_moe_stream_context_reserve = bytes;
+}
+
 extern "C" void ds4_gpu_qwen4_moe_stream_input(const ds4_gpu_tensor *x, uint32_t width) {
     qwen4_cuda::g_moe_stream.input = x;
     qwen4_cuda::g_moe_stream.input_width = width;
@@ -4438,7 +4446,8 @@ static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *count
         static uint64_t refused = UINT64_MAX;
         if (!c.slots && refused != g_moe_layer.forwards) {
             c.resized = true;
-            if (!moe_stream_cache_init(c, device, t->gate_expert_bytes, t->down_expert_bytes, 16, t->n_total_expert)) {
+            if (!moe_stream_cache_init(c, device, t->gate_expert_bytes, t->down_expert_bytes, 16, t->n_total_expert,
+                                       true)) {
                 c.resized = false;
                 refused = g_moe_layer.forwards;
             }
@@ -4630,7 +4639,8 @@ extern "C" int ds4_gpu_qwen4_moe_stream_layer_remote(const ds4_gpu_stream_expert
         sized_at = g_moe_layer.forwards;
         const moe_stream_cache &own = g_moe_stream_caches[device];
         const uint64_t slot_bytes = 2 * t->gate_expert_bytes + t->down_expert_bytes;
-        const uint64_t reserve = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RESERVE_MIB", 512ull << 20);
+        const uint64_t reserve = moe_stream_env_mib("DS4_CUDA_MOE_STREAM_RESERVE_MIB", 512ull << 20) +
+                                 g_moe_stream_context_reserve;
         size_t free_bytes = 0, total_bytes = 0;
         uint64_t slots = own.slots && !own.provisional ? own.slots : 0;
         if (!slots && cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
@@ -5110,7 +5120,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table 
     }
     c.last_layer = t->layer;
     if (!c.slots && !moe_stream_cache_init(c, device, t->gate_expert_bytes, t->down_expert_bytes,
-                                           min_slots, t->n_total_expert)) return 0;
+                                           min_slots, t->n_total_expert, true)) return 0;
     if (c.gate_bytes != t->gate_expert_bytes || c.down_bytes != t->down_expert_bytes || c.slots < min_slots) {
         fprintf(stderr, "ds4: CUDA MoE expert cache on device %d holds %u experts of %llu+%llu bytes; "
                         "layer %u needs %u of %llu+%llu at once\n",
@@ -5151,7 +5161,7 @@ extern "C" int ds4_gpu_qwen4_moe_stream_begin(const ds4_gpu_stream_expert_table 
         h->resized = true;
         ok = cuda_ok(cudaSetDevice(helper_device), "MoE helper device") &&
              moe_stream_cache_init(*h, helper_device, t->gate_expert_bytes, t->down_expert_bytes,
-                                   min_slots, t->n_total_expert);
+                                   min_slots, t->n_total_expert, false);
         ok = cuda_ok(cudaSetDevice(device), "MoE primary device") && ok;
     }
     ok = ok && (!h || moe_stream_grow(g_moe_stream.host_helper_ids, g_moe_stream.host_helper_ids_cap, pairs * 4,

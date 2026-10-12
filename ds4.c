@@ -60858,6 +60858,24 @@ static uint32_t qwen4_ctx_initial_rows(uint32_t ctx_max, uint32_t cap_tokens) {
     return rows < ctx_max ? (uint32_t)rows : ctx_max;
 }
 
+/* What the pool's unclaimed rows will take on the device once sessions grow
+ * into them, reported so the CUDA expert cache does not size itself into it
+ * (it takes what is free at the first decoded token and never gives it back:
+ * a prompt then failed 8192 rows in, "context pool exhausted"). */
+static void qwen4_graph_pool_report(const ds4_qwen4_gpu_graph *g) {
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+    if (g->pool_used && !g->n_tiers) {
+        uint64_t layers = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) layers += g->layer_k_cache[il] != NULL;
+        const uint64_t row = layers * (2u * qwen4_kv_pos_bytes() + DS4_N_INDEXER_HEAD_DIM / 2u) + 16u;
+        const uint64_t rows = g->pool_limit > *g->pool_used ? g->pool_limit - *g->pool_used : 0u;
+        ds4_gpu_qwen4_moe_stream_context_reserve(rows * row);
+    }
+#else
+    (void)g;
+#endif
+}
+
 /* Moves the context caches to new_cap rows, keeping the first keep rows.
  * Everything else a session holds is independent of its context.
  * One layer at a time, so the peak is the new caches plus a single old layer
@@ -60936,6 +60954,7 @@ static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_
                 (unsigned long long)(g->pool_used ? *g->pool_used : 0u), (unsigned long long)g->pool_limit);
         g->ctx_cap = new_cap;
         g->block_key_rows = new_blocks;
+        qwen4_graph_pool_report(g);
     } else {
         ds4_gpu_tensor_free(pos3);
     }
@@ -78796,6 +78815,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->qwen4_graph.pool_reclaim = qwen4_pool_reclaim;
             s->qwen4_graph.pool_ud = e;
             e->qwen4_ctx_used += s->qwen4_graph.ctx_cap;
+            qwen4_graph_pool_report(&s->qwen4_graph);
             for (uint32_t i = 0; i < 64u; i++) {
                 if (!e->qwen4_pooled[i]) {
                     e->qwen4_pooled[i] = s;
