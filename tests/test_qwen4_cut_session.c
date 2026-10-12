@@ -254,7 +254,12 @@ int main(int argc, char **argv) {
 
     ds4_engine_options options = {
         .model_path = model,
+#ifdef __APPLE__
         .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+        .ssd_streaming = true,
+#endif
         .context_size = CTX,
         .prefill_chunk = 1024,
         .n_threads = 1,

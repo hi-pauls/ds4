@@ -99,7 +99,17 @@ $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_CPU))): $(TESTS_OUT)/%.exe: $
 $(TESTS_OUT)/ds4_test.exe: $(addprefix $(OUT)/,ds4_help.o ds4_kvstore.o rax.o) $(ZSTD_OBJS)
 $(TESTS_OUT)/test_cli_printer.exe: $(addprefix $(OUT)/,ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args.o)
 
-$(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_ENGINE))): $(TESTS_OUT)/%.exe: $(TESTS_OUT)/%.o $(CORE_OBJS) $(CUDA_DLL) $(OUT)/ucrt.specs
+# Built like the engine tests, but they need a model file (DS4_TEST_MODEL) and
+# the cards, so they are only built on request and run by hand:
+#
+#   mingw32-make -f win32/Makefile ZSTD_DIR=... tests-model
+TESTS_MODEL := test_qwen4_cut test_qwen4_cut_session
+
+.PHONY: tests-model
+tests-model: $(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_MODEL))) $(TESTS_OUT)/libwinpthread-1.dll \
+        $(TESTS_OUT)/ds4_cuda.dll
+
+$(addprefix $(TESTS_OUT)/,$(addsuffix .exe,$(TESTS_ENGINE) $(TESTS_MODEL))): $(TESTS_OUT)/%.exe: $(TESTS_OUT)/%.o $(CORE_OBJS) $(CUDA_DLL) $(OUT)/ucrt.specs
 	$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^) $(CUDA_DLL) $(LDLIBS)
 
 # The backend's kernel tests, against ds4_cuda.dll.  They need the cards, so
