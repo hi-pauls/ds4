@@ -56,14 +56,19 @@ __device__ __forceinline__ void kv_store_q8(int8_t *row, unsigned D, unsigned i,
     if (!(i & 31)) ((__half *)(row + D))[i / 32] = dh;
 }
 
-/* value lane+32*b of row r, from either cache format */
+/* The (position, kv head) row of a cache.  kvs is the distance between two
+ * positions in bytes when the cache shares its rows with other layers (K/V
+ * stored from the front of one buffer), 0 when it is packed. */
+__device__ __forceinline__ const char *kv_row(const void *cache, uint64_t p, unsigned Hkv, unsigned kh,
+        unsigned rb, uint64_t kvs) {
+    return (const char *)cache + (kvs ? p * kvs + (uint64_t)kh * rb : (p * Hkv + kh) * rb);
+}
+
+/* value lane+32*b of a row, from either cache format */
 template<bool Q8>
-__device__ __forceinline__ float kv_at(const __half *cache, uint64_t r, unsigned D, unsigned b, unsigned lane) {
-    if (Q8) {
-        const int8_t *row = (const int8_t *)cache + r * kv_row_bytes_q8(D);
-        return __half2float(((const __half *)(row + D))[b]) * (float)row[lane + 32 * b];
-    }
-    return __half2float(cache[r * D + lane + 32 * b]);
+__device__ __forceinline__ float kv_at(const char *row, unsigned D, unsigned b, unsigned lane) {
+    if (Q8) return __half2float(((const __half *)(row + D))[b]) * (float)((const int8_t *)row)[lane + 32 * b];
+    return __half2float(((const __half *)row)[lane + 32 * b]);
 }
 
 __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
@@ -71,7 +76,7 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
         const float *iq, const float *ik, const uint32_t *pos3,
         const float *gq, const float *gk, const float *giq,
         unsigned H, unsigned Hkv, unsigned D, unsigned Hi, unsigned Di,
-        unsigned pos0, unsigned ik_ring, float eps, rope_args rp, bool q8) {
+        unsigned pos0, unsigned ik_ring, float eps, rope_args rp, bool q8, uint64_t kvs) {
     const unsigned slot = blockIdx.x, t = blockIdx.y, pos = pos0 + t, lane = threadIdx.x;
     __shared__ float row[256];
     if (slot == H + Hkv + Hi) {
@@ -98,14 +103,15 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
             qout[((uint64_t)t * H + h) * D + i] = row[i];
             gate[((uint64_t)t * H + h) * D + i] = src[D + i];
         } else if (isk) {
-            const uint64_t r = (uint64_t)pos * Hkv + h;
+            const unsigned rb = q8 ? kv_row_bytes_q8(D) : D * 2;
+            char *kr = (char *)kv_row(kc, pos, Hkv, h, rb, kvs), *vr = (char *)kv_row(vc, pos, Hkv, h, rb, kvs);
             const float v = vp[((uint64_t)t * Hkv + h) * D + i];
             if (q8) {
-                kv_store_q8((int8_t *)kc + r * kv_row_bytes_q8(D), D, i, row[i]);
-                kv_store_q8((int8_t *)vc + r * kv_row_bytes_q8(D), D, i, v);
+                kv_store_q8((int8_t *)kr, D, i, row[i]);
+                kv_store_q8((int8_t *)vr, D, i, v);
             } else {
-                kc[r * D + i] = __float2half_rn(row[i]);
-                vc[r * D + i] = __float2half_rn(v);
+                ((__half *)kr)[i] = __float2half_rn(row[i]);
+                ((__half *)vr)[i] = __float2half_rn(v);
             }
         } else iqout[((uint64_t)t * Hi + h) * Di + i] = row[i];
     }
@@ -217,22 +223,23 @@ template<unsigned D, bool Q8>
 __global__ void attention(float *out, float *partial, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
         unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse,
-        unsigned splits, unsigned per, float scale) {
+        unsigned splits, unsigned per, float scale, uint64_t kvs) {
     const unsigned h = blockIdx.x * 4 + threadIdx.x / 32, t = blockIdx.y, split = blockIdx.z;
     if (h >= H) return;
     const unsigned lane = threadIdx.x & 31, kh = h / (H / Hkv), n = sparse ? counts[t] : pos0 + t + 1;
+    const unsigned rb = Q8 ? kv_row_bytes_q8(D) : D * 2;
     float qv[D / 32], acc[D / 32] = {}, m = -3e38f, denom = 0;
     for (unsigned i = 0; i < D / 32; i++) qv[i] = q[((uint64_t)t * H + h) * D + lane + 32 * i] * scale;
     for (unsigned j = split * per; j < min(n, (split + 1) * per); j++) {
         const unsigned p = sparse ? (unsigned)sel[(uint64_t)t * stride + j] : j;
         if (p > pos0 + t) continue;
-        const uint64_t r = (uint64_t)p * Hkv + kh;
+        const char *kr = kv_row(kc, p, Hkv, kh, rb, kvs), *vr = kv_row(vc, p, Hkv, kh, rb, kvs);
         float score = 0;
-        for (unsigned i = 0; i < D / 32; i++) score += qv[i] * kv_at<Q8>(kc, r, D, i, lane);
+        for (unsigned i = 0; i < D / 32; i++) score += qv[i] * kv_at<Q8>(kr, D, i, lane);
         score = sum(score);
         const float nm = fmaxf(m, score), correction = expf(m - nm), w = expf(score - nm);
         denom = denom * correction + w;
-        for (unsigned i = 0; i < D / 32; i++) acc[i] = acc[i] * correction + w * kv_at<Q8>(vc, r, D, i, lane);
+        for (unsigned i = 0; i < D / 32; i++) acc[i] = acc[i] * correction + w * kv_at<Q8>(vr, D, i, lane);
         m = nm;
     }
     if (splits == 1) {
@@ -268,7 +275,7 @@ __device__ __forceinline__ unsigned half2_bits(__half2 h) { return *reinterpret_
 /* 32 q8_0 rows of D=256 into the kv tile of attention_group: one 32-value block
  * per thread, dequantized to half as cp.async cannot. Rows at UINT_MAX are zero. */
 __device__ __forceinline__ void kv_tile_q8(__half (*kv)[264], const __half *cache,
-        const unsigned *positions, unsigned Hkv, unsigned kh, unsigned tid) {
+        const unsigned *positions, unsigned Hkv, unsigned kh, unsigned tid, uint64_t kvs) {
     const unsigned r = tid/8, blk = tid%8, p = positions[r];
     int4 *dst = reinterpret_cast<int4 *>(&kv[r][blk*32]);
     if (p == UINT_MAX) {
@@ -276,7 +283,7 @@ __device__ __forceinline__ void kv_tile_q8(__half (*kv)[264], const __half *cach
         for (unsigned u = 0; u < 4; u++) dst[u] = make_int4(0,0,0,0);
         return;
     }
-    const int8_t *row = (const int8_t *)cache+((uint64_t)p*Hkv+kh)*kv_row_bytes_q8(256);
+    const int8_t *row = (const int8_t *)kv_row(cache,p,Hkv,kh,kv_row_bytes_q8(256),kvs);
     const float d = __half2float(((const __half *)(row+256))[blk]);
     const int4 *src = reinterpret_cast<const int4 *>(row+blk*32);
     #pragma unroll
@@ -298,7 +305,7 @@ __device__ __forceinline__ void kv_tile_q8(__half (*kv)[264], const __half *cach
 template<bool Q8>
 __global__ void attention_group(float *out, const float *q, const float *gate,
         const __half *kc, const __half *vc, const int *sel, const unsigned *counts,
-        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale) {
+        unsigned H, unsigned Hkv, unsigned pos0, unsigned stride, bool sparse, float scale, uint64_t kvs) {
 #if __CUDA_ARCH__ >= 800
     const unsigned D = 256, tid = threadIdx.x, lane = tid&31, warp = tid/32;
     const unsigned t = blockIdx.y, kh = blockIdx.x, group = H/Hkv;
@@ -330,11 +337,12 @@ __global__ void attention_group(float *out, const float *q, const float *gate,
             positions[tid] = p <= pos0+t ? p : UINT_MAX;
         }
         __syncthreads();
-        if (Q8) kv_tile_q8(kv,kc,positions,Hkv,kh,tid);
+        if (Q8) kv_tile_q8(kv,kc,positions,Hkv,kh,tid,kvs);
         else {
             for (unsigned i = tid*8; i < 32*D; i += 256*8) {
                 const unsigned r = i/D, d = i%D, p = positions[r];
-                tt_cp_async_16B(&kv[r][d],kc+((uint64_t)(p == UINT_MAX ? 0 : p)*Hkv+kh)*D+d,p != UINT_MAX);
+                tt_cp_async_16B(&kv[r][d],(const __half *)kv_row(kc,p == UINT_MAX ? 0 : p,Hkv,kh,D*2,kvs)+d,
+                                p != UINT_MAX);
             }
             tt_cp_async_commit();
             tt_cp_async_wait_group<0>();
@@ -383,11 +391,12 @@ __global__ void attention_group(float *out, const float *q, const float *gate,
             scores.prob[0][qr][col+i*16] = p;
             scores.prob[1][qr][col+i*16] = __float2half_rn((prob[i]-__half2float(p))*4096);
         }
-        if (Q8) kv_tile_q8(kv,vc,positions,Hkv,kh,tid);
+        if (Q8) kv_tile_q8(kv,vc,positions,Hkv,kh,tid,kvs);
         else {
             for (unsigned i = tid*8; i < 32*D; i += 256*8) {
                 const unsigned r = i/D, d = i%D, p = positions[r];
-                tt_cp_async_16B(&kv[r][d],vc+((uint64_t)(p == UINT_MAX ? 0 : p)*Hkv+kh)*D+d,p != UINT_MAX);
+                tt_cp_async_16B(&kv[r][d],(const __half *)kv_row(vc,p == UINT_MAX ? 0 : p,Hkv,kh,D*2,kvs)+d,
+                                p != UINT_MAX);
             }
             tt_cp_async_commit();
             tt_cp_async_wait_group<0>();
@@ -2340,13 +2349,23 @@ extern "C" void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n, float scal
     if (freq) memcpy(qwen4_cuda::rope_freq, freq, std::min(n, 32u) * sizeof(float));
 }
 
-extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
+/* Bytes a K/V cache needs for rows positions: packed, or kvs bytes apart with
+ * the last position's rows at its end.  cp.async reads 16 bytes at a time, so
+ * a spread cache keeps every position on a 16 byte boundary. */
+static uint64_t qwen4_kv_span(uint64_t rows, uint32_t Hkv, uint32_t D, uint64_t kvs) {
+    const uint64_t pos = (uint64_t)Hkv * ds4_gpu_qwen4_kv_row_bytes(D);
+    if (!kvs) return rows * pos;
+    return kvs >= pos && !(kvs & 15) ? (rows ? (rows - 1) * kvs + pos : 0) : UINT64_MAX;
+}
+
+extern "C" int ds4_gpu_qwen4_attn_prep_strided_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
         ds4_gpu_tensor *kc, ds4_gpu_tensor *vc, ds4_gpu_tensor *iqout, ds4_gpu_tensor *ikc,
         const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
         const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
         const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
         uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
-        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, uint32_t ik_ring, float base, float eps) {
+        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, uint32_t ik_ring, float base, float eps,
+        uint64_t kvs) {
     using namespace qwen4_cuda;
     const uint64_t qb = (uint64_t)T * H * D * 4, kb = (uint64_t)T * Hkv * D * 4, ib = (uint64_t)T * Hi * Di * 4;
     /* A ring must hold the chunk and the block its first row may complete. */
@@ -2356,8 +2375,7 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
         !tensor(kp, kb) || !tensor(vp, kb) || !tensor(iq, ib) || !tensor(iqout, ib) ||
         !tensor(ik, (uint64_t)T * Di * 4) || !tensor(ikc, (uint64_t)(ik_ring ? ik_ring : cap) * Di * 4) ||
-        !tensor(kc, (uint64_t)cap * Hkv * ds4_gpu_qwen4_kv_row_bytes(D)) ||
-        !tensor(vc, (uint64_t)cap * Hkv * ds4_gpu_qwen4_kv_row_bytes(D)) ||
+        !tensor(kc, qwen4_kv_span(cap, Hkv, D, kvs)) || !tensor(vc, qwen4_kv_span(cap, Hkv, D, kvs)) ||
         !tensor(pos3, (uint64_t)cap * 16)) return 0;
     const char *gq = weight(map, size, qo, D * 4), *gk = weight(map, size, ko, D * 4), *giq = weight(map, size, io, Di * 4);
     if (!gq || !gk || !giq) return 0;
@@ -2365,8 +2383,20 @@ extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor 
         (float *)gate->ptr, (__half *)kc->ptr, (__half *)vc->ptr, (float *)iqout->ptr, (float *)ikc->ptr,
         (const float *)qg->ptr, (const float *)kp->ptr, (const float *)vp->ptr, (const float *)iq->ptr,
         (const float *)ik->ptr, (const uint32_t *)pos3->ptr, (const float *)gq, (const float *)gk, (const float *)giq,
-        H, Hkv, D, Hi, Di, pos0, ik_ring, eps, rope(nrot, base), g_qwen4_kv_q8);
+        H, Hkv, D, Hi, Di, pos0, ik_ring, eps, rope(nrot, base), g_qwen4_kv_q8, kvs);
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_attn_prep_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *kc, ds4_gpu_tensor *vc, ds4_gpu_tensor *iqout, ds4_gpu_tensor *ikc,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
+        const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint64_t io,
+        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot,
+        uint32_t Hi, uint32_t Di, uint32_t pos0, uint32_t cap, uint32_t ik_ring, float base, float eps) {
+    return ds4_gpu_qwen4_attn_prep_strided_tensor(q, gate, kc, vc, iqout, ikc, qg, kp, vp, iq, ik, pos3, map, size,
+                                                  qo, ko, io, T, H, Hkv, D, nrot, Hi, Di, pos0, cap, ik_ring, base,
+                                                  eps, 0);
 }
 
 extern "C" int ds4_gpu_qwen4_idx_block_key_tensor(ds4_gpu_tensor *out,
@@ -5558,12 +5588,13 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     return ok;
 }
 
-extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+extern "C" int ds4_gpu_qwen4_attn_decode_strided_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
-        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, bool sparse, uint32_t stride, float scale) {
+        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, bool sparse, uint32_t stride, float scale,
+        uint64_t kvs) {
     using namespace qwen4_cuda;
-    const uint64_t n = (uint64_t)T * H * D * 4, cb = ((uint64_t)pos0 + T) * Hkv * ds4_gpu_qwen4_kv_row_bytes(D);
+    const uint64_t n = (uint64_t)T * H * D * 4, cb = qwen4_kv_span((uint64_t)pos0 + T, Hkv, D, kvs);
     if (!T || !H || !Hkv || H % Hkv || (D != 32 && D != 128 && D != 256) ||
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
@@ -5575,7 +5606,7 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         kernel<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>(
             (float *)out->ptr,(const float *)q->ptr,(const float *)gate->ptr,(const __half *)kc->ptr,(const __half *)vc->ptr,
             sparse ? (const int *)sel->ptr : NULL,sparse ? (const unsigned *)count->ptr : NULL,
-            H,Hkv,pos0,stride,sparse,scale);
+            H,Hkv,pos0,stride,sparse,scale,kvs);
         return launched();
     }
     const unsigned splits = partial ? std::min(64u, (keys + 31) / 32) : 1;
@@ -5584,7 +5615,8 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
 #define QWEN_ATTN_FMT(DIM, Q8) attention<DIM, Q8><<<grid, 128, 0, cuda_decode_stream()>>>((float *)out->ptr, \
         partial ? (float *)partial->ptr : NULL, (const float *)q->ptr, (const float *)gate->ptr, \
         (const __half *)kc->ptr, (const __half *)vc->ptr, sparse ? (const int *)sel->ptr : NULL, \
-        sparse ? (const unsigned *)count->ptr : NULL, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, scale)
+        sparse ? (const unsigned *)count->ptr : NULL, H, Hkv, pos0, stride, sparse, splits, (keys + splits - 1) / splits, \
+        scale, kvs)
 #define QWEN_ATTN(DIM) if (g_qwen4_kv_q8) { QWEN_ATTN_FMT(DIM, true); } else { QWEN_ATTN_FMT(DIM, false); }
     if (D == 32) { QWEN_ATTN(32); }
     else if (D == 128) { QWEN_ATTN(128); }
@@ -5595,4 +5627,26 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
     if (splits > 1) attn_merge<<<dim3(H, T), D, 0, cuda_decode_stream()>>>((float *)out->ptr,
         (const float *)partial->ptr, (const float *)gate->ptr, H, D, splits);
     return launched();
+}
+
+extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
+        const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
+        uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t pos0, bool sparse, uint32_t stride, float scale) {
+    return ds4_gpu_qwen4_attn_decode_strided_tensor(out, q, gate, kc, vc, sel, count, partial, T, H, Hkv, D, pos0,
+                                                    sparse, stride, scale, 0);
+}
+
+/* rows records of row_bytes each, between two buffers whose records lie
+ * dst_pitch and src_pitch bytes apart: gathers one layer's K or V rows out of
+ * a spread cache and puts them back. */
+extern "C" int ds4_gpu_tensor_copy_rows(ds4_gpu_tensor *dst, uint64_t dst_offset, uint64_t dst_pitch,
+        const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t src_pitch, uint64_t row_bytes, uint64_t rows) {
+    if (!rows) return 1;
+    if (!dst || !src || !row_bytes || dst_pitch < row_bytes || src_pitch < row_bytes ||
+        dst_offset > dst->bytes || (rows - 1) * dst_pitch + row_bytes > dst->bytes - dst_offset ||
+        src_offset > src->bytes || (rows - 1) * src_pitch + row_bytes > src->bytes - src_offset) return 0;
+    return cudaMemcpy2DAsync((char *)dst->ptr + dst_offset, dst_pitch, (const char *)src->ptr + src_offset,
+                             src_pitch, row_bytes, rows, cudaMemcpyDeviceToDevice, cuda_decode_stream()) ==
+           cudaSuccess;
 }

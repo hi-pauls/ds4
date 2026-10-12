@@ -3715,6 +3715,31 @@ int ds4_gpu_qwen4_attn_decode_tensor(
         const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
         uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale);
+/* DS4_KV_FRONT: the K/V rows of every layer for one position lie together in
+ * one buffer, so a session's context is a single span from the buffer's start.
+ * k_cache and v_cache then point at their layer's rows of position 0 and
+ * kv_stride is the distance to the next position in bytes, a multiple of 16;
+ * 0 means packed and is what the calls without it pass.  copy_rows moves
+ * records between buffers of different pitch. */
+int ds4_gpu_qwen4_attn_prep_strided_tensor(
+        ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        ds4_gpu_tensor *iq_out, ds4_gpu_tensor *ik_cache,
+        const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
+        const ds4_gpu_tensor *iq, const ds4_gpu_tensor *ik, const ds4_gpu_tensor *pos3,
+        const void *model_map, uint64_t model_size,
+        uint64_t g_q_offset, uint64_t g_k_offset, uint64_t g_iq_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t n_idx_head, uint32_t idx_dim, uint32_t pos0, uint32_t cache_cap, uint32_t ik_ring,
+        float rope_base, float eps, uint64_t kv_stride);
+int ds4_gpu_qwen4_attn_decode_strided_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *sel_tokens, const ds4_gpu_tensor *n_sel, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim,
+        uint32_t pos0, bool use_sel, uint32_t sel_stride, float scale, uint64_t kv_stride);
+int ds4_gpu_tensor_copy_rows(
+        ds4_gpu_tensor *dst, uint64_t dst_offset, uint64_t dst_pitch,
+        const ds4_gpu_tensor *src, uint64_t src_offset, uint64_t src_pitch, uint64_t row_bytes, uint64_t rows);
 /* Routed experts; shared_type == UINT32_MAX disables the shared-expert slot,
  * otherwise mid/part carry n_slots+1 entries and the reduce weights the last
  * one by sigmoid(shared_gate). */

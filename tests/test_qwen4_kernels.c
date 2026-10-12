@@ -954,6 +954,32 @@ static void test_attn_mm_keys(uint32_t T, uint32_t pos0, bool sparse, uint32_t k
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
     require_ok(ds4_gpu_qwen4_attn_decode_tensor(go_new, gq, ggate, gk, gv, gsel, gcnt, partial, T, H, Hkv, D, pos0, sparse, sel_stride, 0.0625f), "attn mm");
     float *ref = download(go_ref, qn), *got = download(go_new, qn);
+#ifndef __APPLE__
+    {   /* DS4_KV_FRONT: the same rows, as the second of three layers sharing a
+         * buffer, must give both kernels the bytes the packed caches gave */
+        const uint64_t pb = Hkv * ds4_gpu_qwen4_kv_row_bytes(D), kvs = 3u * 2u * pb, bytes = (uint64_t)cap * kvs;
+        ds4_gpu_tensor *front = ds4_gpu_tensor_alloc(bytes);
+        ds4_gpu_tensor *fk = front ? ds4_gpu_tensor_view(front, 2u * pb, bytes - 2u * pb) : NULL;
+        ds4_gpu_tensor *fv = front ? ds4_gpu_tensor_view(front, 3u * pb, bytes - 3u * pb) : NULL;
+        ds4_gpu_tensor *so_ref = upload(NULL, qn), *so_new = upload(NULL, qn);
+        require_ok(fk && fv && ds4_gpu_tensor_copy_rows(fk, 0, kvs, gk, 0, pb, pb, cap) &&
+                   ds4_gpu_tensor_copy_rows(fv, 0, kvs, gv, 0, pb, pb, cap), "attn mm spread setup");
+        setenv("DS4_QWEN4_NO_ATTN_MM", "1", 1);
+        require_ok(ds4_gpu_qwen4_attn_decode_strided_tensor(so_ref, gq, ggate, fk, fv, gsel, gcnt, NULL, T, H, Hkv, D,
+                                                            pos0, sparse, sel_stride, 0.0625f, kvs),
+                   "attn reference, spread");
+        unsetenv("DS4_QWEN4_NO_ATTN_MM");
+        require_ok(ds4_gpu_qwen4_attn_decode_strided_tensor(so_new, gq, ggate, fk, fv, gsel, gcnt, partial, T, H, Hkv,
+                                                            D, pos0, sparse, sel_stride, 0.0625f, kvs),
+                   "attn mm, spread");
+        float *spread_ref = download(so_ref, qn), *spread_new = download(so_new, qn);
+        require_ok(!memcmp(spread_ref, ref, qn * sizeof(float)) && !memcmp(spread_new, got, qn * sizeof(float)),
+                   "spread K/V rows give the packed result");
+        free(spread_ref); free(spread_new);
+        ds4_gpu_tensor_free(so_ref); ds4_gpu_tensor_free(so_new);
+        ds4_gpu_tensor_free(fk); ds4_gpu_tensor_free(fv); ds4_gpu_tensor_free(front);
+    }
+#endif
     double worst = 0.0, scale = 0.0;
     for (uint64_t i = 0; i < qn; i++) {
         require_ok(isfinite(got[i]) && isfinite(ref[i]), "finite attention output");
@@ -1205,6 +1231,17 @@ static void rope_ref(double *x, uint32_t n_rot, uint32_t pos, double base) {
 /* Decode n_pos tokens one at a time through prep / block keys / scoring /
  * expand / attention and compare against a reference that recomputes the
  * selection.  k_blocks is small so the sparse path is exercised early. */
+/* DS4_KV_FRONT: test_attention keeps its K/V rows as the last of this many
+ * layers sharing one buffer; 0 leaves them packed.  CUDA only. */
+static uint32_t g_test_kv_spread;
+#ifdef __APPLE__
+#define attn_prep_kvs(kvs, ...) ds4_gpu_qwen4_attn_prep_tensor(__VA_ARGS__)
+#define attn_decode_kvs(kvs, ...) ds4_gpu_qwen4_attn_decode_tensor(__VA_ARGS__)
+#else
+#define attn_prep_kvs(kvs, ...) ds4_gpu_qwen4_attn_prep_strided_tensor(__VA_ARGS__, kvs)
+#define attn_decode_kvs(kvs, ...) ds4_gpu_qwen4_attn_decode_strided_tensor(__VA_ARGS__, kvs)
+#endif
+
 static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uint32_t n_rot,
                            uint32_t Hi, uint32_t Di, uint32_t k_blocks, uint32_t n_pos) {
     /* a ring shorter than the sequence, so positions wrap around it */
@@ -1339,6 +1376,22 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     ds4_gpu_tensor *gpart = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1, H, D));
     ds4_gpu_tensor *gpos3 = ds4_gpu_tensor_alloc((uint64_t)cap * 16);
     require_ok(gkc && gvc && gbk && gselb && gselt && gnsel && gpart && gpos3, "attention allocs");
+    /* spread: the caches become views behind the rows of the other layers,
+     * which are filled with a pattern no kernel may touch */
+    const uint64_t pos_bytes = Hkv * ds4_gpu_qwen4_kv_row_bytes(D), others = (g_test_kv_spread - 1u) * 2u * pos_bytes;
+    const uint64_t kvs = g_test_kv_spread ? (others + 2u * pos_bytes + 15u) & ~(uint64_t)15u : 0;
+    ds4_gpu_tensor *front = NULL;
+    uint8_t *pattern = NULL;
+    if (kvs) {
+        pattern = malloc(cap * kvs);
+        memset(pattern, 0x5a, cap * kvs);
+        front = ds4_gpu_tensor_alloc(cap * kvs);
+        require_ok(front && ds4_gpu_tensor_write(front, 0, pattern, cap * kvs), "spread K/V buffer");
+        ds4_gpu_tensor_free(gkc); ds4_gpu_tensor_free(gvc);
+        gkc = ds4_gpu_tensor_view(front, others, cap * kvs - others);
+        gvc = ds4_gpu_tensor_view(front, others + pos_bytes, cap * kvs - others - pos_bytes);
+        require_ok(gkc && gvc, "spread K/V views");
+    }
     {
         uint32_t *p3 = calloc((size_t)cap * 4, sizeof(uint32_t));
         for (uint32_t p = 0; p < cap; p++) p3[p * 4] = p3[p * 4 + 1] = p3[p * 4 + 2] = p;
@@ -1352,9 +1405,9 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
         ds4_gpu_tensor *viq = ds4_gpu_tensor_view(giq, (uint64_t)pos * Hi * Di * 4, (uint64_t)Hi * Di * 4);
         ds4_gpu_tensor *vik = ds4_gpu_tensor_view(gik, (uint64_t)pos * Di * 4, (uint64_t)Di * 4);
         ds4_gpu_tensor *vout = ds4_gpu_tensor_view(gout, (uint64_t)pos * H * D * 4, (uint64_t)H * D * 4);
-        require_ok(ds4_gpu_qwen4_attn_prep_tensor(gq, ggate, gkc, gvc, giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
-                                                  a->base, a->size, gq_off, gk_off, giq_off,
-                                                  1, H, Hkv, D, n_rot, Hi, Di, pos, cap, ik_ring, (float)base, (float)eps),
+        require_ok(attn_prep_kvs(kvs, gq, ggate, gkc, gvc, giqo, gikc, vqg, vk, vv, viq, vik, gpos3,
+                                 a->base, a->size, gq_off, gk_off, giq_off,
+                                 1, H, Hkv, D, n_rot, Hi, Di, pos, cap, ik_ring, (float)base, (float)eps),
                    "attn prep");
         const uint32_t n_blocks = (pos + 1) / ratio;
         if ((pos + 1) % ratio == 0) {
@@ -1381,16 +1434,30 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
             require_ok(ds4_gpu_qwen4_idx_expand_tensor(gselt, gnsel, gselb, 1, k_blocks, ratio, pos, sel_stride), "idx expand");
         }
         /* even positions exercise the key-split partials (main sets DS4_QWEN4_ATTN_SPLIT_KEYS=8) */
-        require_ok(ds4_gpu_qwen4_attn_decode_tensor(vout, gq, ggate, gkc, gvc, gselt, gnsel, (pos % 2) ? NULL : gpart,
-                                                    1, H, Hkv, D, pos, sparse, sel_stride, scale), "attn decode");
+        require_ok(attn_decode_kvs(kvs, vout, gq, ggate, gkc, gvc, gselt, gnsel, (pos % 2) ? NULL : gpart,
+                                   1, H, Hkv, D, pos, sparse, sel_stride, scale), "attn decode");
         ds4_gpu_tensor_free(vout); ds4_gpu_tensor_free(vik); ds4_gpu_tensor_free(viq);
         ds4_gpu_tensor_free(vv); ds4_gpu_tensor_free(vk); ds4_gpu_tensor_free(vqg);
     }
     char name[96];
-    snprintf(name, sizeof(name), "attention H=%u/%u D=%u k=%u n=%u%s", H, Hkv, D, k_blocks, n_pos,
-             g_test_kv_q8 ? " q8 kv" : "");
+    snprintf(name, sizeof(name), "attention H=%u/%u D=%u k=%u n=%u%s%s", H, Hkv, D, k_blocks, n_pos,
+             g_test_kv_q8 ? " q8 kv" : "", kvs ? " spread" : "");
     /* half KV and block order differ from the f32 reference; q8_0 rows round to 1/254 of a block's range */
     check_tensor(name, gout, ref_out, (uint64_t)n_pos * H * D, g_test_kv_q8 ? 2e-2 : 5e-4);
+    if (kvs) {
+        uint8_t *after = malloc(cap * kvs);
+        require_ok(ds4_gpu_tensor_read(front, 0, after, cap * kvs), "spread K/V read");
+        for (uint32_t pos = 0; pos < cap; pos++) {
+            require_ok(!memcmp(after + pos * kvs, pattern + pos * kvs, others) &&
+                       !memcmp(after + pos * kvs + others + 2u * pos_bytes,
+                               pattern + pos * kvs + others + 2u * pos_bytes, kvs - others - 2u * pos_bytes),
+                       "spread K/V rows leave the other layers' rows alone");
+            require_ok(pos >= n_pos || memcmp(after + pos * kvs + others, pattern + pos * kvs + others, 2u * pos_bytes),
+                       "spread K/V rows were written");
+        }
+        free(after); free(pattern);
+        ds4_gpu_tensor_free(front);
+    }
 
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gnsel); ds4_gpu_tensor_free(gselt); ds4_gpu_tensor_free(gselb);
     ds4_gpu_tensor_free(gscore); ds4_gpu_tensor_free(gbk); ds4_gpu_tensor_free(gikc); ds4_gpu_tensor_free(giqo);
@@ -4008,6 +4075,15 @@ int main(void) {
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
     test_attention_rows(&arena);
+#else
+    g_test_kv_spread = 3;
+    test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
+    test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+    ds4_gpu_qwen4_set_kv_q8(false);
+    g_test_kv_q8 = false;
+    test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
+    test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+    g_test_kv_spread = 0;
 #endif
     ds4_gpu_qwen4_set_kv_q8(false);
     g_test_kv_q8 = false;

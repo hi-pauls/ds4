@@ -60225,6 +60225,12 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *layer_v_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_ik_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_block_key[DS4_MAX_LAYER];
+    /* DS4_KV_FRONT: the K/V caches above are views into this one buffer, the
+     * rows of every layer for a position together, kv_stride bytes apart, so
+     * the context a session holds is a single span from the buffer's start.
+     * kv_stride is 0 while each layer owns packed caches. */
+    ds4_gpu_tensor *kv_front;
+    uint64_t kv_stride;
     /* A separate injection buffer keeps combined normalization race-free. */
     ds4_gpu_tensor *inj_alt;
     /* MTP: staged predictor input, its residual, and the recurrent-state
@@ -60498,6 +60504,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->snap0_lin_state[il]);
         ds4_gpu_tensor_free(g->snap0_lin_hist[il]);
     }
+    ds4_gpu_tensor_free(g->kv_front);
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
 }
@@ -60690,6 +60697,50 @@ static bool qwen4_graph_alloc_scratch(ds4_qwen4_gpu_graph *g, int tier, uint64_t
  * output head last) when the layers are spread over n_gpus CUDA devices, and
  * NULL for one device.  A split graph owns its transients, keeps private
  * recurrent state and runs without the MTP block. */
+#ifdef __APPLE__
+/* Metal has no spread K/V rows yet, so kv_stride stays 0 there. */
+#define ds4_gpu_qwen4_attn_prep_strided_tensor(q, gate, kc, vc, iqo, ikc, qg, kp, vp, iq, ik, pos3, map, size, qo, \
+                                               ko, io, T, H, Hkv, D, nrot, Hi, Di, pos0, cap, ring, base, eps, kvs) \
+    ds4_gpu_qwen4_attn_prep_tensor(q, gate, kc, vc, iqo, ikc, qg, kp, vp, iq, ik, pos3, map, size, qo, ko, io, T, H, \
+                                   Hkv, D, nrot, Hi, Di, pos0, cap, ring, base, eps)
+#define ds4_gpu_qwen4_attn_decode_strided_tensor(out, q, gate, kc, vc, sel, count, part, T, H, Hkv, D, pos0, sparse, \
+                                                 stride, scale, kvs) \
+    ds4_gpu_qwen4_attn_decode_tensor(out, q, gate, kc, vc, sel, count, part, T, H, Hkv, D, pos0, sparse, stride, scale)
+#define ds4_gpu_tensor_copy_rows(dst, dst_offset, dst_pitch, src, src_offset, src_pitch, row_bytes, rows) 0
+#endif
+
+/* Points the K/V caches of the layers in has (NULL: those that have caches
+ * now) at their rows in front.  Nothing changes unless every view exists. */
+static bool qwen4_kv_front_bind(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *front, const bool *has) {
+    const uint64_t pb = qwen4_kv_pos_bytes(), bytes = ds4_gpu_tensor_bytes(front);
+    ds4_gpu_tensor *k[DS4_MAX_LAYER] = {NULL}, *v[DS4_MAX_LAYER] = {NULL};
+    bool ok = true;
+    uint64_t at = 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (has ? has[il] : g->layer_k_cache[il] != NULL) {
+            ok = at + 2u * pb <= bytes;
+            if (ok) {
+                k[il] = ds4_gpu_tensor_view(front, at, bytes - at);
+                v[il] = ds4_gpu_tensor_view(front, at + pb, bytes - at - pb);
+                ok = k[il] && v[il];
+                at += 2u * pb;
+            }
+        }
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ok && k[il]) {
+            ds4_gpu_tensor_free(g->layer_k_cache[il]);
+            ds4_gpu_tensor_free(g->layer_v_cache[il]);
+            g->layer_k_cache[il] = k[il];
+            g->layer_v_cache[il] = v[il];
+        } else if (!ok) {
+            ds4_gpu_tensor_free(k[il]);
+            ds4_gpu_tensor_free(v[il]);
+        }
+    }
+    return ok;
+}
+
 static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_max, uint32_t ctx_initial,
                               uint32_t cap_tokens, bool mtp, const ds4_qwen4_gpu_graph *shared,
                               ds4_gpu_tensor *const *state_pool,
@@ -60804,6 +60855,22 @@ private_state:
 #undef QWEN4_ALLOC
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
     const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
+    bool has_kv[DS4_MAX_LAYER] = {false};
+    uint64_t kv_layers = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        has_kv[il] = !ds4_qwen4_layer_is_linear(il) && (mtp || !ds4_qwen4_layer_is_nextn(il));
+        kv_layers += has_kv[il];
+    }
+#ifndef __APPLE__
+    const char *front = getenv("DS4_KV_FRONT");
+    if (ok && front && atoi(front) != 0 && !g->n_tiers && kv_layers) {
+        g->kv_stride = (kv_layers * 2u * qwen4_kv_pos_bytes() + 15u) & ~(uint64_t)15u;
+        g->kv_front = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * g->kv_stride);
+        ok = g->kv_front && qwen4_kv_front_bind(g, g->kv_front, has_kv);
+        fprintf(stderr, "ds4: Qwen3.8 K/V rows from the front of one buffer: %llu layers, %llu bytes a position, "
+                "%u rows\n", (unsigned long long)kv_layers, (unsigned long long)g->kv_stride, ctx_cap);
+    }
+#endif
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
             if (state_pool && hist_pool) {
@@ -60825,8 +60892,10 @@ private_state:
         } else if (mtp || !ds4_qwen4_layer_is_nextn(il)) {
             /* Without MTP nothing runs the next-token block: no caches for it. */
             const int tier = qwen4_graph_layer_tier(g, il);
-            g->layer_k_cache[il] = qwen4_graph_alloc_bytes_on(tier, (uint64_t)ctx_cap * qwen4_kv_pos_bytes());
-            g->layer_v_cache[il] = qwen4_graph_alloc_bytes_on(tier, (uint64_t)ctx_cap * qwen4_kv_pos_bytes());
+            if (!g->kv_stride) {
+                g->layer_k_cache[il] = qwen4_graph_alloc_bytes_on(tier, (uint64_t)ctx_cap * qwen4_kv_pos_bytes());
+                g->layer_v_cache[il] = qwen4_graph_alloc_bytes_on(tier, (uint64_t)ctx_cap * qwen4_kv_pos_bytes());
+            }
             g->layer_ik_cache[il] = qwen4_graph_alloc_f32_on(tier, (uint64_t)(g->ik_ring ? g->ik_ring : ctx_max) *
                                                              DS4_N_INDEXER_HEAD_DIM);
             g->layer_block_key[il] = qwen4_graph_alloc_bytes_on(tier, (uint64_t)g->block_key_rows *
@@ -60912,17 +60981,27 @@ static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_
         pos3 = ds4_gpu_tensor_alloc((uint64_t)new_cap * 16u);
         ok = pos3 != NULL && (keep == 0 || ds4_gpu_tensor_copy(pos3, 0, g->pos3, 0, (uint64_t)keep * 16u));
     }
+    /* K/V from the front: every layer's rows move at once, so the peak is
+     * both buffers in full. */
+    ds4_gpu_tensor *front = NULL;
+    if (ok && g->kv_stride) {
+        front = ds4_gpu_tensor_alloc((uint64_t)new_cap * g->kv_stride);
+        ok = front != NULL &&
+             (keep == 0 || ds4_gpu_tensor_copy(front, 0, g->kv_front, 0, (uint64_t)keep * g->kv_stride));
+        ok = ds4_gpu_synchronize() != 0 && ok;
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!g->layer_k_cache[il]) continue;
         const int tier = qwen4_graph_layer_tier(g, il);
         (void)ds4_gpu_begin_commands();
-        ds4_gpu_tensor *k = qwen4_graph_alloc_bytes_on(tier, (uint64_t)new_cap * kv_row);
-        ds4_gpu_tensor *v = qwen4_graph_alloc_bytes_on(tier, (uint64_t)new_cap * kv_row);
+        ds4_gpu_tensor *k = g->kv_stride ? NULL : qwen4_graph_alloc_bytes_on(tier, (uint64_t)new_cap * kv_row);
+        ds4_gpu_tensor *v = g->kv_stride ? NULL : qwen4_graph_alloc_bytes_on(tier, (uint64_t)new_cap * kv_row);
         ds4_gpu_tensor *bk = qwen4_graph_alloc_bytes_on(tier, (uint64_t)new_blocks * bk_row);
-        ok = k && v && bk;
+        ok = (g->kv_stride || (k && v)) && bk;
         if (ok && keep) {
-            ok = ds4_gpu_tensor_copy(k, 0, g->layer_k_cache[il], 0, (uint64_t)keep * kv_row) &&
-                 ds4_gpu_tensor_copy(v, 0, g->layer_v_cache[il], 0, (uint64_t)keep * kv_row) &&
+            ok = (g->kv_stride ||
+                  (ds4_gpu_tensor_copy(k, 0, g->layer_k_cache[il], 0, (uint64_t)keep * kv_row) &&
+                   ds4_gpu_tensor_copy(v, 0, g->layer_v_cache[il], 0, (uint64_t)keep * kv_row))) &&
                  ds4_gpu_tensor_copy(bk, 0, g->layer_block_key[il], 0, (uint64_t)keep_blocks * bk_row);
         }
         /* the copies read the old buffers: finish them before letting those go */
@@ -60930,16 +61009,27 @@ static bool qwen4_graph_resize(ds4_qwen4_gpu_graph *g, uint32_t new_cap, uint32_
         ok = ds4_gpu_synchronize() != 0 && ok;
         if (tier >= 0) ok = ds4_gpu_set_current_device(g->active_tier) == 0 && ok;
         if (ok) {
-            ds4_gpu_tensor_free(g->layer_k_cache[il]);
-            ds4_gpu_tensor_free(g->layer_v_cache[il]);
+            if (!g->kv_stride) {
+                ds4_gpu_tensor_free(g->layer_k_cache[il]);
+                ds4_gpu_tensor_free(g->layer_v_cache[il]);
+                g->layer_k_cache[il] = k;
+                g->layer_v_cache[il] = v;
+            }
             ds4_gpu_tensor_free(g->layer_block_key[il]);
-            g->layer_k_cache[il] = k;
-            g->layer_v_cache[il] = v;
             g->layer_block_key[il] = bk;
         } else {
             ds4_gpu_tensor_free(k);
             ds4_gpu_tensor_free(v);
             ds4_gpu_tensor_free(bk);
+        }
+    }
+    if (g->kv_stride) {
+        ok = ok && qwen4_kv_front_bind(g, front, NULL);
+        if (ok) {
+            ds4_gpu_tensor_free(g->kv_front);
+            g->kv_front = front;
+        } else {
+            ds4_gpu_tensor_free(front);
         }
     }
     if (caller_batch) (void)ds4_gpu_begin_commands();
@@ -61429,10 +61519,10 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
     const uint32_t clast = cpos0 + cT - 1u;
     const uint32_t n_dense = clast < sparse_pos ? cT : (sparse_pos > cpos0 ? sparse_pos - cpos0 : 0u);
     if (n_dense > 0 &&
-        !ds4_gpu_qwen4_attn_decode_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il], g->layer_v_cache[il],
-                                          g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_dense,
-                                          DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, cpos0, false, g->sel_stride,
-                                          scale)) {
+        !ds4_gpu_qwen4_attn_decode_strided_tensor(o_rows, q_rows, gate_rows, g->layer_k_cache[il],
+                                                  g->layer_v_cache[il], g->sel_tokens, g->n_sel,
+                                                  cT <= 2u ? g->attn_part : NULL, n_dense, DS4_N_HEAD, DS4_N_HEAD_KV,
+                                                  DS4_N_HEAD_DIM, cpos0, false, g->sel_stride, scale, g->kv_stride)) {
         return false;
     }
     if (n_dense >= cT) return true;
@@ -61458,10 +61548,10 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
                          n_blocks_after, n_sparse, g->k_blocks) &&
         ds4_gpu_qwen4_idx_expand_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, n_sparse, g->k_blocks, ratio,
                                         sp0, g->sel_stride) &&
-        ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
-                                         g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
-                                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
-                                         scale);
+        ds4_gpu_qwen4_attn_decode_strided_tensor(o, q, gate, g->layer_k_cache[il], g->layer_v_cache[il],
+                                                 g->sel_tokens, g->n_sel, cT <= 2u ? g->attn_part : NULL, n_sparse,
+                                                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, sp0, true, g->sel_stride,
+                                                 scale, g->kv_stride);
     if (!lean) {
         ds4_gpu_tensor_free(iqn);
         ds4_gpu_tensor_free(o);
@@ -61479,12 +61569,12 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
-    if (!(ds4_gpu_qwen4_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn,
-                                         g->layer_ik_cache[il], g->qg, g->kp, g->vp, g->iq, g->ik, g->pos3,
-                                         m->map, m->size, l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
-                                         l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
-                                         DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                         pos0, g->ctx_cap, g->ik_ring, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS))) {
+    if (!(ds4_gpu_qwen4_attn_prep_strided_tensor(
+                g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il], g->iqn, g->layer_ik_cache[il], g->qg, g->kp,
+                g->vp, g->iq, g->ik, g->pos3, m->map, m->size, l->attn_q_norm->abs_offset,
+                l->attn_k_norm->abs_offset, l->indexer_q_norm->abs_offset, T, DS4_N_HEAD, DS4_N_HEAD_KV,
+                DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, pos0, g->ctx_cap, g->ik_ring,
+                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS, g->kv_stride))) {
         return false;
     }
     /* blocks whose last token falls in this chunk get their pooled keys */
@@ -67210,6 +67300,44 @@ static uint64_t qwen4_payload_lin_hist_bytes(void) {
 static uint64_t qwen4_payload_kv_bytes(uint32_t rows) {
     return (uint64_t)rows * qwen4_kv_pos_bytes();
 }
+/* Rows [0, n) of one layer's K or V cache, to the file or from it.  A cache
+ * spread over the front buffer goes through a packed staging buffer, 4096
+ * rows at a time, so the file reads the same either way. */
+static int qwen4_payload_kv_span(FILE *fp, const ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *cache, uint32_t n,
+                                 bool write, uint8_t *buf, size_t cap, uint64_t *remaining,
+                                 char *err, size_t errlen) {
+    int rc = 0;
+    if (!g->kv_stride) {
+        rc = write ? payload_write_tensor_span(fp, cache, 0, qwen4_payload_kv_bytes(n), buf, cap, err, errlen)
+                   : payload_read_tensor_span(fp, cache, 0, qwen4_payload_kv_bytes(n), buf, cap, remaining,
+                                              err, errlen);
+    } else {
+        const uint64_t pb = qwen4_kv_pos_bytes();
+        const uint32_t step = 4096u;
+        ds4_gpu_tensor *stage = ds4_gpu_tensor_alloc((uint64_t)step * pb);
+        bool moved = stage != NULL;
+        for (uint32_t r = 0; rc == 0 && moved && r < n; r += step) {
+            const uint32_t rows = n - r < step ? n - r : step;
+            if (write) {
+                moved = ds4_gpu_tensor_copy_rows(stage, 0, pb, cache, (uint64_t)r * g->kv_stride, g->kv_stride,
+                                                 pb, rows) != 0 && ds4_gpu_synchronize() != 0;
+                if (moved) rc = payload_write_tensor_span(fp, stage, 0, (uint64_t)rows * pb, buf, cap, err, errlen);
+            } else {
+                rc = payload_read_tensor_span(fp, stage, 0, (uint64_t)rows * pb, buf, cap, remaining, err, errlen);
+                if (rc == 0) {
+                    moved = ds4_gpu_tensor_copy_rows(cache, (uint64_t)r * g->kv_stride, g->kv_stride, stage, 0, pb,
+                                                     pb, rows) != 0 && ds4_gpu_synchronize() != 0;
+                }
+            }
+        }
+        ds4_gpu_tensor_free(stage);
+        if (!moved) {
+            payload_set_err(err, errlen, "could not stage K/V rows between the front buffer and the file");
+            rc = 1;
+        }
+    }
+    return rc;
+}
 /* Only the raw indexer keys of the incomplete last block are still needed:
  * every complete block lives on as its pooled key. */
 static uint64_t qwen4_payload_ik_row_bytes(void) {
@@ -67296,10 +67424,10 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
             }
         } else if (g->layer_k_cache[il]) {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                           buf, DS4_SESSION_IO_CHUNK, err, errlen);
-            if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            rc = qwen4_payload_kv_span(fp, g, g->layer_k_cache[il], n, true, buf, DS4_SESSION_IO_CHUNK, NULL,
+                                       err, errlen);
+            if (rc == 0) rc = qwen4_payload_kv_span(fp, g, g->layer_v_cache[il], n, true, buf, DS4_SESSION_IO_CHUNK,
+                                                    NULL, err, errlen);
             for (uint32_t p = n - n % 4u; rc == 0 && p < n; p++) {
                 rc = payload_write_tensor_span(fp, g->layer_ik_cache[il], qwen4_payload_ik_offset(g, p),
                                                qwen4_payload_ik_row_bytes(), buf, DS4_SESSION_IO_CHUNK, err, errlen);
@@ -67393,10 +67521,10 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
             }
         } else {
             const uint32_t n = ds4_qwen4_layer_is_nextn(il) ? mtp_rows : rows;
-            rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                          buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-            if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, qwen4_payload_kv_bytes(n),
-                                                       buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            rc = qwen4_payload_kv_span(fp, g, g->layer_k_cache[il], n, false, buf, DS4_SESSION_IO_CHUNK, remaining,
+                                       err, errlen);
+            if (rc == 0) rc = qwen4_payload_kv_span(fp, g, g->layer_v_cache[il], n, false, buf, DS4_SESSION_IO_CHUNK,
+                                                    remaining, err, errlen);
             for (uint32_t p = n - n % 4u; rc == 0 && p < n; p++) {
                 rc = payload_read_tensor_span(fp, g->layer_ik_cache[il], qwen4_payload_ik_offset(g, p),
                                               qwen4_payload_ik_row_bytes(), buf, DS4_SESSION_IO_CHUNK, remaining,
@@ -82647,14 +82775,28 @@ int ds4_session_qwen4_cut(ds4_session *s, int start, int end, char *err, size_t 
             }
         }
         const uint32_t tail_blocks = g->pos / ratio - (uint32_t)end / ratio;
+        /* K/V from the front: the tail of every layer moves as one span, in
+         * pieces no longer than the cut so that none overlaps itself, front
+         * to back so that no row is written before it is read. */
+        if (ok && tail && g->kv_stride) {
+            const uint64_t gap = (uint64_t)cut * g->kv_stride, bytes = (uint64_t)tail * g->kv_stride;
+            (void)ds4_gpu_begin_commands();
+            for (uint64_t done = 0; ok && done < bytes; done += gap) {
+                ok = ds4_gpu_tensor_copy(g->kv_front, (uint64_t)start * g->kv_stride + done, g->kv_front,
+                                         (uint64_t)end * g->kv_stride + done,
+                                         bytes - done < gap ? bytes - done : gap) != 0;
+            }
+            ok = ds4_gpu_synchronize() != 0 && ok;
+        }
         for (uint32_t il = 0; ok && tail && il < DS4_N_LAYER; il++) {
             if (g->layer_k_cache[il]) {
                 const int tier = g->n_tiers ? g->layer_tier[il] : 0;
                 ok = (!g->n_tiers || ds4_gpu_set_current_device(tier) == 0) &&
-                     qwen4_move_bytes(g->layer_k_cache[il], (uint64_t)start * kv_row, (uint64_t)end * kv_row,
-                                      (uint64_t)tail * kv_row, tmp[tier]) &&
-                     qwen4_move_bytes(g->layer_v_cache[il], (uint64_t)start * kv_row, (uint64_t)end * kv_row,
-                                      (uint64_t)tail * kv_row, tmp[tier]) &&
+                     (g->kv_stride ||
+                      (qwen4_move_bytes(g->layer_k_cache[il], (uint64_t)start * kv_row, (uint64_t)end * kv_row,
+                                        (uint64_t)tail * kv_row, tmp[tier]) &&
+                       qwen4_move_bytes(g->layer_v_cache[il], (uint64_t)start * kv_row, (uint64_t)end * kv_row,
+                                        (uint64_t)tail * kv_row, tmp[tier]))) &&
                      qwen4_move_bytes(g->layer_block_key[il], (uint64_t)(start / ratio) * bk_row,
                                       (uint64_t)(end / ratio) * bk_row, (uint64_t)tail_blocks * bk_row, tmp[tier]);
                 /* raw indexer keys still matter for the unfinished last block only */
@@ -84981,15 +85123,16 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
     for (int i = 0; ok && i < count; i++) {
         ds4_qwen4_gpu_graph *r = &rowg[i];
         const uint32_t pos0 = r->pos;
-        ok = ds4_gpu_qwen4_attn_prep_tensor(r->q, r->gate, r->layer_k_cache[il],
-                                            r->layer_v_cache[il], r->iqn, r->layer_ik_cache[il],
-                                            r->qg, r->kp, r->vp, r->iq, r->ik, r->pos3,
-                                            m->map, m->size, l->attn_q_norm->abs_offset,
-                                            l->attn_k_norm->abs_offset,
-                                            l->indexer_q_norm->abs_offset, 1u, DS4_N_HEAD,
-                                            DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
-                                            DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
-                                            pos0, r->ctx_cap, r->ik_ring, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+        ok = ds4_gpu_qwen4_attn_prep_strided_tensor(r->q, r->gate, r->layer_k_cache[il],
+                                                    r->layer_v_cache[il], r->iqn, r->layer_ik_cache[il],
+                                                    r->qg, r->kp, r->vp, r->iq, r->ik, r->pos3,
+                                                    m->map, m->size, l->attn_q_norm->abs_offset,
+                                                    l->attn_k_norm->abs_offset,
+                                                    l->indexer_q_norm->abs_offset, 1u, DS4_N_HEAD,
+                                                    DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                                    DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                                                    pos0, r->ctx_cap, r->ik_ring, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                                    r->kv_stride);
         const uint32_t first_block = pos0 / ratio;
         const uint32_t n_blocks_after = (pos0 + 1u) / ratio;
         if (ok && n_blocks_after > first_block) {
