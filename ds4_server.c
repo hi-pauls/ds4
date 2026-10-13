@@ -12382,15 +12382,26 @@ static void kv_cache_store_current(server *s, server_slot *slot,
     (void)kv_cache_store_current_ex(s, slot, reason, false);
 }
 
+static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinned, size_t pinned_len,
+                                  const char *reason);
+
 /* The context pool's evict hook, called inside the engine (inference_mu held):
- * a session it takes context from is first written to the disk KV cache, so
- * its next request restores it instead of prefilling from scratch. */
+ * a session it takes context from is first written to the disk KV cache, or
+ * to the conversation cache in that mode, so its next request restores it
+ * instead of prefilling from scratch.  In conversation mode the context is
+ * taken even when the session could not be stored (an unfinished turn with
+ * no complete one before it): a pool that keeps it refuses every request. */
 static bool kv_cache_pool_evict(void *ud, ds4_session *session) {
     server *s = ud;
     bool ok = false;
-    if (s && s->kv.enabled) {
-        for (int i = 0; i < s->slot_count && !ok; i++) {
-            if (s->slots[i].session == session) ok = kv_cache_store_current_ex(s, &s->slots[i], "evict", true);
+    for (int i = 0; s && i < s->slot_count && !ok; i++) {
+        if (s->slots[i].session == session) {
+            if (s->cache_mode == DS4_CACHE_CONVERSATION) {
+                (void)conv_cache_store_slot(s, &s->slots[i], NULL, 0, "evict");
+                ok = true;
+            } else if (s->kv.enabled) {
+                ok = kv_cache_store_current_ex(s, &s->slots[i], "evict", true);
+            }
         }
     }
     return ok;
@@ -13395,6 +13406,62 @@ static bool slot_settle_turn(server *s, server_slot *slot) {
         }
     }
     return slot->turn_done;
+}
+
+/* Puts the slot's session into the conversation cache, settled to its last
+ * complete turn (slot_settle_turn).  Keyed the way the disk cache keys a
+ * store (kv_cache_store_current): by the visible transcript when the live
+ * state holds reasoning or tool state the client will not replay, else by
+ * its rendered text, which could never prefix the next request otherwise.
+ * pinned names the request about to be restored, which the store's eviction
+ * pass must not drop.  Holds inference_mu; takes tool_mu. */
+static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinned, size_t pinned_len,
+                                  const char *reason) {
+    bool stored = false;
+    const int before = ds4_session_pos(slot->session);
+    const bool turn_done = before > 0 && slot_settle_turn(s, slot);
+    const int pos = ds4_session_pos(slot->session);
+    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const bool checkpoint_ok = ds4_session_checkpoint_valid(slot->session);
+    if (pos > 0 && turn_done && checkpoint_ok && live && live->len == pos) {
+        uint8_t *tool_blob = NULL;
+        size_t tool_blob_len = 0;
+        char *key = NULL;
+        tool_memory_snapshot(s, &tool_blob, &tool_blob_len);
+        pthread_mutex_lock(&s->tool_mu);
+        if (slot->responses_live.valid && slot->responses_live.live_tokens == pos &&
+            slot->responses_live.visible_text && slot->responses_live.visible_text[0])
+        {
+            key = xstrdup(slot->responses_live.visible_text);
+        } else if (slot->thinking_live.valid && !slot->thinking_live.token_text_disk_key &&
+                   slot->thinking_live.live_tokens == pos &&
+                   slot->thinking_live.visible_text && slot->thinking_live.visible_text[0])
+        {
+            key = xstrdup(slot->thinking_live.visible_text);
+        }
+        pthread_mutex_unlock(&s->tool_mu);
+        const char *key_source = key ? "visible" : "rendered";
+        size_t key_len = 0;
+        if (key) key_len = strlen(key);
+        else key = render_tokens_text(s->engine, live, &key_len);
+        if (key) {
+            char err[160] = {0};
+            stored = ds4_convcache_store(&s->convcache, s->engine, slot->session, key, key_len,
+                                         ds4_engine_model_id(s->engine), ds4_engine_routed_quant_bits(s->engine),
+                                         ds4_session_ctx(slot->session), pos, pinned, pinned_len,
+                                         tool_blob, (uint32_t)tool_blob_len, err, sizeof(err)) >= 0;
+            server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) %s tokens=%d key=%s key_len=%zu%s%s",
+                       reason, stored ? "ok" : "failed", pos, key_source, key_len,
+                       stored ? "" : " err=", stored ? "" : err);
+        }
+        free(key);
+        free(tool_blob);
+    } else if (before > 0) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) skipped live=%d checkpoint=%s turn=%s",
+                   reason, live ? (int)live->len : -1, checkpoint_ok ? "valid" : "invalid",
+                   turn_done ? "done" : "unfinished");
+    }
+    return stored;
 }
 
 static void trace_time(FILE *fp) {
@@ -15221,9 +15288,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (s->cache_mode == DS4_CACHE_CONVERSATION && cached == 0 && !multimodal &&
         j->req.prompt_text && j->req.prompt_text[0])
     {
-        const int model_id   = ds4_engine_model_id(s->engine);
-        const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
-        const int ctx_size   = ds4_session_ctx(slot->session);
         const size_t req_text_len = strlen(j->req.prompt_text);
 
         /* Live is a superset of the request (identical replay, or live also
@@ -15260,72 +15324,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * prompt text is pinned so the store's eviction pass can't drop the
          * entry about to be loaded. */
         if (cached == 0) {
-            /* Key the outgoing state the way the upstream disk cache does
-             * (kv_cache_store_current): by the visible transcript when the live
-             * state holds hidden reasoning or tool state the client will not
-             * replay, else by its rendered text. A rendered key would contain
-             * the hidden reasoning and could never prefix the next request. */
-            uint8_t *out_tool_blob = NULL;
-            size_t out_tool_blob_len = 0;
-            char *out_key = NULL;
             /* Only a session that ends with a complete turn is stored, and an
              * unfinished one is first dropped back to its last complete turn:
              * the client's next request replays complete turns only. */
             pthread_mutex_lock(&s->inference_mu);
-            const bool turn_done = old_pos > 0 && slot_settle_turn(s, slot);
-            const int out_pos = ds4_session_pos(slot->session);
-            pthread_mutex_unlock(&s->inference_mu);
-            if (out_pos > 0) {
-                tool_memory_snapshot(s, &out_tool_blob, &out_tool_blob_len);
-                pthread_mutex_lock(&s->tool_mu);
-                if (slot->responses_live.valid &&
-                    slot->responses_live.live_tokens == out_pos &&
-                    slot->responses_live.visible_text &&
-                    slot->responses_live.visible_text[0])
-                {
-                    out_key = xstrdup(slot->responses_live.visible_text);
-                } else if (slot->thinking_live.valid &&
-                           !slot->thinking_live.token_text_disk_key &&
-                           slot->thinking_live.live_tokens == out_pos &&
-                           slot->thinking_live.visible_text &&
-                           slot->thinking_live.visible_text[0])
-                {
-                    out_key = xstrdup(slot->thinking_live.visible_text);
-                }
-                pthread_mutex_unlock(&s->tool_mu);
-            }
-            pthread_mutex_lock(&s->inference_mu);
-            const ds4_tokens *live = ds4_session_tokens(slot->session);
-            const bool checkpoint_ok = ds4_session_checkpoint_valid(slot->session);
-            const char *key_source = out_key ? "visible" : "rendered";
-            if (out_pos > 0 && live && live->len == out_pos && checkpoint_ok && turn_done)
-            {
-                size_t out_key_len = 0;
-                if (out_key) out_key_len = strlen(out_key);
-                else out_key = render_tokens_text(s->engine, live, &out_key_len);
-                if (out_key) {
-                    char sto_err[160] = {0};
-                    const int stored = ds4_convcache_store(&s->convcache, s->engine,
-                                        slot->session,
-                                        out_key, out_key_len,
-                                        model_id, quant_bits, ctx_size,
-                                        (int)live->len,
-                                        j->req.prompt_text, req_text_len,
-                                        out_tool_blob, (uint32_t)out_tool_blob_len,
-                                        sto_err, sizeof(sto_err));
-                    server_log(DS4_LOG_KVCACHE,
-                               "ds4-server: convcache store %s tokens=%d key=%s key_len=%zu%s%s",
-                               stored >= 0 ? "ok" : "failed", (int)live->len, key_source, out_key_len,
-                               stored >= 0 ? "" : " err=", stored >= 0 ? "" : sto_err);
-                }
-            } else if (old_pos > 0) {
-                server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: convcache store skipped live=%d old_pos=%d checkpoint=%s turn=%s",
-                           live ? (int)live->len : -1, old_pos, checkpoint_ok ? "valid" : "invalid",
-                           turn_done ? "done" : "unfinished");
-            }
-            free(out_key);
-            free(out_tool_blob);
+            (void)conv_cache_store_slot(s, slot, j->req.prompt_text, req_text_len, "switch");
 
             /* Longest cached entry whose text is a byte prefix of the request,
              * RAM first, then disk. */
@@ -18207,6 +18210,9 @@ int main(int argc, char **argv) {
                            ds4_syscache_entry_count(&s.syscache));
             }
         }
+        /* idle sessions the pool takes context from go to the conversation
+         * cache; without the hook the pool can only refuse new context */
+        if (cfg.engine.ctx_pool_tokens) ds4_engine_set_evict_hook(engine, kv_cache_pool_evict, &s);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -18356,35 +18362,7 @@ int main(int argc, char **argv) {
          * live snapshot the active conversation is lost on any shutdown
          * (idle-timeout kill, launchd stop, upgrade restart) even though
          * hibernated ones would survive. */
-        for (int i = 0; i < s.slot_count; i++) {
-            server_slot *slot = &s.slots[i];
-            if (!slot_settle_turn(&s, slot)) continue;
-            const ds4_tokens *live = ds4_session_tokens(slot->session);
-            if (!live || live->len == 0) continue;
-            size_t live_text_len = 0;
-            char *live_text = render_tokens_text(s.engine, live, &live_text_len);
-            if (!live_text) continue;
-            char sto_err[160] = {0};
-            uint8_t *tool_blob = NULL;
-            size_t tool_blob_len = 0;
-            tool_memory_snapshot(&s, &tool_blob, &tool_blob_len);
-            int idx = ds4_convcache_store(&s.convcache, s.engine, slot->session,
-                                          live_text, live_text_len,
-                                          ds4_engine_model_id(s.engine),
-                                          ds4_engine_routed_quant_bits(s.engine),
-                                          ds4_session_ctx(slot->session),
-                                          (int)live->len,
-                                          NULL, 0,
-                                          tool_blob, (uint32_t)tool_blob_len,
-                                          sto_err, sizeof(sto_err));
-            free(tool_blob);
-            if (idx < 0) {
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: live snapshot on shutdown failed slot=%d: %s",
-                           i, sto_err);
-            }
-            free(live_text);
-        }
+        for (int i = 0; i < s.slot_count; i++) (void)conv_cache_store_slot(&s, &s.slots[i], NULL, 0, "shutdown");
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: flushing %d hibernated conversations to disk",
                    ds4_convcache_len(&s.convcache));
