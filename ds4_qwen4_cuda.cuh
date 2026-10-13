@@ -3979,12 +3979,15 @@ static void moe_layer_ahead_next(const ds4_gpu_stream_expert_table *t) {
 }
 #endif
 
-/* The use counts outlive the process in <model>.expert-uses, written at exit.
+/* The use counts outlive the process in <model>.expert-uses, written at exit
+ * and every moe_stats_save_forwards passes: a server stopped by its launcher
+ * is terminated, not exited, and would never add what it served.
  * A device that is slow to load, an external one above all, is given the
  * most used experts of that ranking once and then left alone. */
 static std::string g_moe_stats_file;
 static bool g_moe_stats_loaded;
 static const char moe_stats_magic[8] = {'D', 'S', '4', 'X', 'U', 'S', 'E', '1'};
+static const uint32_t moe_stats_save_forwards = 256;
 
 static void moe_stats_save(void) {
     const std::string scratch = g_moe_stats_file + ".tmp";
@@ -4055,6 +4058,8 @@ static bool moe_layer_held(uint64_t key) {
 static void moe_layer_visit(uint32_t layer) {
     const bool wrapped = g_moe_layer.seen && layer <= g_moe_layer.last_layer;
     g_moe_layer.forwards += wrapped;
+    if (wrapped && !g_moe_stats_file.empty() && g_moe_layer.forwards % moe_stats_save_forwards == 0)
+        moe_stats_save();
     g_moe_layer.complete = g_moe_layer.complete || wrapped;
     g_moe_layer.seen = true;
     g_moe_layer.last_layer = layer;
