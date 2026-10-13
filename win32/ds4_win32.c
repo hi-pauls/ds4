@@ -442,6 +442,22 @@ __attribute__((constructor)) static void cap_working_set(void) {
     }
 }
 
+/* Started by a service, the process has no window and Windows schedules it as
+ * background work: slower cores, lower clock.  Qwen3.8's CPU experts then
+ * take 0.26 ms each instead of 0.16.  Opting out of execution speed
+ * throttling asks for the scheduling a foreground program gets. */
+__attribute__((constructor)) static void refuse_power_throttling(void) {
+    PROCESS_POWER_THROTTLING_STATE state;
+    memset(&state, 0, sizeof(state));
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask = 0;
+    if (!getenv("DS4_WIN32_KEEP_POWER_THROTTLING") &&
+        !SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state))) {
+        fprintf(stderr, "ds4: could not opt out of power throttling (error %lu)\n", GetLastError());
+    }
+}
+
 int ds4_w32_socket(int domain, int type, int protocol) {
     return adopt_socket(socket(domain, type, protocol));
 }
