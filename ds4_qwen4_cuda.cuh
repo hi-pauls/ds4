@@ -4037,12 +4037,49 @@ static void moe_stats_load(void) {
 }
 
 /* The layer's experts by rows that used them so far, most used first. */
+/* With DS4_CUDA_MOE_TRACE=<file>, every use of an expert goes to that file as
+ * four uint32: layer, expert, rows that used it, the cache clock.  Replacement
+ * policies are compared on such a trace offline, without the model. */
+static void moe_trace(uint32_t layer, uint32_t expert, uint32_t rows) {
+    static FILE *const out = [] {
+        const char *path = getenv("DS4_CUDA_MOE_TRACE");
+        return path ? fopen(path, "wb") : NULL;
+    }();
+    if (out) {
+        const uint32_t record[4] = {layer, expert, rows, (uint32_t)g_moe_stream_clock};
+        (void)fwrite(record, sizeof(record), 1, out);
+    }
+}
+
+static bool moe_stream_adapt(void) {
+    static const bool wanted = getenv("DS4_CUDA_MOE_STREAM_ADAPT") != NULL;
+    return wanted;
+}
+
+/* DS4_CUDA_MOE_STREAM_ADAPT=helper keeps the graph's device on the top of the
+ * stored ranking and lets only the helper's set follow the session. */
+static bool moe_stream_adapt_primary(void) {
+    static const bool wanted = [] {
+        const char *env = getenv("DS4_CUDA_MOE_STREAM_ADAPT");
+        return env && strcmp(env, "helper") != 0;
+    }();
+    return wanted;
+}
+
 static std::vector<std::pair<uint32_t, uint32_t>> moe_layer_ranked(uint32_t layer, uint32_t experts) {
     std::vector<std::pair<uint32_t, uint32_t>> ranked;
     for (uint32_t e = 0; e < experts; e++)
         if (const auto heat = g_moe_layer_heat.find((uint64_t)layer << 32 | e); heat != g_moe_layer_heat.end())
             ranked.emplace_back(heat->second, e);
     std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    /* The stored counts are totals over every session, thousands of times
+     * what a session adds, so a set seeded with them never changes.  With
+     * DS4_CUDA_MOE_STREAM_ADAPT they only order the start: scaled to 1..16 a
+     * layer, a few uses in this session outweigh them. */
+    if (moe_stream_adapt() && !ranked.empty()) {
+        const uint64_t top = ranked[0].first ? ranked[0].first : 1;
+        for (auto &entry : ranked) entry.first = 1 + (uint32_t)((uint64_t)entry.first * 15 / top);
+    }
     return ranked;
 }
 
@@ -4475,7 +4512,10 @@ static int moe_layer_keep(const ds4_gpu_stream_expert_table *t, const int *count
                                 cudaMemcpyDeviceToHost, cuda_decode_stream()), "MoE layer counts read") &&
         moe_stream_wait(cuda_decode_stream(), "MoE layer counts wait");
     for (uint32_t e = 0; ok && e < t->n_total_expert; e++)
-        if (g_moe_stream.host_ids[e] > 0) g_moe_layer_heat[(uint64_t)t->layer << 32 | e] += (uint32_t)g_moe_stream.host_ids[e];
+        if (g_moe_stream.host_ids[e] > 0) {
+            g_moe_layer_heat[(uint64_t)t->layer << 32 | e] += (uint32_t)g_moe_stream.host_ids[e];
+            moe_trace(t->layer, e, (uint32_t)g_moe_stream.host_ids[e]);
+        }
     /* The cache can only be sized once a whole forward has loaded the dense
      * weights, so the first pass of a session keeps nothing. */
     if (ok && g_moe_layer.forwards) {
@@ -4975,6 +5015,7 @@ static bool moe_stream_place(const ds4_gpu_stream_expert_table *t, moe_stream_ca
         if (ids[i] >= 0 && (uint32_t)ids[i] < t->n_total_expert) {
             const uint64_t key = (uint64_t)t->layer << 32 | (uint32_t)ids[i];
             g_moe_layer_heat[key]++;
+            moe_trace(t->layer, (uint32_t)ids[i], 1);
             if (const auto mine = c.slot_of.find(key); mine != c.slot_of.end())
                 c.stamp[mine->second] = g_moe_stream_clock;
             if (h)
@@ -5009,8 +5050,12 @@ static bool moe_stream_place(const ds4_gpu_stream_expert_table *t, moe_stream_ca
             const bool on_device = c.slot_of.count(key) || (h && h->slot_of.count(key));
             /* With a stored ranking this device's set is fixed, full or not:
              * only the helper's changes. */
-            const bool fixed = g_moe_stats_loaded && h;
-            const bool devices_full = (fixed || c.filled == c.slots) && (!h || h->filled == h->slots);
+            /* Seeded from the ranking, an equal share a layer, a few of this
+             * device's slots stay empty (31 of 5503 on Qwen3.8): it counts as
+             * full all the same, or nothing would ever go to the CPU. */
+            const bool seeded = g_moe_stats_loaded && h;
+            const bool fixed = seeded && !moe_stream_adapt_primary();
+            const bool devices_full = (seeded || c.filled == c.slots) && (!h || h->filled == h->slots);
             if (cpu_mode && !on_device && devices_full) {
                 /* The devices are to hold what is used most: a RAM expert
                  * used more than a device's least used one takes its place. */
@@ -5022,8 +5067,12 @@ static bool moe_stream_place(const ds4_gpu_stream_expert_table *t, moe_stream_ca
                 const uint32_t mine = fixed ? UINT32_MAX : moe_stream_coldest(c);
                 const uint32_t theirs = h ? moe_stream_coldest(*h) : UINT32_MAX;
                 const uint32_t coldest = mine < theirs ? mine : theirs;
+                /* With an adapting set the counts are small and close together:
+                 * at a percent 43 experts a token traded places on Qwen3.8,
+                 * 20 ms of loads for 15 ms less arithmetic.  Twice the uses. */
+                const uint64_t promotion_percent = moe_stream_adapt() ? 200u : 101u;
                 const bool hotter = coldest != UINT32_MAX && heat >= coldest + promotion_floor &&
-                                    (uint64_t)heat * 100u >= (uint64_t)coldest * 101u;
+                                    (uint64_t)heat * 100u >= (uint64_t)coldest * promotion_percent;
                 if (!ok || !promotions || !hotter) {
                     g_moe_stream.cpu_pairs.push_back(i);
                     g_moe_stream.cpu_slots.push_back((uint32_t)ram_slot);
