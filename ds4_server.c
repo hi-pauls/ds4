@@ -4258,6 +4258,15 @@ static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                             tool_orders, think_mode);
 }
 
+/* The text that opens the first user turn in a rendered prompt. Qwen3.8 also
+ * renders tool results as user turns, but those only follow the first one. */
+static const char *chat_first_user_marker(server_model_syntax syntax) {
+    const char *marker = "<｜User｜>";
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) marker = "<|im_start|>user";
+    else if (syntax == SERVER_MODEL_SYNTAX_GLM) marker = "<|user|>";
+    return marker;
+}
+
 static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
         const chat_msgs *msgs,
         const char *tool_schemas,
@@ -14912,14 +14921,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     log_session_state(s, slot, "enter",
                       j->req.kind == REQ_CHAT ? "chat" : "compl");
 
-    /* System-prompt boundary in the rendered chat prompt. The chat template
-     * always emits `<｜User｜>` (or the same-shaped marker) as the first
-     * non-system token; everything before it is the system portion, keyed
-     * separately by the syscache. sys_text_len==0 means the request has
-     * no user turn or no system prefix — skip sys handling in that case. */
+    /* System-prompt boundary in the rendered chat prompt: everything before
+     * the first user turn's marker is the system portion, tool schemas
+     * included, keyed separately by the syscache. sys_text_len==0 means the
+     * request has no user turn or no system prefix — skip sys handling in
+     * that case. */
     size_t sys_text_len = 0;
     if (j->req.prompt_text) {
-        const char *first_user = strstr(j->req.prompt_text, "<｜User｜>");
+        const char *first_user = strstr(j->req.prompt_text, chat_first_user_marker(j->req.model_syntax));
         if (first_user) {
             sys_text_len = (size_t)(first_user - j->req.prompt_text);
         }
