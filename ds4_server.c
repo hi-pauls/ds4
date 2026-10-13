@@ -10901,6 +10901,14 @@ struct server_slot {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    /* the session ends with a turn the model finished (stop or tool calls);
+     * only such a session goes into the conversation cache, since the client's
+     * next request never replays an answer cut off half way */
+    bool turn_done;
+    /* session length when the turn now running began: everything before it
+     * ends with a complete turn, so an unfinished turn can be dropped back to
+     * there (slot_settle_turn) */
+    int complete_pos;
     int continued_last_store_tokens;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
@@ -12754,9 +12762,16 @@ static int qwen_span_stopped_live, qwen_span_stopped_prompt;
 static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, const qwen_span_ids *ids,
                             qwen_span_cut *cuts, int max_cuts, int *n_cuts, int *tail) {
     int i = 0, j = 0, open_l = QWEN_SPAN_NONE, open_p = QWEN_SPAN_NONE, n = 0;
-    bool ok = true, after_think = false;
+    /* where the run of equal tokens the walk is in began, for the last turn below */
+    int run_i = 0, run_j = 0;
+    bool ok = true, after_think = false, in_run = false;
     while (ok && i < live->len && j < prompt->len) {
         if (live->v[i] == prompt->v[j]) {
+            if (!in_run) {
+                run_i = i;
+                run_j = j;
+                in_run = true;
+            }
             after_think = live->v[i] == ids->think_close;
             open_l = qwen_span_kind(ids, live->v[i++], open_l);
             open_p = qwen_span_kind(ids, prompt->v[j++], open_p);
@@ -12768,16 +12783,21 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
             if (qwen_span_blank(ids, live->v[i])) i++;
             if (qwen_span_blank(ids, prompt->v[j])) j++;
             after_think = false;
+            in_run = false;
         } else if (ids->has_im_end && open_l == QWEN_SPAN_NONE && open_p == QWEN_SPAN_NONE &&
                    prompt->v[j] == ids->im_end && live->v[i] == ids->im_start) {
             /* The end of a turn the session never evaluated (see im_end): the
              * prompt's marker and the newline behind it have no counterpart. */
             j++;
             while (j < prompt->len && qwen_span_blank(ids, prompt->v[j])) j++;
+            in_run = false;
         } else if (open_l != QWEN_SPAN_NONE && open_l == open_p) {
             const int close = open_l == QWEN_SPAN_THINK ? ids->think_close : ids->tool_close;
             const int close_l = qwen_span_find(live, i, close), close_p = qwen_span_find(prompt, j, close);
             ok = close_l >= 0 && close_p >= 0;
+            /* a session cut off inside the span keeps the run that led into
+             * it, for the last turn below */
+            if (ok) in_run = false;
             if (ok && open_l == QWEN_SPAN_TOOL) {
                 const int start = (i + 3) / 4 * 4, end = close_l / 4 * 4;
                 if (end > start) {
@@ -12785,8 +12805,10 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
                     if (ok) cuts[n++] = (qwen_span_cut){ start, end };
                 }
             }
-            i = close_l;
-            j = close_p;
+            if (ok) {
+                i = close_l;
+                j = close_p;
+            }
         } else if (open_l == QWEN_SPAN_NONE && live->v[i] == ids->think_open) {
             /* the client left out a whole reasoning block the session holds,
              * and with it the blank line after </think> */
@@ -12794,16 +12816,38 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
             ok = close_l >= 0;
             i = close_l + 1;
             for (int skip = 0; ok && skip < 2 && i < live->len && live->v[i] != prompt->v[j]; skip++) i++;
+            in_run = false;
         } else {
             ok = false;
         }
     }
     qwen_span_stopped_live = i;
     qwen_span_stopped_prompt = j;
-    ok = ok && i == live->len && j < prompt->len;
+    bool matched = ok && i == live->len && j < prompt->len;
+    /* The session's last turn is one the client does not have: an answer cut
+     * off by a restart or a dropped connection, or one it never received, or a
+     * retry with nothing new.  That turn is dropped from the session and the
+     * prompt is processed again from where they part, so the session gets no
+     * partial answer back.  Where they part must sit in a run of equal tokens,
+     * in the same span on both sides or in none, inside an assistant turn that
+     * runs to the session's end. */
+    if (!matched && in_run && open_l == open_p && n < max_cuts && (i < live->len || j == prompt->len))
+    {
+        const int start = (i - 1) / 4 * 4;
+        bool last_turn = start >= run_i && start >= (n > 0 ? cuts[n - 1].end : 0);
+        for (int k = i; last_turn && k < live->len; k++) last_turn = live->v[k] != ids->im_start;
+        int turn = i - 1;
+        while (turn >= 0 && live->v[turn] != ids->im_start) turn--;
+        last_turn = last_turn && turn >= 0 && turn + 1 < live->len && live->v[turn + 1] != ids->user;
+        if (last_turn) {
+            cuts[n++] = (qwen_span_cut){ start, live->len };
+            j = run_j + (start - run_i);
+            matched = true;
+        }
+    }
     *n_cuts = n;
     *tail = j;
-    return ok;
+    return matched;
 }
 
 typedef enum {
@@ -12959,8 +13003,8 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     }
 
     /* executed by qwen_span_reuse once the other tiers have passed */
-    const qwen_span_ids *span_ids = ds4_engine_is_qwen4(s->engine) && req->image_count == 0 &&
-        s->cache_mode == DS4_CACHE_PREFIX ? qwen_span_ids_get(s->engine) : NULL;
+    const qwen_span_ids *span_ids = ds4_engine_is_qwen4(s->engine) && req->image_count == 0 ?
+        qwen_span_ids_get(s->engine) : NULL;
     if (span_ids) {
         qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
         int n_cuts = 0, tail = 0;
@@ -13328,6 +13372,29 @@ static int qwen_span_reuse(server *s, server_slot *slot, const ds4_tokens *promp
         free(prompt_text);
     }
     return kept;
+}
+
+/* Makes the slot's session end with a complete turn, for the conversation
+ * cache: an unfinished Qwen3.8 turn (cut off, or still being prefilled when
+ * the server stops) is dropped back to where it began.  The cut starts on the
+ * block boundary at or before that point, so up to three tokens of the last
+ * complete turn go too and are processed again by the next request.  Returns
+ * whether the session now ends with a complete turn.  Holds inference_mu. */
+static bool slot_settle_turn(server *s, server_slot *slot) {
+    const int pos = ds4_session_pos(slot->session);
+    const int start = slot->complete_pos / 4 * 4;
+    if (!slot->turn_done && ds4_engine_is_qwen4(s->engine) && start > 0 && start < pos &&
+        ds4_session_checkpoint_valid(slot->session))
+    {
+        char err[160] = {0};
+        if (ds4_session_qwen4_cut(slot->session, start, pos, err, sizeof(err)) == 0) {
+            slot->turn_done = true;
+            server_log(DS4_LOG_KVCACHE, "ds4-server: unfinished turn dropped, session %d -> %d tokens", pos, start);
+        } else {
+            server_log(DS4_LOG_WARNING, "ds4-server: unfinished turn not dropped: %s", err);
+        }
+    }
+    return slot->turn_done;
 }
 
 static void trace_time(FILE *fp) {
@@ -15135,9 +15202,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     /* Qwen3.8 cannot rewind: a prompt that differs from the session only in
      * reasoning or tool-result content is lined up span by span instead. */
-    if (cached == 0 && ds4_engine_is_qwen4(s->engine) && !multimodal && old_pos > 0 &&
-        s->cache_mode == DS4_CACHE_PREFIX)
-    {
+    if (cached == 0 && ds4_engine_is_qwen4(s->engine) && !multimodal && old_pos > 0) {
         pthread_mutex_lock(&s->inference_mu);
         cached = qwen_span_reuse(s, slot, &j->req.prompt, &effective_prompt);
         pthread_mutex_unlock(&s->inference_mu);
@@ -15203,18 +15268,25 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             uint8_t *out_tool_blob = NULL;
             size_t out_tool_blob_len = 0;
             char *out_key = NULL;
-            if (old_pos > 0) {
+            /* Only a session that ends with a complete turn is stored, and an
+             * unfinished one is first dropped back to its last complete turn:
+             * the client's next request replays complete turns only. */
+            pthread_mutex_lock(&s->inference_mu);
+            const bool turn_done = old_pos > 0 && slot_settle_turn(s, slot);
+            const int out_pos = ds4_session_pos(slot->session);
+            pthread_mutex_unlock(&s->inference_mu);
+            if (out_pos > 0) {
                 tool_memory_snapshot(s, &out_tool_blob, &out_tool_blob_len);
                 pthread_mutex_lock(&s->tool_mu);
                 if (slot->responses_live.valid &&
-                    slot->responses_live.live_tokens == old_pos &&
+                    slot->responses_live.live_tokens == out_pos &&
                     slot->responses_live.visible_text &&
                     slot->responses_live.visible_text[0])
                 {
                     out_key = xstrdup(slot->responses_live.visible_text);
                 } else if (slot->thinking_live.valid &&
                            !slot->thinking_live.token_text_disk_key &&
-                           slot->thinking_live.live_tokens == old_pos &&
+                           slot->thinking_live.live_tokens == out_pos &&
                            slot->thinking_live.visible_text &&
                            slot->thinking_live.visible_text[0])
                 {
@@ -15226,7 +15298,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             const ds4_tokens *live = ds4_session_tokens(slot->session);
             const bool checkpoint_ok = ds4_session_checkpoint_valid(slot->session);
             const char *key_source = out_key ? "visible" : "rendered";
-            if (old_pos > 0 && live && live->len == old_pos && checkpoint_ok)
+            if (out_pos > 0 && live && live->len == out_pos && checkpoint_ok && turn_done)
             {
                 size_t out_key_len = 0;
                 if (out_key) out_key_len = strlen(out_key);
@@ -15248,8 +15320,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 }
             } else if (old_pos > 0) {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: convcache store skipped live=%d old_pos=%d checkpoint=%s",
-                           live ? (int)live->len : -1, old_pos, checkpoint_ok ? "valid" : "invalid");
+                           "ds4-server: convcache store skipped live=%d old_pos=%d checkpoint=%s turn=%s",
+                           live ? (int)live->len : -1, old_pos, checkpoint_ok ? "valid" : "invalid",
+                           turn_done ? "done" : "unfinished");
             }
             free(out_key);
             free(out_tool_blob);
@@ -15302,7 +15375,49 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     ds4_session_invalidate(slot->session);
                 }
             }
-            if (restored_from) {
+            /* No stored conversation is a byte prefix of the request: the
+             * client dropped reasoning or pruned tool results since.  Stored
+             * conversations under the same system prompt are lined up span by
+             * span from their stored text, and only one that lines up is
+             * loaded, so a miss loads nothing. */
+            bool span_restore = false;
+            const qwen_span_ids *span_ids = ds4_engine_is_qwen4(s->engine) ? qwen_span_ids_get(s->engine) : NULL;
+            if (!restored_from && span_ids && sys_text_len > 0) {
+                ds4_convcache_candidate cands[8];
+                const int n_cands = ds4_convcache_candidates(&s->convcache, j->req.prompt_text, req_text_len,
+                                                             sys_text_len, cands, 8);
+                for (int c = 0; c < n_cands && !restored_from; c++) {
+                    ds4_tokens cand = {0};
+                    qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
+                    int n_cuts = 0, tail = 0;
+                    ds4_tokenize_rendered_chat(s->engine, cands[c].text, &cand);
+                    if (qwen_span_match(&cand, &j->req.prompt, span_ids, cuts, QWEN_SPAN_MAX_CUTS, &n_cuts, &tail)) {
+                        if (ds4_convcache_load_candidate(&s->convcache, &cands[c], slot->session,
+                                                         &residents, &residents_len, &tool_blob, &tool_blob_len,
+                                                         load_err, sizeof(load_err)))
+                        {
+                            restored_from = cands[c].ram_idx >= 0 ? "conv-ram-span" : "conv-disk-span";
+                            span_restore = true;
+                        } else {
+                            server_log(DS4_LOG_WARNING, "ds4-server: convcache span load failed: %s", load_err);
+                            ds4_session_invalidate(slot->session);
+                        }
+                    }
+                    ds4_tokens_free(&cand);
+                }
+                server_log(DS4_LOG_KVCACHE, "ds4-server: convcache span lookup candidates=%d %s",
+                           n_cands, restored_from ? restored_from : "none lined up");
+                ds4_convcache_candidates_free(cands, n_cands);
+            }
+            if (span_restore) {
+                cached = qwen_span_reuse(s, slot, &j->req.prompt, &effective_prompt);
+                if (cached > 0) {
+                    cache_source = restored_from;
+                    prompt_for_sync = &effective_prompt;
+                } else {
+                    ds4_session_invalidate(slot->session);
+                }
+            } else if (restored_from) {
                 cached = conv_cache_resume(s, slot, &j->req, restored_key_len,
                                            can_rewind, &effective_prompt,
                                            &prompt_for_sync);
@@ -15408,7 +15523,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     if (s->reasoning_cut_keep > 0 && cached > 0 && cached == ds4_session_pos(slot->session) &&
-        ds4_engine_is_qwen4(s->engine) && !multimodal && s->cache_mode == DS4_CACHE_PREFIX)
+        ds4_engine_is_qwen4(s->engine) && !multimodal)
     {
         pthread_mutex_lock(&s->inference_mu);
         const int kept = qwen_reasoning_cut(s, slot, prompt_for_sync, &effective_prompt);
@@ -15503,6 +15618,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
+    slot->turn_done = false;
+    slot->complete_pos = ds4_session_pos(slot->session);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
@@ -16601,6 +16718,7 @@ decode_again:
                                      prompt_tokens, completion);
     }
     if (job_cancelled(j)) response_ok = false;
+    slot->turn_done = response_ok && (!strcmp(final_finish, "stop") || !strcmp(final_finish, "tool_calls"));
     if (!response_ok) {
         job_mark_cancelled(j);
         final_finish = "error";
@@ -18240,6 +18358,7 @@ int main(int argc, char **argv) {
          * hibernated ones would survive. */
         for (int i = 0; i < s.slot_count; i++) {
             server_slot *slot = &s.slots[i];
+            if (!slot_settle_turn(&s, slot)) continue;
             const ds4_tokens *live = ds4_session_tokens(slot->session);
             if (!live || live->len == 0) continue;
             size_t live_text_len = 0;
@@ -24055,6 +24174,33 @@ static void test_qwen_span_match(void) {
     /* nothing new after the live tokens: no fresh logits, no match */
     prompt.len = 10;
     TEST_ASSERT(!qwen_span_match(&live, &prompt, &ids, cuts, 4, &n, &tail));
+
+    /* 904 opens a turn, 905 is the user role, 906 the assistant's */
+    /* a retry after a restart: the session holds the answer cut off half way,
+     * the prompt ends where it began; the session drops back to the block
+     * before that point and the prompt is processed again from there */
+    int cut_live_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900, 7, 8, 9, 10, 11 };
+    int retry_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900 };
+    ds4_tokens cut_live = { cut_live_v, (int)(sizeof(cut_live_v) / sizeof(cut_live_v[0])), 0 };
+    ds4_tokens retry = { retry_v, (int)(sizeof(retry_v) / sizeof(retry_v[0])), 0 };
+    TEST_ASSERT(qwen_span_match(&cut_live, &retry, &ids, cuts, 4, &n, &tail));
+    TEST_ASSERT(n == 1 && cuts[0].start == 8 && cuts[0].end == cut_live.len && tail == 8);
+    /* the client kept the partial reasoning, closed it and asked on */
+    int kept_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900, 7, 8, 901, 50, 904, 905, 20, 21 };
+    ds4_tokens kept = { kept_v, (int)(sizeof(kept_v) / sizeof(kept_v[0])), 0 };
+    TEST_ASSERT(qwen_span_match(&cut_live, &kept, &ids, cuts, 4, &n, &tail));
+    TEST_ASSERT(n == 1 && cuts[0].start == 8 && cuts[0].end == cut_live.len && tail == 8);
+    /* a different user turn is another conversation, not a cut-off answer */
+    retry_v[3] = 77;
+    TEST_ASSERT(!qwen_span_match(&cut_live, &retry, &ids, cuts, 4, &n, &tail));
+    retry_v[3] = 2;
+    /* a difference in an answer the session has later turns behind is not
+     * the session's last turn */
+    int later_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 7, 8, 904, 905, 30, 31 };
+    int differs_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 7, 9, 904, 905, 30, 31, 32 };
+    ds4_tokens later = { later_v, (int)(sizeof(later_v) / sizeof(later_v[0])), 0 };
+    ds4_tokens differs = { differs_v, (int)(sizeof(differs_v) / sizeof(differs_v[0])), 0 };
+    TEST_ASSERT(!qwen_span_match(&later, &differs, &ids, cuts, 4, &n, &tail));
 }
 
 static void test_client_socket_nonblocking_flag(void) {

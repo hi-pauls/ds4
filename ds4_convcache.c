@@ -696,30 +696,18 @@ static char *scan_disk_best_match(const ds4_convcache *cc,
     return best_path;
 }
 
-bool ds4_convcache_load_from_disk(ds4_convcache *cc,
-                                  const char *incoming_text,
-                                  size_t incoming_text_len,
-                                  ds4_session *session,
-                                  int *loaded_token_count_out,
-                                  size_t *loaded_text_len_out,
-                                  ds4_stream_expert_ref **out_residents,
-                                  uint32_t *out_residents_len,
-                                  uint8_t **out_aux_blob,
-                                  uint32_t *out_aux_blob_len,
-                                  char *err, size_t errlen) {
-    if (out_residents) *out_residents = NULL;
-    if (out_residents_len) *out_residents_len = 0;
-    if (out_aux_blob) *out_aux_blob = NULL;
-    if (out_aux_blob_len) *out_aux_blob_len = 0;
-    if (!cc || !session || !incoming_text) return false;
-    if (cc->opt.disk_budget_bytes == 0 || !cc->opt.disk_dir) return false;
-
-    size_t best_common = 0;
-    int best_token_count = 0;
-    char *path = scan_disk_best_match(cc, incoming_text, incoming_text_len,
-                                      &best_common, &best_token_count);
-    if (!path) return false;
-
+/* Loads one .conv file into the session; takes ownership of path. */
+static bool load_disk_file(const ds4_convcache *cc,
+                           char *path,
+                           int best_token_count,
+                           ds4_session *session,
+                           int *loaded_token_count_out,
+                           size_t *loaded_text_len_out,
+                           ds4_stream_expert_ref **out_residents,
+                           uint32_t *out_residents_len,
+                           uint8_t **out_aux_blob,
+                           uint32_t *out_aux_blob_len,
+                           char *err, size_t errlen) {
     /* Open, read the full header (incl. residents block), then the compressed
      * snapshot bytes past the text. */
     FILE *fp = fopen(path, "rb");
@@ -820,6 +808,133 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
         free(aux_blob);
     }
     return true;
+}
+
+bool ds4_convcache_load_from_disk(ds4_convcache *cc,
+                                  const char *incoming_text,
+                                  size_t incoming_text_len,
+                                  ds4_session *session,
+                                  int *loaded_token_count_out,
+                                  size_t *loaded_text_len_out,
+                                  ds4_stream_expert_ref **out_residents,
+                                  uint32_t *out_residents_len,
+                                  uint8_t **out_aux_blob,
+                                  uint32_t *out_aux_blob_len,
+                                  char *err, size_t errlen) {
+    if (out_residents) *out_residents = NULL;
+    if (out_residents_len) *out_residents_len = 0;
+    if (out_aux_blob) *out_aux_blob = NULL;
+    if (out_aux_blob_len) *out_aux_blob_len = 0;
+    if (!cc || !session || !incoming_text) return false;
+    if (cc->opt.disk_budget_bytes == 0 || !cc->opt.disk_dir) return false;
+
+    size_t best_common = 0;
+    int best_token_count = 0;
+    char *path = scan_disk_best_match(cc, incoming_text, incoming_text_len,
+                                      &best_common, &best_token_count);
+    if (!path) return false;
+    return load_disk_file(cc, path, best_token_count, session, loaded_token_count_out, loaded_text_len_out,
+                          out_residents, out_residents_len, out_aux_blob, out_aux_blob_len, err, errlen);
+}
+
+static size_t common_prefix_len(const char *a, size_t a_len, const char *b, size_t b_len) {
+    const size_t n = a_len < b_len ? a_len : b_len;
+    size_t k = 0;
+    while (k < n && a[k] == b[k]) k++;
+    return k;
+}
+
+static int candidate_cmp_longest_first(const void *a, const void *b) {
+    const ds4_convcache_candidate *x = (const ds4_convcache_candidate *)a;
+    const ds4_convcache_candidate *y = (const ds4_convcache_candidate *)b;
+    return x->common < y->common ? 1 : x->common > y->common ? -1 : 0;
+}
+
+int ds4_convcache_candidates(const ds4_convcache *cc,
+                             const char *text, size_t text_len, size_t min_common,
+                             ds4_convcache_candidate *out, int max) {
+    int n = 0;
+    if (cc && text && out && max > 0) {
+        for (int i = 0; i < cc->len && n < max; i++) {
+            const ds4_convcache_entry *e = &cc->entries[i];
+            const size_t common = e->text ? common_prefix_len(e->text, e->text_len, text, text_len) : 0;
+            if (common >= min_common && common > 0) {
+                char *copy = (char *)malloc(e->text_len + 1);
+                if (copy) {
+                    memcpy(copy, e->text, e->text_len);
+                    copy[e->text_len] = '\0';
+                    out[n++] = (ds4_convcache_candidate){ i, NULL, copy, e->text_len, common, e->token_count };
+                }
+            }
+        }
+        DIR *d = cc->opt.disk_dir && cc->opt.disk_budget_bytes ? opendir(cc->opt.disk_dir) : NULL;
+        struct dirent *ent;
+        while (d && n < max && (ent = readdir(d)) != NULL) {
+            const size_t nlen = strlen(ent->d_name);
+            if (nlen >= 6 && strcmp(ent->d_name + nlen - 5, ".conv") == 0) {
+                const size_t path_len = strlen(cc->opt.disk_dir) + 1 + nlen + 1;
+                char *path = (char *)malloc(path_len);
+                FILE *fp = NULL;
+                size_t entry_len = 0;
+                char *entry = NULL;
+                if (path) {
+                    snprintf(path, path_len, "%s/%s", cc->opt.disk_dir, ent->d_name);
+                    entry = read_entry_text(path, cc->opt.model_key, &entry_len, &fp);
+                }
+                int token_count = 0;
+                if (fp) {
+                    uint32_t tc = 0;
+                    if (fseeko(fp, DS4_CONV_TOKEN_COUNT_OFFSET, SEEK_SET) == 0 && fread(&tc, sizeof(tc), 1, fp) == 1)
+                        token_count = (int)tc;
+                    fclose(fp);
+                }
+                const size_t common = entry ? common_prefix_len(entry, entry_len, text, text_len) : 0;
+                if (entry && common >= min_common && common > 0) {
+                    out[n++] = (ds4_convcache_candidate){ -1, path, entry, entry_len, common, token_count };
+                } else {
+                    free(entry);
+                    free(path);
+                }
+            }
+        }
+        if (d) closedir(d);
+        qsort(out, (size_t)n, sizeof(out[0]), candidate_cmp_longest_first);
+    }
+    return n;
+}
+
+void ds4_convcache_candidates_free(ds4_convcache_candidate *c, int n) {
+    for (int i = 0; c && i < n; i++) {
+        free(c[i].path);
+        free(c[i].text);
+        c[i].path = c[i].text = NULL;
+    }
+}
+
+bool ds4_convcache_load_candidate(ds4_convcache *cc,
+                                  const ds4_convcache_candidate *c,
+                                  ds4_session *session,
+                                  ds4_stream_expert_ref **out_residents,
+                                  uint32_t *out_residents_len,
+                                  uint8_t **out_aux_blob,
+                                  uint32_t *out_aux_blob_len,
+                                  char *err, size_t errlen) {
+    bool ok = false;
+    if (out_residents) *out_residents = NULL;
+    if (out_residents_len) *out_residents_len = 0;
+    if (out_aux_blob) *out_aux_blob = NULL;
+    if (out_aux_blob_len) *out_aux_blob_len = 0;
+    if (cc && c && session) {
+        if (c->ram_idx >= 0) {
+            ok = ds4_convcache_load(cc, c->ram_idx, session, out_residents, out_residents_len,
+                                    out_aux_blob, out_aux_blob_len, err, errlen);
+        } else if (c->path) {
+            char *path = strdup(c->path);
+            ok = path && load_disk_file(cc, path, c->token_count, session, NULL, NULL, out_residents,
+                                        out_residents_len, out_aux_blob, out_aux_blob_len, err, errlen);
+        }
+    }
+    return ok;
 }
 
 bool ds4_convcache_disk_has_prefix(const ds4_convcache *cc,

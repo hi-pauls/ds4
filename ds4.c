@@ -82748,8 +82748,8 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
  * recomputing what follows.  The attention caches lose those rows; the rows
  * after them keep the positions they were encoded with, and new tokens
  * continue past the gap.  The linear-attention state keeps the dropped span
- * folded in, since a recurrent state has nothing to subtract.  start and end
- * must sit on indexer block boundaries. */
+ * folded in, since a recurrent state has nothing to subtract.  start must sit
+ * on an indexer block boundary, and end too unless it is the session's end. */
 #ifdef DS4_HAS_QWEN4_GPU
 /* Rows move towards the front, so the overlapping copy goes through a scratch
  * buffer, finished before it is read back. */
@@ -82775,7 +82775,7 @@ int ds4_session_qwen4_cut(ds4_session *s, int start, int end, char *err, size_t 
     if (!s || !ds4_session_is_qwen4(s) || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len) {
         snprintf(err, errlen, "cut needs a valid Qwen3.8 session");
     } else if (start < 0 || end <= start || (uint32_t)end > g->pos ||
-               start % (int)ratio || end % (int)ratio) {
+               start % (int)ratio || (end % (int)ratio && (uint32_t)end != g->pos)) {
         snprintf(err, errlen, "cut [%d, %d) must be block aligned inside %u tokens", start, end, g->pos);
     } else {
         const uint32_t cut = (uint32_t)(end - start), tail = g->pos - (uint32_t)end;
@@ -82839,7 +82839,9 @@ int ds4_session_qwen4_cut(ds4_session *s, int start, int end, char *err, size_t 
             memmove(s->checkpoint.v + start, s->checkpoint.v + end, (size_t)tail * sizeof(s->checkpoint.v[0]));
             s->checkpoint.len -= (int)cut;
             g->pos -= cut;
-            g->mrope_delta += (int32_t)cut;
+            /* a cut to the end truncates: the next token takes the first freed
+             * position instead of continuing past a gap */
+            if (tail) g->mrope_delta += (int32_t)cut;
             /* verify snapshots name rows from before the cut */
             g->snap_valid = g->snap2_valid = g->snap0_valid = false;
             rc = 0;

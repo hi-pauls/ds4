@@ -159,6 +159,36 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
                                   uint32_t *out_aux_blob_len,
                                   char *err, size_t errlen);
 
+/* Candidates for a lookup that lines an entry up with the request span by
+ * span instead of byte by byte: every RAM and disk entry sharing at least
+ * min_common bytes with `text`, the longest shared start first.  Each holds a
+ * copy of its stored text, so the caller can check the match before loading
+ * anything; free them with ds4_convcache_candidates_free. */
+typedef struct ds4_convcache_candidate {
+    int     ram_idx;      /* >= 0: RAM entry; -1: disk file at path */
+    char   *path;
+    char   *text;
+    size_t  text_len;
+    size_t  common;
+    int     token_count;
+} ds4_convcache_candidate;
+
+int  ds4_convcache_candidates(const ds4_convcache *cc,
+                              const char *text, size_t text_len, size_t min_common,
+                              ds4_convcache_candidate *out, int max);
+void ds4_convcache_candidates_free(ds4_convcache_candidate *c, int n);
+
+/* Loads a candidate into the session; a RAM entry leaves the table as with
+ * ds4_convcache_load. */
+bool ds4_convcache_load_candidate(ds4_convcache *cc,
+                                  const ds4_convcache_candidate *c,
+                                  ds4_session *session,
+                                  ds4_stream_expert_ref **out_residents,
+                                  uint32_t *out_residents_len,
+                                  uint8_t **out_aux_blob,
+                                  uint32_t *out_aux_blob_len,
+                                  char *err, size_t errlen);
+
 /* Disk index integration ---------------------------------------------- */
 
 /* Cheap check: is there any .conv file with a non-zero common byte-prefix
