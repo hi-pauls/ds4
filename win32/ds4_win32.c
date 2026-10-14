@@ -973,11 +973,30 @@ ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
 /* A temporary file the CRT deletes on close stands in for the buffer.  A
  * stream opened for reading starts with the buffer's bytes; one opened for
  * writing is remembered here and copied into its buffer by ds4_w32_fclose,
- * with the NUL POSIX appends when there is room for it. */
+ * with the NUL POSIX appends when there is room for it.  An open_memstream
+ * stream gets its malloc'd buffer at fclose only, not at every fflush. */
 #undef fclose
 enum { fmem_slots = 16 };
-static struct { FILE *file; char *buf; size_t size; } fmem_open[fmem_slots];
+static struct { FILE *file; char *buf; size_t size; char **out; size_t *outlen; } fmem_open[fmem_slots];
 static SRWLOCK fmem_lock = SRWLOCK_INIT;
+
+static FILE *fmem_register(FILE *file, char *buf, size_t size, char **out, size_t *outlen) {
+    FILE *result = NULL;
+    AcquireSRWLockExclusive(&fmem_lock);
+    for (int i = 0; i < fmem_slots && !result; i++) {
+        if (!fmem_open[i].file) {
+            fmem_open[i].file = file;
+            fmem_open[i].buf = buf;
+            fmem_open[i].size = size;
+            fmem_open[i].out = out;
+            fmem_open[i].outlen = outlen;
+            result = file;
+        }
+    }
+    ReleaseSRWLockExclusive(&fmem_lock);
+    if (!result) errno = EMFILE;
+    return result;
+}
 
 FILE *fmemopen(void *buf, size_t size, const char *mode) {
     FILE *result = NULL;
@@ -988,18 +1007,20 @@ FILE *fmemopen(void *buf, size_t size, const char *mode) {
         if (file && mode[0] == 'r') {
             if (fwrite(buf, 1, size, file) == size && fseek(file, 0, SEEK_SET) == 0) result = file;
         } else if (file) {
-            AcquireSRWLockExclusive(&fmem_lock);
-            for (int i = 0; i < fmem_slots && !result; i++) {
-                if (!fmem_open[i].file) {
-                    fmem_open[i].file = file;
-                    fmem_open[i].buf = buf;
-                    fmem_open[i].size = size;
-                    result = file;
-                }
-            }
-            ReleaseSRWLockExclusive(&fmem_lock);
-            if (!result) errno = EMFILE;
+            result = fmem_register(file, buf, size, NULL, NULL);
         }
+        if (file && !result) fclose(file);
+    }
+    return result;
+}
+
+FILE *open_memstream(char **ptr, size_t *sizeloc) {
+    FILE *result = NULL;
+    if (!ptr || !sizeloc) {
+        errno = EINVAL;
+    } else {
+        FILE *file = tmpfile();
+        if (file) result = fmem_register(file, NULL, 0, ptr, sizeloc);
         if (file && !result) fclose(file);
     }
     return result;
@@ -1008,17 +1029,35 @@ FILE *fmemopen(void *buf, size_t size, const char *mode) {
 int ds4_w32_fclose(FILE *stream) {
     char *buf = NULL;
     size_t size = 0;
+    char **out = NULL;
+    size_t *outlen = NULL;
     AcquireSRWLockExclusive(&fmem_lock);
-    for (int i = 0; stream && i < fmem_slots && !buf; i++) {
+    for (int i = 0; stream && i < fmem_slots && !buf && !out; i++) {
         if (fmem_open[i].file == stream) {
             buf = fmem_open[i].buf;
             size = fmem_open[i].size;
+            out = fmem_open[i].out;
+            outlen = fmem_open[i].outlen;
             fmem_open[i].file = NULL;
         }
     }
     ReleaseSRWLockExclusive(&fmem_lock);
     int failed = 0;
-    if (buf) {
+    if (out) {
+        /* ftell is 32-bit here; a snapshot can pass 2 GB. */
+        const long long written = fflush(stream) == 0 ? _ftelli64(stream) : -1;
+        char *copy = written >= 0 ? malloc((size_t)written + 1) : NULL;
+        if (!copy || _fseeki64(stream, 0, SEEK_SET) != 0 ||
+            fread(copy, 1, (size_t)written, stream) != (size_t)written) {
+            free(copy);
+            failed = 1;
+            errno = ENOMEM;
+        } else {
+            copy[written] = '\0';
+            *out = copy;
+            *outlen = (size_t)written;
+        }
+    } else if (buf) {
         const long written = fflush(stream) == 0 ? ftell(stream) : -1;
         if (written < 0 || (size_t)written > size || fseek(stream, 0, SEEK_SET) != 0 ||
             fread(buf, 1, (size_t)written, stream) != (size_t)written) {
