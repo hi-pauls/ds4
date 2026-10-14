@@ -699,6 +699,23 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
+/* A point a delta snapshot is later taken from (Qwen3.8; valid is false for
+ * other models).  Taking one resets the rewind floor the delta checks. */
+typedef struct {
+    bool valid;
+    int rows;
+    int mtp_rows;
+    uint32_t epoch;
+} ds4_session_mark;
+ds4_session_mark ds4_session_mark_now(ds4_session *s);
+/* Saves what the session gained since the mark, appendable after the
+ * snapshot taken at it; ds4_session_load_snapshot applies it onto a session
+ * holding exactly the mark's tokens.  Returns 1 without saving when rows the
+ * mark covered have changed since (a cut, a reset, a rewind below it): the
+ * caller then saves a full snapshot. */
+int ds4_session_save_delta_snapshot(ds4_session *s, const ds4_session_mark *since, ds4_session_snapshot *snap,
+                                    char *err, size_t errlen);
+
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end);

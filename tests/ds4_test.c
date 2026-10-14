@@ -504,6 +504,65 @@ cleanup:
     test_restore_env("DS4_QWEN4_SPEC_FORCE_ACCEPT", saved_force);
 }
 
+/* A base snapshot plus a delta saved since its mark restores the session the
+ * full snapshot holds, byte for byte; a delta is refused on a session that is
+ * not at its mark, and not taken once a rewind went below the mark. */
+static void test_session_delta_snapshot(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+    if (!ds4_engine_is_qwen4(engine)) {
+        fprintf(stderr, "ds4-test: delta snapshot skipped, needs a Qwen3.8 model\n");
+        return;
+    }
+    ds4_session *reference = NULL, *restored = NULL;
+    ds4_session_snapshot base = {0}, full = {0}, delta = {0}, again = {0};
+    ds4_tokens prompt = {0};
+    char err[192] = {0};
+    TEST_ASSERT(ds4_session_create(&reference, engine, 2048) == 0);
+    TEST_ASSERT(ds4_session_create(&restored, engine, 2048) == 0);
+    if (reference && restored) {
+        ds4_chat_begin(engine, &prompt);
+        ds4_chat_append_message(engine, &prompt, "user", "Count from one to fifty in words, comma separated.");
+        ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+        TEST_ASSERT(ds4_session_sync(reference, &prompt, err, sizeof(err)) == 0);
+        const ds4_session_mark mark = ds4_session_mark_now(reference);
+        TEST_ASSERT(mark.valid && mark.rows == prompt.len);
+        TEST_ASSERT(ds4_session_save_snapshot(reference, &base, err, sizeof(err)) == 0);
+        /* 37 tokens: the delta starts and ends inside an indexer block */
+        for (int i = 0; i < 37; i++)
+            TEST_ASSERT(ds4_session_eval(reference, ds4_session_argmax(reference), err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_save_snapshot(reference, &full, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_save_delta_snapshot(reference, &mark, &delta, err, sizeof(err)) == 0);
+        fprintf(stderr, "ds4-test: delta snapshot base=%" PRIu64 " full=%" PRIu64 " delta=%" PRIu64 " bytes\n",
+                base.len, full.len, delta.len);
+
+        TEST_ASSERT(ds4_session_load_snapshot(restored, &delta, err, sizeof(err)) != 0);
+        TEST_ASSERT(ds4_session_load_snapshot(restored, &base, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_load_snapshot(restored, &delta, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_session_save_snapshot(restored, &again, err, sizeof(err)) == 0);
+        TEST_ASSERT(again.len == full.len);
+        if (again.len == full.len && memcmp(again.ptr, full.ptr, full.len) != 0) {
+            size_t first = 0;
+            while (first < full.len && again.ptr[first] == full.ptr[first]) first++;
+            fprintf(stderr, "ds4-test: base + delta differs from the full snapshot at byte %zu of %" PRIu64 "\n",
+                    first, full.len);
+            TEST_ASSERT(false);
+        }
+
+        ds4_session_rewind(reference, mark.rows - 1);
+        ds4_session_snapshot refused = {0};
+        TEST_ASSERT(ds4_session_save_delta_snapshot(reference, &mark, &refused, err, sizeof(err)) != 0);
+        ds4_session_snapshot_free(&refused);
+    }
+    ds4_session_snapshot_free(&base);
+    ds4_session_snapshot_free(&full);
+    ds4_session_snapshot_free(&delta);
+    ds4_session_snapshot_free(&again);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(reference);
+    ds4_session_free(restored);
+}
+
 static void test_session_snapshot_roundtrip(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -7210,6 +7269,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
+    {"--delta-snapshot", "delta-snapshot", "Qwen3.8 base snapshot plus delta equals the full snapshot", test_session_delta_snapshot},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
