@@ -10919,6 +10919,10 @@ struct server_slot {
     job *assigned;
     job *running;
     bool busy;
+    /* the prompt text of the job the slot runs, under s->mu while busy (see
+     * slot_finishing_conversation) */
+    char *busy_text;
+    size_t busy_text_len;
     bool prefill_waiting;
 
     bool decode_pending;
@@ -13465,13 +13469,14 @@ static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinn
         else key = render_tokens_text(s->engine, live, &key_len);
         if (key) {
             char err[160] = {0};
-            stored = ds4_convcache_store(&s->convcache, s->engine, slot->session, key, key_len,
-                                         ds4_engine_model_id(s->engine), ds4_engine_routed_quant_bits(s->engine),
-                                         ds4_session_ctx(slot->session), pos, pinned, pinned_len,
-                                         tool_blob, (uint32_t)tool_blob_len, err, sizeof(err)) >= 0;
+            const int rc = ds4_convcache_store(&s->convcache, s->engine, slot->session, key, key_len,
+                                               ds4_engine_model_id(s->engine), ds4_engine_routed_quant_bits(s->engine),
+                                               ds4_session_ctx(slot->session), pos, pinned, pinned_len,
+                                               tool_blob, (uint32_t)tool_blob_len, err, sizeof(err));
+            stored = rc >= 0 || rc == DS4_CONVCACHE_DISK_ONLY;
             server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) %s tokens=%d key=%s key_len=%zu%s%s",
-                       reason, stored ? "ok" : "failed", pos, key_source, key_len,
-                       stored ? "" : " err=", stored ? "" : err);
+                       reason, rc == DS4_CONVCACHE_DISK_ONLY ? "ok (disk only)" : stored ? "ok" : "failed",
+                       pos, key_source, key_len, stored ? "" : " err=", stored ? "" : err);
         }
         free(key);
         free(tool_blob);
@@ -16955,6 +16960,34 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     return SLOT_PROTECTED_SCORE_BASE - live;
 }
 
+/* A slot answers its client before it is free again: slot_refresh_live_text
+ * renders the whole session first.  A fast tool call brings the client's next
+ * request back inside that window, and routed then it reused nothing and
+ * prefilled the whole transcript (214k tokens, 16 minutes) beside the session
+ * it continues.  Such a request waits for the slot instead: it continues the
+ * conversation when it shares nine tenths of the busy job's prompt text (half
+ * let another conversation under a long system prompt wait too).  Caller holds
+ * s->mu. */
+static bool slot_finishing_conversation(const server *s, const job *j) {
+    bool finishing = false;
+    const char *text = j->req.prompt_text;
+    for (int i = 0; text && !finishing && i < s->slot_count; i++) {
+        const server_slot *slot = &s->slots[i];
+        if (slot->busy && slot->busy_text) {
+            size_t common = 0;
+            while (common < slot->busy_text_len && text[common] == slot->busy_text[common]) common++;
+            finishing = common * 10 >= slot->busy_text_len * 9;
+        }
+    }
+    return finishing;
+}
+
+static void slot_set_busy_text(server_slot *slot, const job *j) {
+    free(slot->busy_text);
+    slot->busy_text = j && j->req.prompt_text ? xstrdup(j->req.prompt_text) : NULL;
+    slot->busy_text_len = slot->busy_text ? strlen(slot->busy_text) : 0;
+}
+
 static void dispatch_jobs_locked(server *s) {
     if (!s || !s->batched_mode) return;
     const time_t now = time(NULL);
@@ -16979,7 +17012,10 @@ static void dispatch_jobs_locked(server *s) {
                     best = &s->slots[i];
                 }
             }
-            if (best) {
+            if (best && best_score <= 0 && slot_finishing_conversation(s, j)) {
+                server_log(DS4_LOG_KVCACHE,
+                           "routing: request waits for the slot still finishing its conversation");
+            } else if (best) {
                 chosen = j;
                 chosen_prev = prev;
                 chosen_slot = best;
@@ -17006,6 +17042,7 @@ static void dispatch_jobs_locked(server *s) {
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
         chosen_slot->busy = true;
+        slot_set_busy_text(chosen_slot, chosen);
         ds4_session_set_idle(chosen_slot->session, false);
         if (chosen_evict_live > 0) {
             server_log(DS4_LOG_KVCACHE,
@@ -17097,6 +17134,7 @@ static void *slot_worker_main(void *arg) {
 
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
+        slot_set_busy_text(slot, NULL);
         ds4_session_set_idle(slot->session, true);
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
@@ -17348,6 +17386,7 @@ static void server_cancel_job(server *s, job *j) {
             if (slot->assigned != j) continue;
             slot->assigned = NULL;
             slot->busy = false;
+            slot_set_busy_text(slot, NULL);
             ds4_session_set_idle(slot->session, true);
             detached = true;
             dispatch_jobs_locked(s);
@@ -17653,6 +17692,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
+        free(slot->busy_text);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -18451,6 +18491,27 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+}
+
+static void test_request_waits_for_finishing_slot(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+    job running = {0}, next = {0}, alien = {0};
+    running.req.prompt_text = "<|im_start|>system~tools<|im_start|>user~fix it<|im_start|>assistant~";
+    next.req.prompt_text = "<|im_start|>system~tools<|im_start|>user~fix it<|im_start|>assistant~"
+                           "<tool_call>bash</tool_call><|im_start|>user~<tool_response>ok";
+    alien.req.prompt_text = "<|im_start|>system~tools<|im_start|>user~title this";
+    slots[0].busy = true;
+    slot_set_busy_text(&slots[0], &running);
+    /* the tool result of the turn slot 0 is finishing waits for it; another
+     * conversation under the same system prompt does not */
+    TEST_ASSERT(slot_finishing_conversation(&s, &next));
+    TEST_ASSERT(!slot_finishing_conversation(&s, &alien));
+    slots[0].busy = false;
+    slot_set_busy_text(&slots[0], NULL);
+    TEST_ASSERT(!slot_finishing_conversation(&s, &next));
 }
 
 static void test_mixed_prefill_quantum_option(void) {
@@ -26071,6 +26132,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
+    test_request_waits_for_finishing_slot();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
