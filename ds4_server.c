@@ -13267,6 +13267,14 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
  * render as user messages and do not count as turns.  Rebuilds the prompt to
  * sync from the cut session and the prompt's tail; returns the tokens kept, 0
  * when nothing was cut.  Caller holds inference_mu. */
+/* The whole indexer blocks strictly between a reasoning block's <think> at
+ * open and </think> at close.  The markers themselves stay in the session: a
+ * client's next request still carries them, and qwen_span_match needs both to
+ * line the cut block up with the client's full one. */
+static qwen_span_cut qwen_think_cut(int open, int close) {
+    return (qwen_span_cut){ (open + 4) / 4 * 4, close / 4 * 4 };
+}
+
 /* Where the last `keep` user turns begin (tool results are user turns too, and
  * do not count), or 0 when there are fewer: --reasoning-cut leaves everything
  * from there untouched. */
@@ -13326,8 +13334,8 @@ static int qwen_reasoning_cut(server *s, server_slot *slot, const ds4_tokens *pr
             if (live->v[i] == ids->think_open) {
                 const int close = qwen_span_find(live, i, ids->think_close);
                 if (close > i && close < boundary) {
-                    const int start = (i + 3) / 4 * 4, end = (close + 1) / 4 * 4;
-                    if (end > start) cuts[n++] = (qwen_span_cut){ start, end };
+                    const qwen_span_cut cut = qwen_think_cut(i, close);
+                    if (cut.end > cut.start) cuts[n++] = cut;
                     i = close;
                 }
             }
@@ -24239,6 +24247,39 @@ static void test_qwen_span_match(void) {
     TEST_ASSERT(!qwen_span_match(&later, &differs, &ids, cuts, 4, &n, &tail));
 }
 
+static void test_qwen_think_cut_keeps_markers(void) {
+    /* every alignment of <think> and </think>: whole blocks strictly between */
+    for (int open = 8; open < 12; open++) {
+        for (int close = open + 9; close < open + 13; close++) {
+            const qwen_span_cut c = qwen_think_cut(open, close);
+            TEST_ASSERT(c.start > open && c.end <= close && c.start % 4 == 0 && c.end % 4 == 0);
+            TEST_ASSERT(c.start - open <= 4 && close - c.end <= 3);
+        }
+    }
+    /* a session cut that way still lines up with the client's full transcript,
+     * whatever the alignment: <think> at 8 (on a block boundary) and </think>
+     * at 19 (just before one) lost their markers to the old rounding */
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
+    for (int shift = 0; shift < 4; shift++) {
+        int full_v[40], cut_v[40], n_full = 0, n_cut = 0;
+        for (int k = 0; k < 4 + shift; k++) full_v[n_full++] = 1 + k;
+        const int open = n_full;
+        full_v[n_full++] = 900;
+        for (int k = 0; k < 10; k++) full_v[n_full++] = 50 + k;
+        const int close = n_full;
+        full_v[n_full++] = 901;
+        full_v[n_full++] = 60;
+        const qwen_span_cut c = qwen_think_cut(open, close);
+        for (int k = 0; k < n_full; k++) if (k < c.start || k >= c.end) cut_v[n_cut++] = full_v[k];
+        full_v[n_full++] = 70;
+        ds4_tokens live = { cut_v, n_cut, 0 }, prompt = { full_v, n_full, 0 };
+        qwen_span_cut cuts[4];
+        int n = 0, tail = 0;
+        TEST_ASSERT(qwen_span_match(&live, &prompt, &ids, cuts, 4, &n, &tail));
+        TEST_ASSERT(n == 0 && tail == n_full - 1);
+    }
+}
+
 static void test_qwen_precut_tokens(void) {
     const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
     /* system, three user turns with an answer each, the generation prompt;
@@ -26210,6 +26251,7 @@ static void ds4_server_unit_tests_run(void) {
     test_live_prefix_rewind_target();
     test_qwen_span_match();
     test_qwen_precut_tokens();
+    test_qwen_think_cut_keeps_markers();
     test_json_escape_replaces_invalid_utf8();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
