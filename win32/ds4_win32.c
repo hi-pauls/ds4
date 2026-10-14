@@ -29,9 +29,12 @@
 #undef poll
 #undef select
 
-/* Read by the MinGW-w64 startup code: every open() and fopen() without an
- * explicit mode, and the three standard streams, become binary. */
-int _CRT_fmode = _O_BINARY;
+/* Every open() and fopen() without an explicit mode becomes binary.  The UCRT
+ * startup ignores _CRT_fmode, which left _fmode at text and turned each 0x0A
+ * of a record appended through open() into 0x0D 0x0A. */
+__attribute__((constructor)) static void default_to_binary(void) {
+    _set_fmode(_O_BINARY);
+}
 
 static HANDLE fd_handle(int fd) {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
