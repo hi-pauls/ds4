@@ -13267,24 +13267,62 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
  * render as user messages and do not count as turns.  Rebuilds the prompt to
  * sync from the cut session and the prompt's tail; returns the tokens kept, 0
  * when nothing was cut.  Caller holds inference_mu. */
+/* Where the last `keep` user turns begin (tool results are user turns too, and
+ * do not count), or 0 when there are fewer: --reasoning-cut leaves everything
+ * from there untouched. */
+static int qwen_cut_boundary(const qwen_span_ids *ids, const ds4_tokens *t, int keep) {
+    int turns = 0, boundary = 0;
+    for (int i = t->len - 2; i >= 0 && turns < keep; i--) {
+        const bool tool = (i + 2 < t->len && t->v[i + 2] == ids->tool_open) ||
+                          (i + 3 < t->len && t->v[i + 3] == ids->tool_open);
+        if (t->v[i] == ids->im_start && t->v[i + 1] == ids->user && !tool) {
+            turns++;
+            boundary = i;
+        }
+    }
+    return turns == keep ? boundary : 0;
+}
+
+/* The --reasoning-cut rule applied to a prompt before it is prefilled: past
+ * the threshold, the reasoning inside turns before the last `keep` user turns
+ * is left out, its <think> markers kept.  A session prefilled from a client's
+ * transcript (cold, restored, or after a server change) then holds what one
+ * that grew and was cut turn by turn holds, instead of every reasoning block
+ * the transcript still carries.  Only tokens from `from` on are left out: the
+ * session already holds the ones before.  Returns how many were left out; out
+ * holds the rest. */
+static int qwen_precut_tokens(const qwen_span_ids *ids, const ds4_tokens *prompt, int from, int keep,
+                              int threshold, int ctx, ds4_tokens *out) {
+    int removed = 0;
+    const int boundary = ids && keep > 0 && (int64_t)prompt->len * 100 > (int64_t)ctx * threshold ?
+        qwen_cut_boundary(ids, prompt, keep) : 0;
+    if (boundary > from) {
+        bool open = false;
+        ds4_tokens_free(out);
+        for (int k = 0; k < prompt->len; k++) {
+            const int tok = prompt->v[k];
+            if (tok == ids->think_close) open = false;
+            if (open && k >= from && k < boundary) {
+                removed++;
+            } else {
+                ds4_tokens_push(out, tok);
+            }
+            if (tok == ids->think_open) open = true;
+        }
+    }
+    return removed;
+}
+
 static int qwen_reasoning_cut(server *s, server_slot *slot, const ds4_tokens *prompt, ds4_tokens *out) {
     const qwen_span_ids *ids = qwen_span_ids_get(s->engine);
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     int kept = 0;
     if (ids && live && prompt->len > live->len &&
         (int64_t)live->len * 100 > (int64_t)ds4_session_ctx(slot->session) * s->reasoning_cut_threshold) {
-        int turns = 0, boundary = 0;
-        for (int i = live->len - 2; i >= 0 && turns < s->reasoning_cut_keep; i--) {
-            const bool tool = (i + 2 < live->len && live->v[i + 2] == ids->tool_open) ||
-                              (i + 3 < live->len && live->v[i + 3] == ids->tool_open);
-            if (live->v[i] == ids->im_start && live->v[i + 1] == ids->user && !tool) {
-                turns++;
-                boundary = i;
-            }
-        }
+        const int boundary = qwen_cut_boundary(ids, live, s->reasoning_cut_keep);
         qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
         int n = 0, cut_tokens = 0;
-        for (int i = 0; turns == s->reasoning_cut_keep && i < boundary && n < QWEN_SPAN_MAX_CUTS; i++) {
+        for (int i = 0; boundary > 0 && i < boundary && n < QWEN_SPAN_MAX_CUTS; i++) {
             if (live->v[i] == ids->think_open) {
                 const int close = qwen_span_find(live, i, ids->think_close);
                 if (close > i && close < boundary) {
@@ -15538,6 +15576,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &j->req.prompt;
         }
         pthread_mutex_unlock(&s->inference_mu);
+    }
+    /* What is about to be prefilled gets the same cut as a live session, so a
+     * transcript read in one go (cold, restored, or after a server change)
+     * does not bring back every reasoning block the live session dropped. */
+    if (s->reasoning_cut_keep > 0 && ds4_engine_is_qwen4(s->engine) && !multimodal &&
+        cached == ds4_session_pos(slot->session) && prompt_for_sync->len > cached)
+    {
+        ds4_tokens precut = {0};
+        const int removed = qwen_precut_tokens(qwen_span_ids_get(s->engine), prompt_for_sync, cached,
+                                               s->reasoning_cut_keep, s->reasoning_cut_threshold,
+                                               ds4_session_ctx(slot->session), &precut);
+        if (removed > 0) {
+            server_log(DS4_LOG_KVCACHE, "ds4-server: reasoning cut %d tokens from the prompt before prefill, %d -> %d",
+                       removed, prompt_for_sync->len, precut.len);
+            ds4_tokens_free(&effective_prompt);
+            effective_prompt = precut;
+            prompt_for_sync = &effective_prompt;
+        } else {
+            ds4_tokens_free(&precut);
+        }
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
@@ -24181,6 +24239,29 @@ static void test_qwen_span_match(void) {
     TEST_ASSERT(!qwen_span_match(&later, &differs, &ids, cuts, 4, &n, &tail));
 }
 
+static void test_qwen_precut_tokens(void) {
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
+    /* system, three user turns with an answer each, the generation prompt;
+     * 906 is the assistant role; reasoning 10-12 and 13-14 */
+    int v[] = { 904, 907, 1, 2,
+                904, 905, 3, 904, 906, 900, 10, 11, 12, 901, 20,
+                904, 905, 4, 904, 906, 900, 13, 14, 901, 21,
+                904, 905, 5, 904, 906, 900 };
+    ds4_tokens prompt = { v, (int)(sizeof(v) / sizeof(v[0])), 0 };
+    ds4_tokens out = {0};
+    /* the last two user turns stay whole; the first answer's reasoning goes,
+     * its markers stay */
+    TEST_ASSERT(qwen_precut_tokens(&ids, &prompt, 0, 2, 0, 1, &out) == 3);
+    TEST_ASSERT(out.len == prompt.len - 3 && out.v[9] == 900 && out.v[10] == 901 && out.v[11] == 20);
+    /* tokens the session already holds are left alone */
+    TEST_ASSERT(qwen_precut_tokens(&ids, &prompt, 12, 2, 0, 1, &out) == 1);
+    TEST_ASSERT(out.v[12] == 901);
+    /* fewer user turns than kept, or below the threshold: nothing goes */
+    TEST_ASSERT(qwen_precut_tokens(&ids, &prompt, 0, 5, 0, 1, &out) == 0);
+    TEST_ASSERT(qwen_precut_tokens(&ids, &prompt, 0, 2, 50, 1000, &out) == 0);
+    ds4_tokens_free(&out);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2] = {-1, -1};
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -26128,6 +26209,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_live_prefix_rewind_target();
     test_qwen_span_match();
+    test_qwen_precut_tokens();
     test_json_escape_replaces_invalid_utf8();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
