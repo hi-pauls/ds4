@@ -18,8 +18,9 @@ local changes.
      (`.claude/workflows/measure-on-heimdall.md`).
 3. Whoever runs the second set fast-forwards `hel/main` to the branch head
    (`git push hel <sha>:refs/heads/main`), tags it `stable-YYYY-MM-DD`
-   (annotated, pushed to `hel`) and posts the tag in the comms `dwarfstar`
-   room. Both machines switch to the tag and rebuild.
+   (annotated, pushed to `hel`; a second tag the same day takes `.2`, then
+   `.3`) and posts the tag in the comms `dwarfstar` room. Both machines
+   switch to the tag and rebuild.
 
 ## Building on Hel
 
