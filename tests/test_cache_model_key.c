@@ -11,12 +11,25 @@
 
 static const uint8_t pattern[64] = "kv bytes of the model that saved this conversation, padded....";
 static int loads;
+/* when set, a snapshot opens like a session payload: header, then these tokens */
+static const uint32_t *payload_ids;
+static uint32_t payload_n;
 
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
     (void)s; (void)err; (void)errlen;
-    snap->ptr = malloc(sizeof(pattern));
-    memcpy(snap->ptr, pattern, sizeof(pattern));
-    snap->len = snap->cap = sizeof(pattern);
+    if (payload_ids) {
+        uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = { DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION };
+        h[7] = payload_n;
+        snap->len = snap->cap = sizeof(h) + payload_n * sizeof(uint32_t) + sizeof(pattern);
+        snap->ptr = malloc(snap->len);
+        memcpy(snap->ptr, h, sizeof(h));
+        memcpy(snap->ptr + sizeof(h), payload_ids, payload_n * sizeof(uint32_t));
+        memcpy(snap->ptr + sizeof(h) + payload_n * sizeof(uint32_t), pattern, sizeof(pattern));
+    } else {
+        snap->ptr = malloc(sizeof(pattern));
+        memcpy(snap->ptr, pattern, sizeof(pattern));
+        snap->len = snap->cap = sizeof(pattern);
+    }
     return 0;
 }
 
@@ -99,6 +112,31 @@ int main(void) {
                                0, 2, 4096, 7, NULL, 0, NULL, 0, err, sizeof(err)) == -1 &&
            strstr(err, "no disk copy") != NULL, "oversized snapshot without disk fails with its reason");
     ds4_convcache_free(&cc);
+
+    /* an entry keyed by the visible transcript is lined up by the tokens its
+     * snapshot opens with, in RAM and after it went to disk */
+    const uint32_t ids[] = { 904, 905, 1, 2, 900, 7, 8, 901, 3 };
+    const char *visible = "<|user|>visible key, reasoning left out";
+    const size_t visible_common = strlen("<|user|>visible");
+    ds4_convcache_candidate cand[4];
+    payload_ids = ids;
+    payload_n = sizeof(ids) / sizeof(ids[0]);
+    expect(ds4_convcache_init(&cc, &opt), "convcache init, payload snapshots");
+    expect(ds4_convcache_store(&cc, NULL, (ds4_session *)&cc, visible, strlen(visible),
+                               0, 2, 4096, 9, NULL, 0, NULL, 0, NULL, 0) >= 0, "visible-key store");
+    int n = ds4_convcache_candidates(&cc, visible, strlen(visible), visible_common, cand, 4);
+    expect(n == 1 && cand[0].ram_idx >= 0 && cand[0].tokens_len == (int)payload_n &&
+           memcmp(cand[0].tokens, ids, sizeof(ids)) == 0, "RAM candidate carries the snapshot's tokens");
+    ds4_convcache_candidates_free(cand, n);
+    ds4_convcache_flush_to_disk(&cc);
+    ds4_convcache_free(&cc);
+    expect(ds4_convcache_init(&cc, &opt), "convcache init, disk only");
+    n = ds4_convcache_candidates(&cc, visible, strlen(visible), visible_common, cand, 4);
+    expect(n == 1 && cand[0].ram_idx == -1 && cand[0].tokens_len == (int)payload_n &&
+           memcmp(cand[0].tokens, ids, sizeof(ids)) == 0, "disk candidate carries the snapshot's tokens");
+    ds4_convcache_candidates_free(cand, n);
+    ds4_convcache_free(&cc);
+    payload_ids = NULL;
 
     const char *prompt = "You are a helpful assistant.";
     ds4_syscache sa, sb;

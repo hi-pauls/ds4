@@ -15417,8 +15417,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     ds4_tokens cand = {0};
                     qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
                     int n_cuts = 0, tail = 0;
-                    ds4_tokenize_rendered_chat(s->engine, cands[c].text, &cand);
-                    if (qwen_span_match(&cand, &j->req.prompt, span_ids, cuts, QWEN_SPAN_MAX_CUTS, &n_cuts, &tail)) {
+                    if (cands[c].tokens) {
+                        for (int k = 0; k < cands[c].tokens_len; k++) ds4_tokens_push(&cand, cands[c].tokens[k]);
+                    } else {
+                        ds4_tokenize_rendered_chat(s->engine, cands[c].text, &cand);
+                    }
+                    const bool lines_up =
+                        qwen_span_match(&cand, &j->req.prompt, span_ids, cuts, QWEN_SPAN_MAX_CUTS, &n_cuts, &tail);
+                    if (!lines_up) qwen_span_log_mismatch(s, "convcache candidate", &cand, &j->req.prompt);
+                    if (lines_up) {
                         if (ds4_convcache_load_candidate(&s->convcache, &cands[c], slot->session,
                                                          &residents, &residents_len, &tool_blob, &tool_blob_len,
                                                          load_err, sizeof(load_err)))

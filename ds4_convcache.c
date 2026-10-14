@@ -845,6 +845,53 @@ static size_t common_prefix_len(const char *a, size_t a_len, const char *b, size
     return k;
 }
 
+/* Decompresses from fp until len bytes of output have been written to dst. */
+static bool zstd_read(ZSTD_DStream *ds, FILE *fp, ZSTD_inBuffer *in, uint8_t *in_buf, size_t in_cap,
+                      void *dst, size_t len) {
+    ZSTD_outBuffer out = { dst, len, 0 };
+    bool ok = true;
+    while (ok && out.pos < out.size) {
+        if (in->pos == in->size) {
+            in->size = fread(in_buf, 1, in_cap, fp);
+            in->pos = 0;
+            ok = in->size > 0;
+        }
+        if (ok) ok = !ZSTD_isError(ZSTD_decompressStream(ds, &out, in));
+    }
+    return ok;
+}
+
+/* A session payload opens with DS4_SESSION_PAYLOAD_U32_FIELDS header words,
+ * the eighth the token count, and then the tokens (ds4_session_save_payload);
+ * only that much of the compressed snapshot at fp is decompressed, about 1 MB
+ * for a 265k-token session of several GB. */
+static bool snapshot_tokens(FILE *fp, int **tokens_out, int *len_out) {
+    bool ok = false;
+    *tokens_out = NULL;
+    *len_out = 0;
+    ZSTD_DStream *ds = ZSTD_createDStream();
+    uint8_t *in_buf = (uint8_t *)malloc(1 << 16);
+    if (ds && in_buf) {
+        ZSTD_inBuffer in = { in_buf, 0, 0 };
+        uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+        if (zstd_read(ds, fp, &in, in_buf, 1 << 16, h, sizeof(h)) &&
+            h[0] == DS4_SESSION_PAYLOAD_MAGIC && h[1] == DS4_SESSION_PAYLOAD_VERSION &&
+            h[7] > 0 && h[7] <= (uint32_t)(16 * 1024 * 1024)) {
+            int *tokens = (int *)malloc((size_t)h[7] * sizeof(int));
+            ok = tokens && zstd_read(ds, fp, &in, in_buf, 1 << 16, tokens, (size_t)h[7] * sizeof(int));
+            if (ok) {
+                *tokens_out = tokens;
+                *len_out = (int)h[7];
+            } else {
+                free(tokens);
+            }
+        }
+    }
+    free(in_buf);
+    ZSTD_freeDStream(ds);
+    return ok;
+}
+
 static int candidate_cmp_longest_first(const void *a, const void *b) {
     const ds4_convcache_candidate *x = (const ds4_convcache_candidate *)a;
     const ds4_convcache_candidate *y = (const ds4_convcache_candidate *)b;
@@ -864,7 +911,14 @@ int ds4_convcache_candidates(const ds4_convcache *cc,
                 if (copy) {
                     memcpy(copy, e->text, e->text_len);
                     copy[e->text_len] = '\0';
-                    out[n++] = (ds4_convcache_candidate){ i, NULL, copy, e->text_len, common, e->token_count };
+                    out[n] = (ds4_convcache_candidate){ i, NULL, copy, e->text_len, common, e->token_count,
+                                                        NULL, 0 };
+                    FILE *snap = fmemopen(e->snap.ptr, (size_t)e->snap.len, "rb");
+                    if (snap) {
+                        (void)snapshot_tokens(snap, &out[n].tokens, &out[n].tokens_len);
+                        fclose(snap);
+                    }
+                    n++;
                 }
             }
         }
@@ -882,16 +936,19 @@ int ds4_convcache_candidates(const ds4_convcache *cc,
                     snprintf(path, path_len, "%s/%s", cc->opt.disk_dir, ent->d_name);
                     entry = read_entry_text(path, cc->opt.model_key, &entry_len, &fp);
                 }
-                int token_count = 0;
+                const size_t common = entry ? common_prefix_len(entry, entry_len, text, text_len) : 0;
+                int token_count = 0, *tokens = NULL, tokens_len = 0;
                 if (fp) {
+                    /* read_entry_text leaves fp at the snapshot */
+                    if (entry && common >= min_common && common > 0) (void)snapshot_tokens(fp, &tokens, &tokens_len);
                     uint32_t tc = 0;
                     if (fseeko(fp, DS4_CONV_TOKEN_COUNT_OFFSET, SEEK_SET) == 0 && fread(&tc, sizeof(tc), 1, fp) == 1)
                         token_count = (int)tc;
                     fclose(fp);
                 }
-                const size_t common = entry ? common_prefix_len(entry, entry_len, text, text_len) : 0;
                 if (entry && common >= min_common && common > 0) {
-                    out[n++] = (ds4_convcache_candidate){ -1, path, entry, entry_len, common, token_count };
+                    out[n++] = (ds4_convcache_candidate){ -1, path, entry, entry_len, common, token_count,
+                                                          tokens, tokens_len };
                 } else {
                     free(entry);
                     free(path);
@@ -908,7 +965,9 @@ void ds4_convcache_candidates_free(ds4_convcache_candidate *c, int n) {
     for (int i = 0; c && i < n; i++) {
         free(c[i].path);
         free(c[i].text);
+        free(c[i].tokens);
         c[i].path = c[i].text = NULL;
+        c[i].tokens = NULL;
     }
 }
 

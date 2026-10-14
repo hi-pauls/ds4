@@ -174,6 +174,12 @@ typedef struct ds4_convcache_candidate {
     size_t  text_len;
     size_t  common;
     int     token_count;
+    /* the session's own tokens, read from the start of its snapshot; NULL when
+     * the snapshot does not open with a token history.  A key stored as the
+     * visible transcript holds no reasoning, so its text never lines up with a
+     * client that replays it: these do. */
+    int    *tokens;
+    int     tokens_len;
 } ds4_convcache_candidate;
 
 int  ds4_convcache_candidates(const ds4_convcache *cc,
