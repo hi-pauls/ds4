@@ -12692,13 +12692,19 @@ typedef struct {
      * next turn's suffix starts behind it */
     int im_end;
     bool has_im_end;
+    /* <tool_call> and </tool_call>: the client renders a call back with its
+     * own argument order (OpenCode puts oldString before the newString the
+     * model wrote first), so a session restored from disk, which holds no tool
+     * memory to replay the model's text, differed inside every edit */
+    int call_open, call_close;
+    bool has_call;
 } qwen_span_ids;
 
 typedef struct {
     int start, end;
 } qwen_span_cut;
 
-enum { QWEN_SPAN_NONE, QWEN_SPAN_THINK, QWEN_SPAN_TOOL };
+enum { QWEN_SPAN_NONE, QWEN_SPAN_THINK, QWEN_SPAN_TOOL, QWEN_SPAN_CALL };
 #define QWEN_SPAN_MAX_CUTS 256
 
 /* the marker tokens, or NULL when one of them is not a single token */
@@ -12733,6 +12739,16 @@ static const qwen_span_ids *qwen_span_ids_get(ds4_engine *engine) {
         ids.has_im_end = end.len == 1;
         if (ids.has_im_end) ids.im_end = end.v[0];
         ds4_tokens_free(&end);
+        ds4_tokens call_open = {0}, call_close = {0};
+        ds4_tokenize_rendered_chat(engine, "<tool_call>", &call_open);
+        ds4_tokenize_rendered_chat(engine, "</tool_call>", &call_close);
+        ids.has_call = call_open.len == 1 && call_close.len == 1;
+        if (ids.has_call) {
+            ids.call_open = call_open.v[0];
+            ids.call_close = call_close.v[0];
+        }
+        ds4_tokens_free(&call_open);
+        ds4_tokens_free(&call_close);
         looked_up = true;
     }
     return valid ? &ids : NULL;
@@ -12748,7 +12764,9 @@ static int qwen_span_kind(const qwen_span_ids *ids, int tok, int open) {
     int kind = open;
     if (tok == ids->think_open) kind = QWEN_SPAN_THINK;
     else if (tok == ids->tool_open) kind = QWEN_SPAN_TOOL;
-    else if (tok == ids->think_close || tok == ids->tool_close) kind = QWEN_SPAN_NONE;
+    else if (ids->has_call && tok == ids->call_open) kind = QWEN_SPAN_CALL;
+    else if (tok == ids->think_close || tok == ids->tool_close || (ids->has_call && tok == ids->call_close))
+        kind = QWEN_SPAN_NONE;
     return kind;
 }
 
@@ -12759,8 +12777,10 @@ static int qwen_span_find(const ds4_tokens *t, int from, int tok) {
 }
 
 /* Lines a Qwen3.8 prompt up against the live session tokens with the content
- * of reasoning and tool-result spans free to differ.  Live reasoning the
- * client dropped stays in the session; live tool output the client pruned or
+ * of reasoning, tool-call and tool-result spans free to differ.  Live
+ * reasoning the client dropped stays in the session, and so does the model's
+ * own text of a tool call the client renders differently; live tool output the
+ * client pruned or
  * replaced is cut (block aligned, see ds4_session_qwen4_cut), the client's
  * version standing in for it.  Everything else must match token for token.
  * On a match, cuts holds the live ranges to drop in ascending order and *tail
@@ -12794,7 +12814,8 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
             j++;
             while (j < prompt->len && qwen_span_blank(ids, prompt->v[j])) j++;
         } else if (open_l != QWEN_SPAN_NONE && open_l == open_p) {
-            const int close = open_l == QWEN_SPAN_THINK ? ids->think_close : ids->tool_close;
+            const int close = open_l == QWEN_SPAN_THINK ? ids->think_close :
+                              open_l == QWEN_SPAN_CALL ? ids->call_close : ids->tool_close;
             const int close_l = qwen_span_find(live, i, close), close_p = qwen_span_find(prompt, j, close);
             ok = close_l >= 0 && close_p >= 0;
             if (ok && open_l == QWEN_SPAN_TOOL) {
@@ -24238,7 +24259,7 @@ static void test_json_escape_replaces_invalid_utf8(void) {
 
 static void test_qwen_span_match(void) {
     /* markers 900-903; other ids are text */
-    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false, 0, 0, false };
     qwen_span_cut cuts[4];
     int n = 0, tail = 0;
     /* live: sys, reasoning, tool result of 12, answer; the prompt drops the
@@ -24274,6 +24295,23 @@ static void test_qwen_span_match(void) {
     int kept_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900, 7, 8, 901, 50, 904, 905, 20, 21 };
     ds4_tokens kept = { kept_v, (int)(sizeof(kept_v) / sizeof(kept_v[0])), 0 };
     TEST_ASSERT(!qwen_span_match(&answered, &kept, &ids, cuts, 4, &n, &tail));
+
+    /* 910/911 are <tool_call> and </tool_call>: the client's rendering of a
+     * call (oldString 21 before newString 20) lines up with the model's own,
+     * which stays uncut; a difference outside the call still does not */
+    qwen_span_ids call_ids = ids;
+    call_ids.call_open = 910;
+    call_ids.call_close = 911;
+    call_ids.has_call = true;
+    int model_v[] = { 1, 2, 3, 910, 20, 30, 21, 31, 911, 902, 7, 903 };
+    int client_v[] = { 1, 2, 3, 910, 21, 31, 20, 30, 911, 902, 7, 903, 40 };
+    ds4_tokens model = { model_v, (int)(sizeof(model_v) / sizeof(model_v[0])), 0 };
+    ds4_tokens client = { client_v, (int)(sizeof(client_v) / sizeof(client_v[0])), 0 };
+    TEST_ASSERT(qwen_span_match(&model, &client, &call_ids, cuts, 4, &n, &tail));
+    TEST_ASSERT(n == 0 && tail == 12);
+    TEST_ASSERT(!qwen_span_match(&model, &client, &ids, cuts, 4, &n, &tail));
+    client_v[1] = 77;
+    TEST_ASSERT(!qwen_span_match(&model, &client, &call_ids, cuts, 4, &n, &tail));
 }
 
 static void test_qwen_think_cut_keeps_markers(void) {
@@ -24288,7 +24326,7 @@ static void test_qwen_think_cut_keeps_markers(void) {
     /* a session cut that way still lines up with the client's full transcript,
      * whatever the alignment: <think> at 8 (on a block boundary) and </think>
      * at 19 (just before one) lost their markers to the old rounding */
-    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false, 0, 0, false };
     for (int shift = 0; shift < 4; shift++) {
         int full_v[40], cut_v[40], n_full = 0, n_cut = 0;
         for (int k = 0; k < 4 + shift; k++) full_v[n_full++] = 1 + k;
@@ -24310,7 +24348,7 @@ static void test_qwen_think_cut_keeps_markers(void) {
 }
 
 static void test_qwen_precut_tokens(void) {
-    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false };
+    const qwen_span_ids ids = { 900, 901, 902, 903, 904, 905, {0}, 0, 0, false, 0, 0, false };
     /* system, three user turns with an answer each, the generation prompt;
      * 906 is the assistant role; reasoning 10-12 and 13-14 */
     int v[] = { 904, 907, 1, 2,
