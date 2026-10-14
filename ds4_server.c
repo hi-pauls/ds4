@@ -10905,10 +10905,6 @@ struct server_slot {
      * only such a session goes into the conversation cache, since the client's
      * next request never replays an answer cut off half way */
     bool turn_done;
-    /* session length when the turn now running began: everything before it
-     * ends with a complete turn, so an unfinished turn can be dropped back to
-     * there (slot_settle_turn) */
-    int complete_pos;
     int continued_last_store_tokens;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
@@ -12773,16 +12769,9 @@ static int qwen_span_stopped_live, qwen_span_stopped_prompt;
 static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, const qwen_span_ids *ids,
                             qwen_span_cut *cuts, int max_cuts, int *n_cuts, int *tail) {
     int i = 0, j = 0, open_l = QWEN_SPAN_NONE, open_p = QWEN_SPAN_NONE, n = 0;
-    /* where the run of equal tokens the walk is in began, for the last turn below */
-    int run_i = 0, run_j = 0;
-    bool ok = true, after_think = false, in_run = false;
+    bool ok = true, after_think = false;
     while (ok && i < live->len && j < prompt->len) {
         if (live->v[i] == prompt->v[j]) {
-            if (!in_run) {
-                run_i = i;
-                run_j = j;
-                in_run = true;
-            }
             after_think = live->v[i] == ids->think_close;
             open_l = qwen_span_kind(ids, live->v[i++], open_l);
             open_p = qwen_span_kind(ids, prompt->v[j++], open_p);
@@ -12794,21 +12783,16 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
             if (qwen_span_blank(ids, live->v[i])) i++;
             if (qwen_span_blank(ids, prompt->v[j])) j++;
             after_think = false;
-            in_run = false;
         } else if (ids->has_im_end && open_l == QWEN_SPAN_NONE && open_p == QWEN_SPAN_NONE &&
                    prompt->v[j] == ids->im_end && live->v[i] == ids->im_start) {
             /* The end of a turn the session never evaluated (see im_end): the
              * prompt's marker and the newline behind it have no counterpart. */
             j++;
             while (j < prompt->len && qwen_span_blank(ids, prompt->v[j])) j++;
-            in_run = false;
         } else if (open_l != QWEN_SPAN_NONE && open_l == open_p) {
             const int close = open_l == QWEN_SPAN_THINK ? ids->think_close : ids->tool_close;
             const int close_l = qwen_span_find(live, i, close), close_p = qwen_span_find(prompt, j, close);
             ok = close_l >= 0 && close_p >= 0;
-            /* a session cut off inside the span keeps the run that led into
-             * it, for the last turn below */
-            if (ok) in_run = false;
             if (ok && open_l == QWEN_SPAN_TOOL) {
                 const int start = (i + 3) / 4 * 4, end = close_l / 4 * 4;
                 if (end > start) {
@@ -12827,38 +12811,20 @@ static bool qwen_span_match(const ds4_tokens *live, const ds4_tokens *prompt, co
             ok = close_l >= 0;
             i = close_l + 1;
             for (int skip = 0; ok && skip < 2 && i < live->len && live->v[i] != prompt->v[j]; skip++) i++;
-            in_run = false;
         } else {
             ok = false;
         }
     }
     qwen_span_stopped_live = i;
     qwen_span_stopped_prompt = j;
-    bool matched = ok && i == live->len && j < prompt->len;
-    /* The session's last turn is one the client does not have: an answer cut
-     * off by a restart or a dropped connection, or one it never received, or a
-     * retry with nothing new.  That turn is dropped from the session and the
-     * prompt is processed again from where they part, so the session gets no
-     * partial answer back.  Where they part must sit in a run of equal tokens,
-     * in the same span on both sides or in none, inside an assistant turn that
-     * runs to the session's end. */
-    if (!matched && in_run && open_l == open_p && n < max_cuts && (i < live->len || j == prompt->len))
-    {
-        const int start = (i - 1) / 4 * 4;
-        bool last_turn = start >= run_i && start >= (n > 0 ? cuts[n - 1].end : 0);
-        for (int k = i; last_turn && k < live->len; k++) last_turn = live->v[k] != ids->im_start;
-        int turn = i - 1;
-        while (turn >= 0 && live->v[turn] != ids->im_start) turn--;
-        last_turn = last_turn && turn >= 0 && turn + 1 < live->len && live->v[turn + 1] != ids->user;
-        if (last_turn) {
-            cuts[n++] = (qwen_span_cut){ start, live->len };
-            j = run_j + (start - run_i);
-            matched = true;
-        }
-    }
+    /* A session that runs past the prompt (a retry, or an answer the client
+     * never got) does not match: cutting the extra turn off its end leaves it
+     * folded into the linear-attention state, and the model then carries on as
+     * if it had already answered. */
+    ok = ok && i == live->len && j < prompt->len;
     *n_cuts = n;
     *tail = j;
-    return matched;
+    return ok;
 }
 
 typedef enum {
@@ -13431,31 +13397,10 @@ static int qwen_span_reuse(server *s, server_slot *slot, const ds4_tokens *promp
     return kept;
 }
 
-/* Makes the slot's session end with a complete turn, for the conversation
- * cache: an unfinished Qwen3.8 turn (cut off, or still being prefilled when
- * the server stops) is dropped back to where it began.  The cut starts on the
- * block boundary at or before that point, so up to three tokens of the last
- * complete turn go too and are processed again by the next request.  Returns
- * whether the session now ends with a complete turn.  Holds inference_mu. */
-static bool slot_settle_turn(server *s, server_slot *slot) {
-    const int pos = ds4_session_pos(slot->session);
-    const int start = slot->complete_pos / 4 * 4;
-    if (!slot->turn_done && ds4_engine_is_qwen4(s->engine) && start > 0 && start < pos &&
-        ds4_session_checkpoint_valid(slot->session))
-    {
-        char err[160] = {0};
-        if (ds4_session_qwen4_cut(slot->session, start, pos, err, sizeof(err)) == 0) {
-            slot->turn_done = true;
-            server_log(DS4_LOG_KVCACHE, "ds4-server: unfinished turn dropped, session %d -> %d tokens", pos, start);
-        } else {
-            server_log(DS4_LOG_WARNING, "ds4-server: unfinished turn not dropped: %s", err);
-        }
-    }
-    return slot->turn_done;
-}
-
-/* Puts the slot's session into the conversation cache, settled to its last
- * complete turn (slot_settle_turn).  Keyed the way the disk cache keys a
+/* Puts the slot's session into the conversation cache if its last turn is
+ * complete; an unfinished one is not stored, since cutting the turn off would
+ * leave it folded into Qwen3.8's linear-attention state.  Keyed the way the
+ * disk cache keys a
  * store (kv_cache_store_current): by the visible transcript when the live
  * state holds reasoning or tool state the client will not replay, else by
  * its rendered text, which could never prefix the next request otherwise.
@@ -13464,9 +13409,8 @@ static bool slot_settle_turn(server *s, server_slot *slot) {
 static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinned, size_t pinned_len,
                                   const char *reason) {
     bool stored = false;
-    const int before = ds4_session_pos(slot->session);
-    const bool turn_done = before > 0 && slot_settle_turn(s, slot);
     const int pos = ds4_session_pos(slot->session);
+    const bool turn_done = slot->turn_done;
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     const bool checkpoint_ok = ds4_session_checkpoint_valid(slot->session);
     if (pos > 0 && turn_done && checkpoint_ok && live && live->len == pos) {
@@ -13502,7 +13446,7 @@ static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinn
         }
         free(key);
         free(tool_blob);
-    } else if (before > 0) {
+    } else if (pos > 0) {
         server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) skipped live=%d checkpoint=%s turn=%s",
                    reason, live ? (int)live->len : -1, checkpoint_ok ? "valid" : "invalid",
                    turn_done ? "done" : "unfinished");
@@ -15688,7 +15632,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     slot->turn_done = false;
-    slot->complete_pos = ds4_session_pos(slot->session);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
@@ -24219,32 +24162,20 @@ static void test_qwen_span_match(void) {
     prompt.len = 10;
     TEST_ASSERT(!qwen_span_match(&live, &prompt, &ids, cuts, 4, &n, &tail));
 
-    /* 904 opens a turn, 905 is the user role, 906 the assistant's */
-    /* a retry after a restart: the session holds the answer cut off half way,
-     * the prompt ends where it began; the session drops back to the block
-     * before that point and the prompt is processed again from there */
-    int cut_live_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900, 7, 8, 9, 10, 11 };
+    /* 904 opens a turn, 905 is the user role, 906 the assistant's.  A session
+     * holding an answer the prompt does not carry never matches: cutting that
+     * answer off leaves it in the linear-attention state, and a repeated
+     * request then got "<|im_end|>" or the answer twice (Heimdall,
+     * 2026-10-14).  Neither a retry of the same prompt ... */
+    int answered_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900, 7, 8, 9, 10, 11 };
     int retry_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900 };
-    ds4_tokens cut_live = { cut_live_v, (int)(sizeof(cut_live_v) / sizeof(cut_live_v[0])), 0 };
+    ds4_tokens answered = { answered_v, (int)(sizeof(answered_v) / sizeof(answered_v[0])), 0 };
     ds4_tokens retry = { retry_v, (int)(sizeof(retry_v) / sizeof(retry_v[0])), 0 };
-    TEST_ASSERT(qwen_span_match(&cut_live, &retry, &ids, cuts, 4, &n, &tail));
-    TEST_ASSERT(n == 1 && cuts[0].start == 8 && cuts[0].end == cut_live.len && tail == 8);
-    /* the client kept the partial reasoning, closed it and asked on */
+    TEST_ASSERT(!qwen_span_match(&answered, &retry, &ids, cuts, 4, &n, &tail));
+    /* ... nor a client that kept part of a cut-off answer and asked on */
     int kept_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 900, 7, 8, 901, 50, 904, 905, 20, 21 };
     ds4_tokens kept = { kept_v, (int)(sizeof(kept_v) / sizeof(kept_v[0])), 0 };
-    TEST_ASSERT(qwen_span_match(&cut_live, &kept, &ids, cuts, 4, &n, &tail));
-    TEST_ASSERT(n == 1 && cuts[0].start == 8 && cuts[0].end == cut_live.len && tail == 8);
-    /* a different user turn is another conversation, not a cut-off answer */
-    retry_v[3] = 77;
-    TEST_ASSERT(!qwen_span_match(&cut_live, &retry, &ids, cuts, 4, &n, &tail));
-    retry_v[3] = 2;
-    /* a difference in an answer the session has later turns behind is not
-     * the session's last turn */
-    int later_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 7, 8, 904, 905, 30, 31 };
-    int differs_v[] = { 904, 905, 1, 2, 3, 4, 904, 906, 7, 9, 904, 905, 30, 31, 32 };
-    ds4_tokens later = { later_v, (int)(sizeof(later_v) / sizeof(later_v[0])), 0 };
-    ds4_tokens differs = { differs_v, (int)(sizeof(differs_v) / sizeof(differs_v[0])), 0 };
-    TEST_ASSERT(!qwen_span_match(&later, &differs, &ids, cuts, 4, &n, &tail));
+    TEST_ASSERT(!qwen_span_match(&answered, &kept, &ids, cuts, 4, &n, &tail));
 }
 
 static void test_qwen_think_cut_keeps_markers(void) {
