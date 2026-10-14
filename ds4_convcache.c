@@ -23,8 +23,10 @@
  *   [text_len bytes of rendered text]
  *   CONZ: [ZSTD-compressed snapshot bytes to end of file]
  *   CONA: [8-byte base frame length] [ZSTD frame of the snapshot]
- *         then appended records, each the state a later turn reached:
- *         [4-byte DLTA] [4-byte suffix_len] [key text suffix]
+ *         then appended records, each the state a later turn reached and
+ *         the whole key it answers to (a finished turn renders differently
+ *         once the next one follows it, so keys do not extend each other):
+ *         [4-byte DLTA] [4-byte key_len] [key text]
  *         [4-byte token_count] [4-byte aux_len] [aux bytes]
  *         [8-byte uncompressed delta length] [8-byte frame length]
  *         [ZSTD frame of a delta payload (ds4_session_save_delta_snapshot)]
@@ -188,19 +190,19 @@ static bool write_entry_atomic(const char *path,
 
 /* Appends one record to a CONA file.  A record that does not land whole is
  * cut off again, and a crash part way leaves one conv_file_read skips. */
-static bool append_record(const char *path, const char *suffix, size_t suffix_len, int token_count,
+static bool append_record(const char *path, const char *key, size_t key_len, int token_count,
                           const uint8_t *aux, uint32_t aux_len, uint64_t raw_len,
                           const uint8_t *frame, uint64_t frame_len) {
     bool landed = false;
-    const int fd = path ? open(path, O_WRONLY | O_APPEND) : -1;
+    const int fd = path && key && key_len ? open(path, O_WRONLY | O_APPEND) : -1;
     struct stat st;
     if (fd >= 0 && fstat(fd, &st) == 0) {
         FILE *fp = fdopen(fd, "ab");
         if (fp) {
-            const uint32_t magic = DS4_CONV_RECORD_MAGIC, sl = (uint32_t)suffix_len;
+            const uint32_t magic = DS4_CONV_RECORD_MAGIC, kl = (uint32_t)key_len;
             const uint32_t tc = (uint32_t)(token_count < 0 ? 0 : token_count), al = aux ? aux_len : 0u;
-            landed = fwrite(&magic, sizeof(magic), 1, fp) == 1 && fwrite(&sl, sizeof(sl), 1, fp) == 1 &&
-                     (sl == 0 || fwrite(suffix, 1, sl, fp) == sl) && fwrite(&tc, sizeof(tc), 1, fp) == 1 &&
+            landed = fwrite(&magic, sizeof(magic), 1, fp) == 1 && fwrite(&kl, sizeof(kl), 1, fp) == 1 &&
+                     fwrite(key, 1, kl, fp) == kl && fwrite(&tc, sizeof(tc), 1, fp) == 1 &&
                      fwrite(&al, sizeof(al), 1, fp) == 1 && (al == 0 || fwrite(aux, 1, al, fp) == al) &&
                      fwrite(&raw_len, sizeof(raw_len), 1, fp) == 1 &&
                      fwrite(&frame_len, sizeof(frame_len), 1, fp) == 1 &&
@@ -258,8 +260,8 @@ static void trim_disk_to_budget(const ds4_convcache *cc, const char *keep_path) 
     }
 }
 
-/* One .conv file as read back: the key text with every record's suffix, the
- * token count, tool memory and residents of its newest state, and where each
+/* One .conv file as read back: the key, token count and tool memory of its
+ * newest state (the last record's, else the base's), residents, and where each
  * compressed frame sits.  A CONZ file is a base alone; a CONA file is a base
  * followed by appended delta records (append_record), of which a record cut
  * short by a crash is left out with everything behind it. */
@@ -297,15 +299,15 @@ static bool read_exact(FILE *fp, void *dst, size_t len) {
 /* Reads one appended record's metadata and steps past its frame; false at
  * the end of the file or at a record the file does not hold whole. */
 static bool read_record(FILE *fp, off_t file_end, conv_file *f) {
-    uint32_t magic = 0, suffix_len = 0, token_count = 0, aux_len = 0;
+    uint32_t magic = 0, key_len = 0, token_count = 0, aux_len = 0;
     uint64_t raw_len = 0, frame_len = 0;
-    char *suffix = NULL;
+    char *key = NULL;
     uint8_t *aux = NULL;
     bool ok = read_exact(fp, &magic, sizeof(magic)) && magic == DS4_CONV_RECORD_MAGIC &&
-              read_exact(fp, &suffix_len, sizeof(suffix_len)) && suffix_len <= (uint32_t)(64 * 1024 * 1024);
+              read_exact(fp, &key_len, sizeof(key_len)) && key_len > 0 && key_len <= (uint32_t)(64 * 1024 * 1024);
     if (ok) {
-        suffix = (char *)malloc((size_t)suffix_len + 1);
-        ok = suffix && read_exact(fp, suffix, suffix_len) &&
+        key = (char *)malloc((size_t)key_len + 1);
+        ok = key && read_exact(fp, key, key_len) &&
              read_exact(fp, &token_count, sizeof(token_count)) &&
              read_exact(fp, &aux_len, sizeof(aux_len)) && aux_len <= (uint32_t)(64 * 1024 * 1024);
     }
@@ -317,14 +319,14 @@ static bool read_record(FILE *fp, off_t file_end, conv_file *f) {
     const off_t at = ok ? ftello(fp) : -1;
     ok = ok && at >= 0 && frame_len > 0 && (uint64_t)(file_end - at) >= frame_len;
     conv_frame *records = ok ? (conv_frame *)realloc(f->records, (size_t)(f->n_records + 1) * sizeof(conv_frame)) : NULL;
-    char *text = ok && records ? (char *)realloc(f->text, f->text_len + suffix_len + 1) : NULL;
-    ok = ok && records && text && fseeko(fp, (off_t)frame_len, SEEK_CUR) == 0;
+    ok = ok && records && fseeko(fp, (off_t)frame_len, SEEK_CUR) == 0;
     if (records) f->records = records;
-    if (text) f->text = text;
     if (ok) {
-        memcpy(f->text + f->text_len, suffix, suffix_len);
-        f->text_len += suffix_len;
-        f->text[f->text_len] = '\0';
+        key[key_len] = '\0';
+        free(f->text);
+        f->text = key;
+        f->text_len = key_len;
+        key = NULL;
         f->token_count = (int)token_count;
         f->records[f->n_records++] = (conv_frame){ at, frame_len, raw_len };
         if (aux_len) {
@@ -334,7 +336,7 @@ static bool read_record(FILE *fp, off_t file_end, conv_file *f) {
             aux = NULL;
         }
     }
-    free(suffix);
+    free(key);
     free(aux);
     return ok;
 }

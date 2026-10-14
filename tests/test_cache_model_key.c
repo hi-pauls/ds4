@@ -162,7 +162,7 @@ int main(void) {
      * key and tokens of the newest record, a load applies base and records in
      * order, and a record cut short by a crash is left out */
     const uint32_t turn[] = { 904, 905, 1, 2, 900, 7, 901, 3, 904, 905, 4, 5, 6 };
-    const char *key = "<|user|>append base", *suffix = " and a second turn";
+    const char *key = "<|user|>append base", *next_key = "<|user|>append base and a second turn";
     char *path = NULL;
     expect(ds4_convcache_init(&cc, &opt), "convcache init, appendable");
     path = ds4_convcache_entry_path(&cc, key, strlen(key));
@@ -172,11 +172,11 @@ int main(void) {
     ds4_session_snapshot_free(&raw);
     raw = fake_payload(turn, 8, 13, true);
     const uint8_t tool_memory[] = "tool memory of the second turn";
-    expect(ds4_convcache_write(&cc, path, false, suffix, strlen(suffix), 13, NULL, 0, tool_memory,
+    expect(ds4_convcache_write(&cc, path, false, next_key, strlen(next_key), 13, NULL, 0, tool_memory,
                                sizeof(tool_memory), &raw, err, sizeof(err)), "record appended");
     ds4_session_snapshot_free(&raw);
     n = ds4_convcache_candidates(&cc, key, strlen(key), strlen(key), cand, 4);
-    expect(n == 1 && cand[0].text_len == strlen(key) + strlen(suffix) && cand[0].token_count == 13 &&
+    expect(n == 1 && cand[0].text_len == strlen(next_key) && cand[0].token_count == 13 &&
            cand[0].tokens_len == 13 && memcmp(cand[0].tokens, turn, sizeof(turn)) == 0,
            "candidate carries the record's key and tokens");
     const int loads_before = loads;
@@ -196,7 +196,7 @@ int main(void) {
            "base rewritten");
     ds4_session_snapshot_free(&raw);
     raw = fake_payload(turn, 8, 13, true);
-    expect(ds4_convcache_write(&cc, path, false, suffix, strlen(suffix), 13, NULL, 0, NULL, 0, &raw, err,
+    expect(ds4_convcache_write(&cc, path, false, next_key, strlen(next_key), 13, NULL, 0, NULL, 0, &raw, err,
                                sizeof(err)), "record appended again");
     ds4_session_snapshot_free(&raw);
     struct stat st;

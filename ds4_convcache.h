@@ -216,8 +216,8 @@ char *ds4_convcache_entry_path(const ds4_convcache *cc, const char *text, size_t
 
 /* Compresses `raw` (an uncompressed session or delta payload, compressed in
  * place) and writes it to `path`: a new entry keyed by `text` when `base`,
- * otherwise a record appended to the entry there, `text` then being what
- * the key gained.  Touches only that file and the budget trim, so a writer
+ * otherwise a record appended to the entry there, `text` then becoming the
+ * entry's key.  Touches only that file and the budget trim, so a writer
  * thread may run it beside lookups, one write per path at a time. */
 bool ds4_convcache_write(const ds4_convcache *cc, const char *path, bool base, const char *text, size_t text_len,
                          int token_count, const ds4_stream_expert_ref *residents, uint32_t residents_len,
