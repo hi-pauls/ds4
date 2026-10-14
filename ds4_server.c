@@ -13334,6 +13334,36 @@ static int qwen_reasoning_cut(server *s, server_slot *slot, const ds4_tokens *pr
     return kept;
 }
 
+/* A session lost to one token is a whole conversation prefilled again, so say
+ * which token: three before where the last qwen_span_match stopped and five
+ * from it, each side. */
+static void qwen_span_log_mismatch(server *s, const char *what, const ds4_tokens *live,
+                                   const ds4_tokens *prompt) {
+    const int at_live = qwen_span_stopped_live, at_prompt = qwen_span_stopped_prompt;
+    buf sides[2] = {{0}, {0}};
+    for (int side = 0; side < 2; side++) {
+        const ds4_tokens *t = side ? prompt : live;
+        const int at = side ? at_prompt : at_live;
+        for (int k = at - 3; k < at + 5; k++) {
+            if (k >= 0 && k < t->len) {
+                size_t len = 0;
+                char *piece = ds4_token_text(s->engine, t->v[k], &len);
+                buf_puts(&sides[side], k == at ? " >>" : " ");
+                for (size_t c = 0; piece && c < len && c < 24; c++)
+                    buf_append(&sides[side], piece[c] == '\n' ? "~" : piece + c, 1);
+                free(piece);
+            }
+        }
+    }
+    char *live_text = buf_take(&sides[0]), *prompt_text = buf_take(&sides[1]);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: %s span mismatch at live=%d/%d prompt=%d/%d: live [%s ] prompt [%s ]",
+               what, at_live, live->len, at_prompt, prompt->len, live_text ? live_text : "",
+               prompt_text ? prompt_text : "");
+    free(live_text);
+    free(prompt_text);
+}
+
 /* Reuses the live Qwen3.8 session for a prompt that differs from it only in
  * reasoning or tool-result content: cuts the pruned tool output and builds the
  * prompt to sync from the session's tokens and the prompt's unseen tail.
@@ -13368,33 +13398,32 @@ static int qwen_span_reuse(server *s, server_slot *slot, const ds4_tokens *promp
             ds4_session_invalidate(slot->session);
         }
     } else if (ids && live && ds4_session_checkpoint_valid(slot->session)) {
-        /* A session lost to one token is a whole conversation prefilled again,
-         * so say which token: three before the stop and five from it, each side. */
-        const int at_live = qwen_span_stopped_live, at_prompt = qwen_span_stopped_prompt;
-        buf sides[2] = {{0}, {0}};
-        for (int side = 0; side < 2; side++) {
-            const ds4_tokens *t = side ? prompt : live;
-            const int at = side ? at_prompt : at_live;
-            for (int k = at - 3; k < at + 5; k++) {
-                if (k >= 0 && k < t->len) {
-                    size_t len = 0;
-                    char *piece = ds4_token_text(s->engine, t->v[k], &len);
-                    buf_puts(&sides[side], k == at ? " >>" : " ");
-                    for (size_t c = 0; piece && c < len && c < 24; c++)
-                        buf_append(&sides[side], piece[c] == '\n' ? "~" : piece + c, 1);
-                    free(piece);
-                }
-            }
-        }
-        char *live_text = buf_take(&sides[0]), *prompt_text = buf_take(&sides[1]);
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: live kv cache span mismatch at live=%d/%d prompt=%d/%d: live [%s ] prompt [%s ]",
-                   at_live, live->len, at_prompt, prompt->len, live_text ? live_text : "",
-                   prompt_text ? prompt_text : "");
-        free(live_text);
-        free(prompt_text);
+        qwen_span_log_mismatch(s, "live kv cache", live, prompt);
     }
     return kept;
+}
+
+/* Batched routing sends a prompt that lines up with no slot to an empty one,
+ * silently: the resident session of the same conversation stays put and the
+ * whole transcript is prefilled again beside it.  Says where the largest idle
+ * session stopped lining up.  Caller holds tool_mu, as for job_slot_score. */
+static void qwen_route_miss_log(server *s, const job *j) {
+    const qwen_span_ids *ids = ds4_engine_is_qwen4(s->engine) && j->req.image_count == 0 ?
+        qwen_span_ids_get(s->engine) : NULL;
+    server_slot *largest = NULL;
+    for (int i = 0; ids && i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (!slot->busy && slot->session && ds4_session_checkpoint_valid(slot->session) &&
+            (!largest || ds4_session_pos(slot->session) > ds4_session_pos(largest->session)))
+            largest = slot;
+    }
+    if (largest) {
+        const ds4_tokens *live = ds4_session_tokens(largest->session);
+        qwen_span_cut cuts[QWEN_SPAN_MAX_CUTS];
+        int n_cuts = 0, tail = 0;
+        if (live && !qwen_span_match(live, &j->req.prompt, ids, cuts, QWEN_SPAN_MAX_CUTS, &n_cuts, &tail))
+            qwen_span_log_mismatch(s, "routing: slot", live, &j->req.prompt);
+    }
 }
 
 /* Puts the slot's session into the conversation cache if its last turn is
@@ -16967,6 +16996,7 @@ static void dispatch_jobs_locked(server *s) {
             chosen_evict_idle = now > chosen_slot->last_used
                                 ? now - chosen_slot->last_used : 0;
         }
+        if (chosen && chosen_score <= 0) qwen_route_miss_log(s, chosen);
         pthread_mutex_unlock(&s->tool_mu);
         if (!chosen || !chosen_slot) break;
 
