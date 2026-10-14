@@ -70,6 +70,7 @@ typedef struct ds4_convcache {
     int                 len;
     int                 cap;
     uint64_t            ram_used_bytes;
+    char               *loaded_path;  /* the .conv file the last disk load read */
 } ds4_convcache;
 
 /* Init / free ---------------------------------------------------------- */
@@ -206,6 +207,21 @@ bool ds4_convcache_load_candidate(ds4_convcache *cc,
 bool ds4_convcache_disk_has_prefix(const ds4_convcache *cc,
                                    const char *incoming_text,
                                    size_t incoming_text_len);
+
+/* Appendable entries -------------------------------------------------- */
+
+/* The path a conversation keyed by `text` starts its entry under; NULL
+ * without disk backing.  Caller frees. */
+char *ds4_convcache_entry_path(const ds4_convcache *cc, const char *text, size_t text_len);
+
+/* Compresses `raw` (an uncompressed session or delta payload, compressed in
+ * place) and writes it to `path`: a new entry keyed by `text` when `base`,
+ * otherwise a record appended to the entry there, `text` then being what
+ * the key gained.  Touches only that file and the budget trim, so a writer
+ * thread may run it beside lookups, one write per path at a time. */
+bool ds4_convcache_write(const ds4_convcache *cc, const char *path, bool base, const char *text, size_t text_len,
+                         int token_count, const ds4_stream_expert_ref *residents, uint32_t residents_len,
+                         const uint8_t *aux, uint32_t aux_len, ds4_session_snapshot *raw, char *err, size_t errlen);
 
 /* Shutdown ------------------------------------------------------------ */
 

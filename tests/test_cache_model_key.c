@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static const uint8_t pattern[64] = "kv bytes of the model that saved this conversation, padded....";
@@ -35,9 +36,28 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
     (void)s; (void)err; (void)errlen;
-    if (snap->len != sizeof(pattern) || memcmp(snap->ptr, pattern, sizeof(pattern)) != 0) return 1;
+    uint32_t magic = 0;
+    if (snap->len >= sizeof(magic)) memcpy(&magic, snap->ptr, sizeof(magic));
+    if (magic != DS4_SESSION_PAYLOAD_MAGIC &&
+        (snap->len != sizeof(pattern) || memcmp(snap->ptr, pattern, sizeof(pattern)) != 0)) return 1;
     loads++;
     return 0;
+}
+
+/* a payload the way the session writes one: header, (from, from_mtp), tokens */
+static ds4_session_snapshot fake_payload(const uint32_t *ids, uint32_t from, uint32_t rows, bool delta) {
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS] = { DS4_SESSION_PAYLOAD_MAGIC, DS4_SESSION_PAYLOAD_VERSION };
+    h[7] = rows;
+    const size_t extra = delta ? 2 * sizeof(uint32_t) : 0;
+    ds4_session_snapshot snap = {0};
+    snap.len = snap.cap = sizeof(h) + extra + (rows - from) * sizeof(uint32_t) + sizeof(pattern);
+    snap.ptr = malloc(snap.len);
+    const uint32_t start[2] = { from, 0 };
+    memcpy(snap.ptr, h, sizeof(h));
+    memcpy(snap.ptr + sizeof(h), start, extra);
+    memcpy(snap.ptr + sizeof(h) + extra, ids + from, (rows - from) * sizeof(uint32_t));
+    memcpy(snap.ptr + sizeof(h) + extra + (rows - from) * sizeof(uint32_t), pattern, sizeof(pattern));
+    return snap;
 }
 
 void ds4_session_snapshot_free(ds4_session_snapshot *snap) {
@@ -137,6 +157,56 @@ int main(void) {
     ds4_convcache_candidates_free(cand, n);
     ds4_convcache_free(&cc);
     payload_ids = NULL;
+
+    /* an appendable entry: a base, then a record per turn.  Candidates see the
+     * key and tokens of the newest record, a load applies base and records in
+     * order, and a record cut short by a crash is left out */
+    const uint32_t turn[] = { 904, 905, 1, 2, 900, 7, 901, 3, 904, 905, 4, 5, 6 };
+    const char *key = "<|user|>append base", *suffix = " and a second turn";
+    char *path = NULL;
+    expect(ds4_convcache_init(&cc, &opt), "convcache init, appendable");
+    path = ds4_convcache_entry_path(&cc, key, strlen(key));
+    ds4_session_snapshot raw = fake_payload(turn, 0, 8, false);
+    expect(path && ds4_convcache_write(&cc, path, true, key, strlen(key), 8, NULL, 0, NULL, 0, &raw, err, sizeof(err)),
+           "base written");
+    ds4_session_snapshot_free(&raw);
+    raw = fake_payload(turn, 8, 13, true);
+    const uint8_t tool_memory[] = "tool memory of the second turn";
+    expect(ds4_convcache_write(&cc, path, false, suffix, strlen(suffix), 13, NULL, 0, tool_memory,
+                               sizeof(tool_memory), &raw, err, sizeof(err)), "record appended");
+    ds4_session_snapshot_free(&raw);
+    n = ds4_convcache_candidates(&cc, key, strlen(key), strlen(key), cand, 4);
+    expect(n == 1 && cand[0].text_len == strlen(key) + strlen(suffix) && cand[0].token_count == 13 &&
+           cand[0].tokens_len == 13 && memcmp(cand[0].tokens, turn, sizeof(turn)) == 0,
+           "candidate carries the record's key and tokens");
+    const int loads_before = loads;
+    uint8_t *aux = NULL;
+    uint32_t aux_len = 0;
+    expect(n == 1 && ds4_convcache_load_candidate(&cc, &cand[0], (ds4_session *)&cc, NULL, NULL, &aux, &aux_len,
+                                                  err, sizeof(err)) &&
+           loads == loads_before + 2 && aux_len == sizeof(tool_memory) && cc.loaded_path &&
+           strcmp(cc.loaded_path, path) == 0, "load applies base and record and keeps the newest tool memory");
+    free(aux);
+    ds4_convcache_candidates_free(cand, n);
+    ds4_convcache_free(&cc);
+
+    expect(ds4_convcache_init(&cc, &opt), "convcache init, cut record");
+    raw = fake_payload(turn, 0, 8, false);
+    expect(ds4_convcache_write(&cc, path, true, key, strlen(key), 8, NULL, 0, NULL, 0, &raw, err, sizeof(err)),
+           "base rewritten");
+    ds4_session_snapshot_free(&raw);
+    raw = fake_payload(turn, 8, 13, true);
+    expect(ds4_convcache_write(&cc, path, false, suffix, strlen(suffix), 13, NULL, 0, NULL, 0, &raw, err,
+                               sizeof(err)), "record appended again");
+    ds4_session_snapshot_free(&raw);
+    struct stat st;
+    expect(stat(path, &st) == 0 && truncate(path, st.st_size - 5) == 0, "record cut short");
+    n = ds4_convcache_candidates(&cc, key, strlen(key), strlen(key), cand, 4);
+    expect(n == 1 && cand[0].text_len == strlen(key) && cand[0].tokens_len == 8,
+           "a record cut short is left out, the base stays");
+    ds4_convcache_candidates_free(cand, n);
+    ds4_convcache_free(&cc);
+    free(path);
 
     const char *prompt = "You are a helpful assistant.";
     ds4_syscache sa, sb;

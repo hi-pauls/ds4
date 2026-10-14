@@ -5,6 +5,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,13 +21,18 @@
  *   [n_residents * sizeof(ds4_stream_expert_ref) bytes: residents array]
  *   [4-byte aux_blob_len] [aux_blob_len bytes]
  *   [text_len bytes of rendered text]
- *   [ZSTD-compressed snapshot bytes to end of file]
- * The text follows the (variable-size) residents block; scan_disk_best_match
- * seeks past both header and residents to reach the text for prefix matching.
+ *   CONZ: [ZSTD-compressed snapshot bytes to end of file]
+ *   CONA: [8-byte base frame length] [ZSTD frame of the snapshot]
+ *         then appended records, each the state a later turn reached:
+ *         [4-byte DLTA] [4-byte suffix_len] [key text suffix]
+ *         [4-byte token_count] [4-byte aux_len] [aux bytes]
+ *         [8-byte uncompressed delta length] [8-byte frame length]
+ *         [ZSTD frame of a delta payload (ds4_session_save_delta_snapshot)]
  * Servers of different models may share a directory: a file whose model_key
  * differs is never loaded, and CONY files, which carry no key, are rejected. */
 #define DS4_CONV_FILE_MAGIC 0x434f4e5au  /* "CONZ" — + model_key */
-#define DS4_CONV_TOKEN_COUNT_OFFSET 16   /* magic 4 + model_key 8 + text_len 4 */
+#define DS4_CONV_FILE_MAGIC_APPEND 0x434f4e41u  /* "CONA" */
+#define DS4_CONV_RECORD_MAGIC 0x444c5441u  /* "DLTA" */
 /* Compression level: 1 is the fastest zstd preset. */
 /* Compression level: 1 is the fastest zstd preset. Empirical on ~140 MiB
  * snapshots: ~0.9s encode / ~0.4s decode / ~40% ratio — cheap enough to
@@ -111,6 +117,15 @@ static bool decompress_snapshot(const ds4_session_snapshot *compressed,
     return true;
 }
 
+static void entry_sha(const ds4_convcache *cc, const char *text, size_t text_len, char sha[41]) {
+    uint64_t h = 5381 ^ cc->opt.model_key;
+    for (size_t i = 0; i < text_len; i++) h = ((h << 5) + h) ^ (uint8_t)text[i];
+    snprintf(sha, 41, "%016llx%016llx%08x",
+             (unsigned long long)h,
+             (unsigned long long)(h ^ 0xdeadbeefcafebabeULL),
+             (unsigned)(text_len & 0xffffffff));
+}
+
 /* Compose the on-disk path for a given SHA. Caller frees. */
 static char *disk_path_for(const ds4_convcache *cc, const char *sha) {
     if (!cc || !cc->opt.disk_dir || !sha) return NULL;
@@ -121,11 +136,7 @@ static char *disk_path_for(const ds4_convcache *cc, const char *sha) {
     return p;
 }
 
-/* Write a magic-tagged entry file atomically. Layout:
- *   [magic(u32)] [text_len(u32)] [token_count(u32)] [uncompressed_len(u64)]
- *   [n_residents(u32)] [n_residents * sizeof(ds4_stream_expert_ref) bytes]
- *   [aux_blob_len(u32)] [aux_blob_len bytes]
- *   [text bytes] [ZSTD-compressed snapshot bytes to EOF]
+/* Writes a CONA entry (layout at the top) with no records yet, atomically.
  * The snap_ptr/snap_len are ALREADY compressed by the caller.
  * Returns whether the file landed; disk backing is best-effort, so most
  * callers ignore it. */
@@ -148,7 +159,7 @@ static bool write_entry_atomic(const char *path,
     bool landed = false;
     FILE *fp = fopen(tmp, "wb");
     if (fp) {
-        uint32_t magic = DS4_CONV_FILE_MAGIC;
+        uint32_t magic = DS4_CONV_FILE_MAGIC_APPEND;
         uint32_t tl = (uint32_t)text_len;
         uint32_t tc = (uint32_t)(token_count < 0 ? 0 : token_count);
         uint64_t ul = uncompressed_len;
@@ -165,12 +176,44 @@ static bool write_entry_atomic(const char *path,
                   fwrite(&ab,    sizeof(ab),    1, fp) == 1 &&
                   (ab   == 0 || fwrite(aux_blob, 1, ab, fp) == ab) &&
                   fwrite(text, 1, text_len, fp) == text_len &&
+                  fwrite(&snap_len, sizeof(snap_len), 1, fp) == 1 &&
                   fwrite(snap_ptr, 1, (size_t)snap_len, fp) == (size_t)snap_len;
         ok = fclose(fp) == 0 && ok;
         landed = ok && rename(tmp, path) == 0;
         if (!landed) unlink(tmp);
     }
     free(tmp);
+    return landed;
+}
+
+/* Appends one record to a CONA file.  A record that does not land whole is
+ * cut off again, and a crash part way leaves one conv_file_read skips. */
+static bool append_record(const char *path, const char *suffix, size_t suffix_len, int token_count,
+                          const uint8_t *aux, uint32_t aux_len, uint64_t raw_len,
+                          const uint8_t *frame, uint64_t frame_len) {
+    bool landed = false;
+    const int fd = path ? open(path, O_WRONLY | O_APPEND) : -1;
+    struct stat st;
+    if (fd >= 0 && fstat(fd, &st) == 0) {
+        FILE *fp = fdopen(fd, "ab");
+        if (fp) {
+            const uint32_t magic = DS4_CONV_RECORD_MAGIC, sl = (uint32_t)suffix_len;
+            const uint32_t tc = (uint32_t)(token_count < 0 ? 0 : token_count), al = aux ? aux_len : 0u;
+            landed = fwrite(&magic, sizeof(magic), 1, fp) == 1 && fwrite(&sl, sizeof(sl), 1, fp) == 1 &&
+                     (sl == 0 || fwrite(suffix, 1, sl, fp) == sl) && fwrite(&tc, sizeof(tc), 1, fp) == 1 &&
+                     fwrite(&al, sizeof(al), 1, fp) == 1 && (al == 0 || fwrite(aux, 1, al, fp) == al) &&
+                     fwrite(&raw_len, sizeof(raw_len), 1, fp) == 1 &&
+                     fwrite(&frame_len, sizeof(frame_len), 1, fp) == 1 &&
+                     fwrite(frame, 1, (size_t)frame_len, fp) == (size_t)frame_len;
+            landed = fflush(fp) == 0 && landed;
+            if (!landed) (void)ftruncate(fd, st.st_size);
+            fclose(fp);
+        } else {
+            close(fd);
+        }
+    } else if (fd >= 0) {
+        close(fd);
+    }
     return landed;
 }
 
@@ -215,57 +258,134 @@ static void trim_disk_to_budget(const ds4_convcache *cc, const char *keep_path) 
     }
 }
 
-/* Read just the text-header portion of a .conv file. Returns malloc'd text
- * (caller frees) on success, NULL on any error. Sets *text_len_out to the
- * length. Leaves the FILE* positioned just past the text (i.e. at the start
- * of the compressed snapshot bytes) if `keep_open` is non-NULL. */
-static char *read_entry_text(const char *path,
-                             uint64_t model_key,
-                             size_t *text_len_out,
-                             FILE **keep_open) {
-    if (keep_open) *keep_open = NULL;
-    if (text_len_out) *text_len_out = 0;
-    if (!path) return NULL;
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    uint32_t magic = 0, text_len = 0, token_count = 0;
-    uint64_t file_model_key = 0;
-    uint64_t uncompressed_len = 0;
-    uint32_t n_residents = 0;
-    if (fread(&magic,           sizeof(magic),           1, fp) != 1 ||
-        fread(&file_model_key,  sizeof(file_model_key),  1, fp) != 1 ||
-        fread(&text_len,        sizeof(text_len),        1, fp) != 1 ||
-        fread(&token_count,     sizeof(token_count),     1, fp) != 1 ||
-        fread(&uncompressed_len, sizeof(uncompressed_len), 1, fp) != 1 ||
-        fread(&n_residents,     sizeof(n_residents),     1, fp) != 1 ||
-        magic != DS4_CONV_FILE_MAGIC || file_model_key != model_key ||
-        text_len == 0 || text_len > (uint32_t)(64 * 1024 * 1024))
-    {
-        fclose(fp);
-        return NULL;
+/* One .conv file as read back: the key text with every record's suffix, the
+ * token count, tool memory and residents of its newest state, and where each
+ * compressed frame sits.  A CONZ file is a base alone; a CONA file is a base
+ * followed by appended delta records (append_record), of which a record cut
+ * short by a crash is left out with everything behind it. */
+typedef struct {
+    off_t at;
+    uint64_t len;
+    uint64_t raw_len;
+} conv_frame;
+
+typedef struct {
+    char *text;
+    size_t text_len;
+    int token_count;
+    ds4_stream_expert_ref *residents;
+    uint32_t n_residents;
+    uint8_t *aux;
+    uint32_t aux_len;
+    conv_frame base;
+    conv_frame *records;
+    int n_records;
+} conv_file;
+
+static void conv_file_free(conv_file *f) {
+    free(f->text);
+    free(f->residents);
+    free(f->aux);
+    free(f->records);
+    memset(f, 0, sizeof(*f));
+}
+
+static bool read_exact(FILE *fp, void *dst, size_t len) {
+    return len == 0 || fread(dst, 1, len, fp) == len;
+}
+
+/* Reads one appended record's metadata and steps past its frame; false at
+ * the end of the file or at a record the file does not hold whole. */
+static bool read_record(FILE *fp, off_t file_end, conv_file *f) {
+    uint32_t magic = 0, suffix_len = 0, token_count = 0, aux_len = 0;
+    uint64_t raw_len = 0, frame_len = 0;
+    char *suffix = NULL;
+    uint8_t *aux = NULL;
+    bool ok = read_exact(fp, &magic, sizeof(magic)) && magic == DS4_CONV_RECORD_MAGIC &&
+              read_exact(fp, &suffix_len, sizeof(suffix_len)) && suffix_len <= (uint32_t)(64 * 1024 * 1024);
+    if (ok) {
+        suffix = (char *)malloc((size_t)suffix_len + 1);
+        ok = suffix && read_exact(fp, suffix, suffix_len) &&
+             read_exact(fp, &token_count, sizeof(token_count)) &&
+             read_exact(fp, &aux_len, sizeof(aux_len)) && aux_len <= (uint32_t)(64 * 1024 * 1024);
     }
-    /* Skip past the residents block; caller can re-read it explicitly if it
-     * needs the resident set (load_from_disk does). */
-    off_t resb = (off_t)n_residents * (off_t)sizeof(ds4_stream_expert_ref);
-    if (fseeko(fp, resb, SEEK_CUR) != 0) { fclose(fp); return NULL; }
-    /* Skip past the aux_blob length + bytes too. */
-    uint32_t aux_blob_len = 0;
-    if (fread(&aux_blob_len, sizeof(aux_blob_len), 1, fp) != 1) {
-        fclose(fp); return NULL;
+    if (ok && aux_len) {
+        aux = (uint8_t *)malloc(aux_len);
+        ok = aux && read_exact(fp, aux, aux_len);
     }
-    if (fseeko(fp, (off_t)aux_blob_len, SEEK_CUR) != 0) {
-        fclose(fp); return NULL;
+    ok = ok && read_exact(fp, &raw_len, sizeof(raw_len)) && read_exact(fp, &frame_len, sizeof(frame_len));
+    const off_t at = ok ? ftello(fp) : -1;
+    ok = ok && at >= 0 && frame_len > 0 && (uint64_t)(file_end - at) >= frame_len;
+    conv_frame *records = ok ? (conv_frame *)realloc(f->records, (size_t)(f->n_records + 1) * sizeof(conv_frame)) : NULL;
+    char *text = ok && records ? (char *)realloc(f->text, f->text_len + suffix_len + 1) : NULL;
+    ok = ok && records && text && fseeko(fp, (off_t)frame_len, SEEK_CUR) == 0;
+    if (records) f->records = records;
+    if (text) f->text = text;
+    if (ok) {
+        memcpy(f->text + f->text_len, suffix, suffix_len);
+        f->text_len += suffix_len;
+        f->text[f->text_len] = '\0';
+        f->token_count = (int)token_count;
+        f->records[f->n_records++] = (conv_frame){ at, frame_len, raw_len };
+        if (aux_len) {
+            free(f->aux);
+            f->aux = aux;
+            f->aux_len = aux_len;
+            aux = NULL;
+        }
     }
-    char *text = (char *)malloc((size_t)text_len + 1);
-    if (!text) { fclose(fp); return NULL; }
-    if (fread(text, 1, text_len, fp) != text_len) {
-        free(text); fclose(fp); return NULL;
+    free(suffix);
+    free(aux);
+    return ok;
+}
+
+/* Parses a .conv file of this model; false and nothing kept on any error. */
+static bool conv_file_read(const char *path, uint64_t model_key, conv_file *f) {
+    memset(f, 0, sizeof(*f));
+    FILE *fp = path ? fopen(path, "rb") : NULL;
+    uint32_t magic = 0, text_len = 0, token_count = 0, n_residents = 0, aux_len = 0;
+    uint64_t file_model_key = 0, uncompressed_len = 0;
+    off_t file_end = -1;
+    bool ok = fp && fseeko(fp, 0, SEEK_END) == 0 && (file_end = ftello(fp)) > 0 && fseeko(fp, 0, SEEK_SET) == 0 &&
+              read_exact(fp, &magic, sizeof(magic)) &&
+              (magic == DS4_CONV_FILE_MAGIC || magic == DS4_CONV_FILE_MAGIC_APPEND) &&
+              read_exact(fp, &file_model_key, sizeof(file_model_key)) && file_model_key == model_key &&
+              read_exact(fp, &text_len, sizeof(text_len)) && text_len > 0 &&
+              text_len <= (uint32_t)(64 * 1024 * 1024) &&
+              read_exact(fp, &token_count, sizeof(token_count)) &&
+              read_exact(fp, &uncompressed_len, sizeof(uncompressed_len)) && uncompressed_len > 0 &&
+              read_exact(fp, &n_residents, sizeof(n_residents)) && n_residents <= (uint32_t)(1u << 24);
+    if (ok && n_residents) {
+        f->residents = (ds4_stream_expert_ref *)malloc((size_t)n_residents * sizeof(*f->residents));
+        ok = f->residents && read_exact(fp, f->residents, (size_t)n_residents * sizeof(*f->residents));
+        f->n_residents = n_residents;
     }
-    text[text_len] = '\0';
-    if (text_len_out) *text_len_out = text_len;
-    if (keep_open) *keep_open = fp;
-    else fclose(fp);
-    return text;
+    ok = ok && read_exact(fp, &aux_len, sizeof(aux_len)) && aux_len <= (uint32_t)(64 * 1024 * 1024);
+    if (ok && aux_len) {
+        f->aux = (uint8_t *)malloc(aux_len);
+        ok = f->aux && read_exact(fp, f->aux, aux_len);
+        f->aux_len = aux_len;
+    }
+    if (ok) {
+        f->text = (char *)malloc((size_t)text_len + 1);
+        ok = f->text && read_exact(fp, f->text, text_len);
+        if (ok) f->text[text_len] = '\0';
+        f->text_len = text_len;
+        f->token_count = (int)token_count;
+    }
+    uint64_t base_len = 0;
+    if (ok && magic == DS4_CONV_FILE_MAGIC_APPEND) ok = read_exact(fp, &base_len, sizeof(base_len));
+    const off_t base_at = ok ? ftello(fp) : -1;
+    if (ok && magic == DS4_CONV_FILE_MAGIC) base_len = (uint64_t)(file_end - base_at);
+    ok = ok && base_at >= 0 && base_len > 0 && (uint64_t)(file_end - base_at) >= base_len;
+    if (ok) {
+        f->base = (conv_frame){ base_at, base_len, uncompressed_len };
+        if (magic == DS4_CONV_FILE_MAGIC_APPEND && fseeko(fp, (off_t)base_len, SEEK_CUR) == 0)
+            while (read_record(fp, file_end, f)) {}
+    }
+    if (fp) fclose(fp);
+    if (!ok) conv_file_free(f);
+    return ok;
 }
 
 /* Grow the entry array to at least `min_cap`. */
@@ -381,6 +501,7 @@ void ds4_convcache_free(ds4_convcache *cc) {
     }
     free(cc->entries);
     free(cc->opt.disk_dir);
+    free(cc->loaded_path);
     memset(cc, 0, sizeof(*cc));
 }
 
@@ -438,12 +559,7 @@ int ds4_convcache_store(ds4_convcache *cc,
      * byte-prefix comparison on the stored text. Seeding it with the model
      * key keeps two models' copies of one conversation in separate files. */
     char sha[41] = {0};
-    uint64_t h = 5381 ^ cc->opt.model_key;
-    for (size_t i = 0; i < text_len; i++) h = ((h << 5) + h) ^ (uint8_t)text[i];
-    snprintf(sha, sizeof(sha), "%016llx%016llx%08x",
-             (unsigned long long)h,
-             (unsigned long long)(h ^ 0xdeadbeefcafebabeULL),
-             (unsigned)(text_len & 0xffffffff));
+    entry_sha(cc, text, text_len, sha);
 
     /* Snapshot first — we need its size to know how much room to make. */
     const uint64_t t_start = now_ns();
@@ -673,31 +789,21 @@ static char *scan_disk_best_match(const ds4_convcache *cc,
         char *path = (char *)malloc(path_len);
         if (!path) continue;
         snprintf(path, path_len, "%s/%s", cc->opt.disk_dir, name);
-        FILE *fp = NULL;
-        size_t text_len = 0;
-        char *text = read_entry_text(path, cc->opt.model_key, &text_len, &fp);
-        if (!text) { free(path); continue; }
-        int token_count = 0;
-        long saved = ftell(fp);
-        if (fseeko(fp, DS4_CONV_TOKEN_COUNT_OFFSET, SEEK_SET) == 0) {
-            uint32_t tc = 0;
-            if (fread(&tc, sizeof(tc), 1, fp) == 1) token_count = (int)tc;
-        }
-        (void)fseek(fp, saved, SEEK_SET);
-        fclose(fp);
-        size_t min_len = text_len < incoming_text_len ? text_len
-                                                      : incoming_text_len;
+        conv_file f;
+        if (!conv_file_read(path, cc->opt.model_key, &f)) { free(path); continue; }
+        size_t min_len = f.text_len < incoming_text_len ? f.text_len
+                                                        : incoming_text_len;
         if (min_len > best_common &&
-            memcmp(text, incoming_text, min_len) == 0)
+            memcmp(f.text, incoming_text, min_len) == 0)
         {
             free(best_path);
             best_path = path;
             best_common = min_len;
-            best_token_count = token_count;
+            best_token_count = f.token_count;
         } else {
             free(path);
         }
-        free(text);
+        conv_file_free(&f);
     }
     closedir(d);
     if (best_common_out) *best_common_out = best_common;
@@ -705,10 +811,10 @@ static char *scan_disk_best_match(const ds4_convcache *cc,
     return best_path;
 }
 
-/* Loads one .conv file into the session; takes ownership of path. */
-static bool load_disk_file(const ds4_convcache *cc,
+/* Loads one .conv file into the session, base and records; takes ownership of
+ * path and keeps it as the cache's loaded_path on success. */
+static bool load_disk_file(ds4_convcache *cc,
                            char *path,
-                           int best_token_count,
                            ds4_session *session,
                            int *loaded_token_count_out,
                            size_t *loaded_text_len_out,
@@ -717,106 +823,50 @@ static bool load_disk_file(const ds4_convcache *cc,
                            uint8_t **out_aux_blob,
                            uint32_t *out_aux_blob_len,
                            char *err, size_t errlen) {
-    /* Open, read the full header (incl. residents block), then the compressed
-     * snapshot bytes past the text. */
-    FILE *fp = fopen(path, "rb");
-    if (!fp) { free(path); return false; }
-    uint32_t magic = 0, text_len = 0, token_count = 0;
-    uint64_t file_model_key = 0;
-    uint64_t uncompressed_len = 0;
-    uint32_t n_residents = 0;
-    if (fread(&magic,            sizeof(magic),            1, fp) != 1 ||
-        fread(&file_model_key,   sizeof(file_model_key),   1, fp) != 1 ||
-        fread(&text_len,         sizeof(text_len),         1, fp) != 1 ||
-        fread(&token_count,      sizeof(token_count),      1, fp) != 1 ||
-        fread(&uncompressed_len, sizeof(uncompressed_len), 1, fp) != 1 ||
-        fread(&n_residents,      sizeof(n_residents),      1, fp) != 1 ||
-        magic != DS4_CONV_FILE_MAGIC || file_model_key != cc->opt.model_key ||
-        uncompressed_len == 0)
-    {
-        fclose(fp); free(path); return false;
-    }
-    ds4_stream_expert_ref *residents = NULL;
-    if (n_residents > 0) {
-        residents = (ds4_stream_expert_ref *)
-            malloc((size_t)n_residents * sizeof(*residents));
-        if (!residents ||
-            fread(residents, sizeof(*residents), n_residents, fp) != n_residents)
-        {
-            free(residents); fclose(fp); free(path); return false;
+    conv_file f;
+    bool ok = conv_file_read(path, cc->opt.model_key, &f);
+    FILE *fp = ok ? fopen(path, "rb") : NULL;
+    ok = fp != NULL;
+    /* the base, then every record in the order the turns appended them */
+    for (int k = -1; ok && k < f.n_records; k++) {
+        const conv_frame *frame = k < 0 ? &f.base : &f.records[k];
+        ds4_session_snapshot compressed = { (uint8_t *)malloc((size_t)frame->len), frame->len, frame->len };
+        ds4_session_snapshot uncompressed = {0};
+        char step_err[160] = {0};
+        ok = compressed.ptr && fseeko(fp, frame->at, SEEK_SET) == 0 &&
+             read_exact(fp, compressed.ptr, (size_t)frame->len);
+        if (ok && !decompress_snapshot(&compressed, frame->raw_len, &uncompressed, step_err, sizeof(step_err))) {
+            if (err && errlen) snprintf(err, errlen, "decompress %s: %s", k < 0 ? "base" : "record", step_err);
+            ok = false;
         }
-    }
-    uint32_t aux_blob_len = 0;
-    uint8_t *aux_blob = NULL;
-    if (fread(&aux_blob_len, sizeof(aux_blob_len), 1, fp) != 1) {
-        free(residents); fclose(fp); free(path); return false;
-    }
-    if (aux_blob_len > 0) {
-        aux_blob = (uint8_t *)malloc(aux_blob_len);
-        if (!aux_blob ||
-            fread(aux_blob, 1, aux_blob_len, fp) != aux_blob_len)
-        {
-            free(aux_blob); free(residents); fclose(fp); free(path); return false;
+        if (ok && ds4_session_load_snapshot(session, &uncompressed, step_err, sizeof(step_err)) != 0) {
+            if (err && errlen) snprintf(err, errlen, "load %s %d: %s", k < 0 ? "base" : "record", k + 1, step_err);
+            ok = false;
         }
+        ds4_session_snapshot_free(&compressed);
+        ds4_session_snapshot_free(&uncompressed);
     }
-    if (fseeko(fp, (off_t)text_len, SEEK_CUR) != 0)
-    {
-        free(aux_blob); free(residents); fclose(fp); free(path); return false;
+    if (fp) fclose(fp);
+    if (ok) {
+        if (loaded_token_count_out) *loaded_token_count_out = f.token_count;
+        if (loaded_text_len_out) *loaded_text_len_out = f.text_len;
+        if (out_residents && out_residents_len && f.residents) {
+            *out_residents = f.residents;
+            *out_residents_len = f.n_residents;
+            f.residents = NULL;
+        }
+        if (out_aux_blob && out_aux_blob_len && f.aux) {
+            *out_aux_blob = f.aux;
+            *out_aux_blob_len = f.aux_len;
+            f.aux = NULL;
+        }
+        free(cc->loaded_path);
+        cc->loaded_path = path;
+        path = NULL;
     }
-    long snap_start = ftell(fp);
-    if (fseek(fp, 0, SEEK_END) != 0) { free(aux_blob); free(residents); fclose(fp); free(path); return false; }
-    long file_end = ftell(fp);
-    long snap_bytes = file_end - snap_start;
-    if (snap_bytes <= 0 || fseek(fp, snap_start, SEEK_SET) != 0) {
-        free(aux_blob); free(residents); fclose(fp); free(path); return false;
-    }
-    uint8_t *cbuf = (uint8_t *)malloc((size_t)snap_bytes);
-    if (!cbuf) { free(aux_blob); free(residents); fclose(fp); free(path); return false; }
-    size_t nread = fread(cbuf, 1, (size_t)snap_bytes, fp);
-    fclose(fp);
+    conv_file_free(&f);
     free(path);
-    if (nread != (size_t)snap_bytes) { free(aux_blob); free(residents); free(cbuf); return false; }
-
-    ds4_session_snapshot compressed = {
-        .ptr = cbuf,
-        .len = (uint64_t)snap_bytes,
-        .cap = (uint64_t)snap_bytes,
-    };
-    ds4_session_snapshot uncompressed = {0};
-    char dec_err[160] = {0};
-    bool dec_ok = decompress_snapshot(&compressed, uncompressed_len,
-                                      &uncompressed, dec_err, sizeof(dec_err));
-    ds4_session_snapshot_free(&compressed);
-    if (!dec_ok) {
-        free(aux_blob); free(residents);
-        if (err && errlen) snprintf(err, errlen, "decompress: %s", dec_err);
-        return false;
-    }
-    char load_err[160] = {0};
-    int rc = ds4_session_load_snapshot(session, &uncompressed,
-                                       load_err, sizeof(load_err));
-    ds4_session_snapshot_free(&uncompressed);
-    if (rc != 0) {
-        free(aux_blob); free(residents);
-        if (err && errlen) snprintf(err, errlen, "load: %s", load_err);
-        return false;
-    }
-    if (loaded_token_count_out) *loaded_token_count_out = best_token_count;
-    if (loaded_text_len_out) *loaded_text_len_out = text_len;
-    /* Transfer residents / aux_blob to caller (or free if unwanted). */
-    if (out_residents && out_residents_len && residents) {
-        *out_residents     = residents;
-        *out_residents_len = n_residents;
-    } else {
-        free(residents);
-    }
-    if (out_aux_blob && out_aux_blob_len && aux_blob) {
-        *out_aux_blob     = aux_blob;
-        *out_aux_blob_len = aux_blob_len;
-    } else {
-        free(aux_blob);
-    }
-    return true;
+    return ok;
 }
 
 bool ds4_convcache_load_from_disk(ds4_convcache *cc,
@@ -842,7 +892,7 @@ bool ds4_convcache_load_from_disk(ds4_convcache *cc,
     char *path = scan_disk_best_match(cc, incoming_text, incoming_text_len,
                                       &best_common, &best_token_count);
     if (!path) return false;
-    return load_disk_file(cc, path, best_token_count, session, loaded_token_count_out, loaded_text_len_out,
+    return load_disk_file(cc, path, session, loaded_token_count_out, loaded_text_len_out,
                           out_residents, out_residents_len, out_aux_blob, out_aux_blob_len, err, errlen);
 }
 
@@ -871,33 +921,47 @@ static bool zstd_read(ZSTD_DStream *ds, FILE *fp, ZSTD_inBuffer *in, uint8_t *in
 
 /* A session payload opens with DS4_SESSION_PAYLOAD_U32_FIELDS header words,
  * the eighth the token count, and then the tokens (ds4_session_save_payload);
- * only that much of the compressed snapshot at fp is decompressed, about 1 MB
- * for a 265k-token session of several GB. */
-static bool snapshot_tokens(FILE *fp, int **tokens_out, int *len_out) {
+ * a delta has its start row and MTP row between header and tokens, and only
+ * the tokens from that row on.  Only that much of the compressed frame at fp
+ * is decompressed, about 1 MB for a 265k-token session of several GB.  The
+ * tokens are appended to *tokens; a delta that does not start where they end
+ * is refused. */
+static bool snapshot_tokens(FILE *fp, bool delta, int **tokens, int *len) {
     bool ok = false;
-    *tokens_out = NULL;
-    *len_out = 0;
     ZSTD_DStream *ds = ZSTD_createDStream();
     uint8_t *in_buf = (uint8_t *)malloc(1 << 16);
     if (ds && in_buf) {
         ZSTD_inBuffer in = { in_buf, 0, 0 };
-        uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+        uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS], from[2] = {0, 0};
         if (zstd_read(ds, fp, &in, in_buf, 1 << 16, h, sizeof(h)) &&
             h[0] == DS4_SESSION_PAYLOAD_MAGIC && h[1] == DS4_SESSION_PAYLOAD_VERSION &&
-            h[7] > 0 && h[7] <= (uint32_t)(16 * 1024 * 1024)) {
-            int *tokens = (int *)malloc((size_t)h[7] * sizeof(int));
-            ok = tokens && zstd_read(ds, fp, &in, in_buf, 1 << 16, tokens, (size_t)h[7] * sizeof(int));
-            if (ok) {
-                *tokens_out = tokens;
-                *len_out = (int)h[7];
-            } else {
-                free(tokens);
-            }
+            h[7] <= (uint32_t)(16 * 1024 * 1024) &&
+            (!delta || zstd_read(ds, fp, &in, in_buf, 1 << 16, from, sizeof(from))) &&
+            from[0] == (uint32_t)*len && h[7] > from[0]) {
+            const size_t added = (size_t)(h[7] - from[0]);
+            int *grown = (int *)realloc(*tokens, ((size_t)*len + added) * sizeof(int));
+            if (grown) *tokens = grown;
+            ok = grown && zstd_read(ds, fp, &in, in_buf, 1 << 16, grown + *len, added * sizeof(int));
+            if (ok) *len += (int)added;
         }
     }
     free(in_buf);
     ZSTD_freeDStream(ds);
     return ok;
+}
+
+/* The tokens a file's newest state holds: its base's, then every record's. */
+static void conv_file_tokens(const char *path, const conv_file *f, int **tokens, int *len) {
+    FILE *fp = fopen(path, "rb");
+    bool ok = fp && fseeko(fp, f->base.at, SEEK_SET) == 0 && snapshot_tokens(fp, false, tokens, len);
+    for (int k = 0; ok && k < f->n_records; k++)
+        ok = fseeko(fp, f->records[k].at, SEEK_SET) == 0 && snapshot_tokens(fp, true, tokens, len);
+    if (!ok) {
+        free(*tokens);
+        *tokens = NULL;
+        *len = 0;
+    }
+    if (fp) fclose(fp);
 }
 
 static int candidate_cmp_longest_first(const void *a, const void *b) {
@@ -923,7 +987,7 @@ int ds4_convcache_candidates(const ds4_convcache *cc,
                                                         NULL, 0 };
                     FILE *snap = fmemopen(e->snap.ptr, (size_t)e->snap.len, "rb");
                     if (snap) {
-                        (void)snapshot_tokens(snap, &out[n].tokens, &out[n].tokens_len);
+                        (void)snapshot_tokens(snap, false, &out[n].tokens, &out[n].tokens_len);
                         fclose(snap);
                     }
                     n++;
@@ -937,30 +1001,23 @@ int ds4_convcache_candidates(const ds4_convcache *cc,
             if (nlen >= 6 && strcmp(ent->d_name + nlen - 5, ".conv") == 0) {
                 const size_t path_len = strlen(cc->opt.disk_dir) + 1 + nlen + 1;
                 char *path = (char *)malloc(path_len);
-                FILE *fp = NULL;
-                size_t entry_len = 0;
-                char *entry = NULL;
+                conv_file f = {0};
+                bool read = false;
                 if (path) {
                     snprintf(path, path_len, "%s/%s", cc->opt.disk_dir, ent->d_name);
-                    entry = read_entry_text(path, cc->opt.model_key, &entry_len, &fp);
+                    read = conv_file_read(path, cc->opt.model_key, &f);
                 }
-                const size_t common = entry ? common_prefix_len(entry, entry_len, text, text_len) : 0;
-                int token_count = 0, *tokens = NULL, tokens_len = 0;
-                if (fp) {
-                    /* read_entry_text leaves fp at the snapshot */
-                    if (entry && common >= min_common && common > 0) (void)snapshot_tokens(fp, &tokens, &tokens_len);
-                    uint32_t tc = 0;
-                    if (fseeko(fp, DS4_CONV_TOKEN_COUNT_OFFSET, SEEK_SET) == 0 && fread(&tc, sizeof(tc), 1, fp) == 1)
-                        token_count = (int)tc;
-                    fclose(fp);
-                }
-                if (entry && common >= min_common && common > 0) {
-                    out[n++] = (ds4_convcache_candidate){ -1, path, entry, entry_len, common, token_count,
+                const size_t common = read ? common_prefix_len(f.text, f.text_len, text, text_len) : 0;
+                if (read && common >= min_common && common > 0) {
+                    int *tokens = NULL, tokens_len = 0;
+                    conv_file_tokens(path, &f, &tokens, &tokens_len);
+                    out[n++] = (ds4_convcache_candidate){ -1, path, f.text, f.text_len, common, f.token_count,
                                                           tokens, tokens_len };
+                    f.text = NULL;
                 } else {
-                    free(entry);
                     free(path);
                 }
+                conv_file_free(&f);
             }
         }
         if (d) closedir(d);
@@ -998,7 +1055,7 @@ bool ds4_convcache_load_candidate(ds4_convcache *cc,
                                     out_aux_blob, out_aux_blob_len, err, errlen);
         } else if (c->path) {
             char *path = strdup(c->path);
-            ok = path && load_disk_file(cc, path, c->token_count, session, NULL, NULL, out_residents,
+            ok = path && load_disk_file(cc, path, session, NULL, NULL, out_residents,
                                         out_residents_len, out_aux_blob, out_aux_blob_len, err, errlen);
         }
     }
@@ -1033,6 +1090,41 @@ void ds4_convcache_flush_to_disk(ds4_convcache *cc) {
         free(path);
     }
     trim_disk_to_budget(cc, NULL);
+}
+
+char *ds4_convcache_entry_path(const ds4_convcache *cc, const char *text, size_t text_len) {
+    char sha[41] = {0};
+    char *path = NULL;
+    if (cc && text && text_len && cc->opt.disk_dir && cc->opt.disk_budget_bytes) {
+        entry_sha(cc, text, text_len, sha);
+        path = disk_path_for(cc, sha);
+    }
+    return path;
+}
+
+bool ds4_convcache_write(const ds4_convcache *cc, const char *path, bool base, const char *text, size_t text_len,
+                         int token_count, const ds4_stream_expert_ref *residents, uint32_t residents_len,
+                         const uint8_t *aux, uint32_t aux_len, ds4_session_snapshot *raw, char *err, size_t errlen) {
+    bool landed = false;
+    uint64_t raw_len = 0;
+    char comp_err[160] = {0};
+    const uint64_t t0 = now_ns();
+    if (!cc || !path || !raw || !raw->ptr) {
+        if (err && errlen) snprintf(err, errlen, "nothing to write");
+    } else if (!compress_snapshot_inplace(raw, &raw_len, comp_err, sizeof(comp_err))) {
+        if (err && errlen) snprintf(err, errlen, "compress: %s", comp_err);
+    } else {
+        const uint64_t t1 = now_ns();
+        landed = base ? write_entry_atomic(path, cc->opt.model_key, text, text_len, token_count, raw_len,
+                                           residents, residents_len, aux, aux_len, raw->ptr, raw->len)
+                      : append_record(path, text, text_len, token_count, aux, aux_len, raw_len, raw->ptr, raw->len);
+        if (!landed && err && errlen) snprintf(err, errlen, "%s %s failed", base ? "writing" : "appending to", path);
+        if (landed) trim_disk_to_budget(cc, path);
+        fprintf(stderr, "ds4: convcache %s compress %.2fs write %.2fs, %llu -> %llu bytes\n",
+                base ? "base" : "record", (double)(t1 - t0) / 1e9, (double)(now_ns() - t1) / 1e9,
+                (unsigned long long)raw_len, (unsigned long long)raw->len);
+    }
+    return landed;
 }
 
 uint64_t ds4_convcache_ram_used(const ds4_convcache *cc) {
