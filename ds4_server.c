@@ -10923,6 +10923,9 @@ struct server_slot {
     char *disk_key;
     size_t disk_key_len;
     ds4_session_mark disk_mark;
+    /* uncompressed bytes of the entry's base and of the records behind it:
+     * once the records outweigh the base the next store writes a new base */
+    uint64_t disk_base_bytes, disk_record_bytes;
 
     job *assigned;
     job *running;
@@ -13533,12 +13536,16 @@ static void conv_write_enqueue(server *s, conv_write *w) {
 /* The slot now continues the entry at path, holding key; its next store
  * appends what the session gains after this point. */
 static void slot_adopt_disk_entry(server_slot *slot, char *path, char *key, size_t key_len) {
+    struct stat st;
     free(slot->disk_path);
     free(slot->disk_key);
     slot->disk_path = path;
     slot->disk_key = key;
     slot->disk_key_len = key_len;
     slot->disk_mark = ds4_session_mark_now(slot->session);
+    /* a loaded entry counts as all base until the next one is written */
+    slot->disk_base_bytes = path && stat(path, &st) == 0 ? (uint64_t)st.st_size : 0;
+    slot->disk_record_bytes = 0;
 }
 
 /* Queues the slot's state for the writer: a record holding only what it
@@ -13548,7 +13555,9 @@ static void slot_adopt_disk_entry(server_slot *slot, char *path, char *key, size
 static bool conv_cache_queue_slot(server *s, server_slot *slot, char *key, size_t key_len, uint8_t *aux,
                                   size_t aux_len, int pos, const char *reason) {
     bool queued = false;
-    const bool extends = slot->disk_path && slot->disk_mark.valid;
+    const bool holds = slot->disk_path && ds4_session_mark_holds(slot->session, &slot->disk_mark);
+    const bool compact = holds && slot->disk_record_bytes > slot->disk_base_bytes;
+    const bool extends = holds && !compact;
     if (extends && pos == slot->disk_mark.rows && key_len == slot->disk_key_len &&
         memcmp(key, slot->disk_key, key_len) == 0) {
         server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) already on disk tokens=%d", reason, pos);
@@ -13568,8 +13577,13 @@ static bool conv_cache_queue_slot(server *s, server_slot *slot, char *key, size_
             w->text_len = key_len;
         } else {
             if (extends) server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) writes a new base: %s", reason, err);
+            if (compact) {
+                server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) compacts its entry: records %llu > base %llu bytes",
+                           reason, (unsigned long long)slot->disk_record_bytes, (unsigned long long)slot->disk_base_bytes);
+            }
             w->base = true;
-            w->path = ds4_convcache_entry_path(&s->convcache, key, key_len);
+            /* a base compacting the slot's own entry replaces it in place */
+            w->path = compact ? xstrdup(slot->disk_path) : ds4_convcache_entry_path(&s->convcache, key, key_len);
             rc = w->path ? ds4_session_save_snapshot(slot->session, &w->raw, err, sizeof(err)) : 1;
             w->text = xstrdup(key);
             w->text_len = key_len;
@@ -13580,7 +13594,11 @@ static bool conv_cache_queue_slot(server *s, server_slot *slot, char *key, size_
             w->aux_len = aux_len;
             server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) queued %s tokens=%d bytes=%llu copy=%.2fs",
                        reason, w->base ? "base" : "record", pos, (unsigned long long)w->raw.len, now_sec() - t0);
+            const uint64_t base_bytes = w->base ? w->raw.len : slot->disk_base_bytes;
+            const uint64_t record_bytes = w->base ? 0 : slot->disk_record_bytes + w->raw.len;
             slot_adopt_disk_entry(slot, xstrdup(w->path), key, key_len);
+            slot->disk_base_bytes = base_bytes;
+            slot->disk_record_bytes = record_bytes;
             conv_write_enqueue(s, w);
             queued = true;
         } else {

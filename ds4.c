@@ -68909,15 +68909,27 @@ ds4_session_mark ds4_session_mark_now(ds4_session *s) {
     return mark;
 }
 
+bool ds4_session_mark_holds(ds4_session *s, const ds4_session_mark *since) {
+    bool holds = false;
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s && since && since->valid && ds4_session_is_qwen4(s) && s->checkpoint_valid) {
+        const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        holds = g->layout_epoch == since->epoch && g->mark_floor >= (uint32_t)since->rows &&
+                g->pos >= (uint32_t)since->rows && g->mtp_pos >= (uint32_t)since->mtp_rows;
+    }
+#else
+    (void)s; (void)since;
+#endif
+    return holds;
+}
+
 int ds4_session_save_delta_snapshot(ds4_session *s, const ds4_session_mark *since, ds4_session_snapshot *snap,
                                     char *err, size_t errlen) {
     int rc = 1;
 #ifdef DS4_HAS_QWEN4_GPU
-    const ds4_qwen4_gpu_graph *g = s ? &s->qwen4_graph : NULL;
     if (!s || !since || !snap || !since->valid || !ds4_session_is_qwen4(s) || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "delta snapshot needs a Qwen3.8 session and a mark");
-    } else if (g->layout_epoch != since->epoch || g->mark_floor < (uint32_t)since->rows ||
-               g->pos < (uint32_t)since->rows || g->mtp_pos < (uint32_t)since->mtp_rows) {
+    } else if (!ds4_session_mark_holds(s, since)) {
         payload_set_err(err, errlen, "rows before the mark changed since it was taken");
     } else {
         char *ptr = NULL;

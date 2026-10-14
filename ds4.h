@@ -708,6 +708,9 @@ typedef struct {
     uint32_t epoch;
 } ds4_session_mark;
 ds4_session_mark ds4_session_mark_now(ds4_session *s);
+/* Whether the rows the mark covered are still the session's, so a delta
+ * since it can be saved. */
+bool ds4_session_mark_holds(ds4_session *s, const ds4_session_mark *since);
 /* Saves what the session gained since the mark, appendable after the
  * snapshot taken at it; ds4_session_load_snapshot applies it onto a session
  * holding exactly the mark's tokens.  Returns 1 without saving when rows the
