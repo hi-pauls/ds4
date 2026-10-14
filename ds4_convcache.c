@@ -446,12 +446,14 @@ int ds4_convcache_store(ds4_convcache *cc,
              (unsigned)(text_len & 0xffffffff));
 
     /* Snapshot first — we need its size to know how much room to make. */
+    const uint64_t t_start = now_ns();
     ds4_session_snapshot snap = {0};
     char save_err[160] = {0};
     if (ds4_session_save_snapshot(session, &snap, save_err, sizeof(save_err)) != 0) {
         if (err && errlen) snprintf(err, errlen, "snapshot: %s", save_err);
         return -1;
     }
+    const uint64_t t_snap = now_ns();
 
     /* Compress before checking the RAM budget — compressed size is what
      * actually occupies RAM, and it's typically ~40% of the raw snapshot. */
@@ -464,6 +466,10 @@ int ds4_convcache_store(ds4_convcache *cc,
         ds4_session_snapshot_free(&snap);
         return -1;
     }
+    const uint64_t t_comp = now_ns();
+    fprintf(stderr, "ds4: convcache store snapshot %.2fs, compress %.2fs, %llu -> %llu bytes\n",
+            (double)(t_snap - t_start) / 1e9, (double)(t_comp - t_snap) / 1e9,
+            (unsigned long long)uncompressed_len, (unsigned long long)snap.len);
 
     /* Snapshot the current streaming-expert-cache residency. Small (~40 KB
      * for 5000 experts) so this always fits alongside the KV state; both
@@ -488,11 +494,13 @@ int ds4_convcache_store(ds4_convcache *cc,
         if (cc->opt.disk_budget_bytes > 0 && cc->opt.disk_dir) {
             char *path = disk_path_for(cc, sha);
             if (path) {
+                const uint64_t t_write = now_ns();
                 landed = write_entry_atomic(path, cc->opt.model_key, text, text_len, token_count,
                                             uncompressed_len,
                                             residents, residents_len,
                                             aux_blob, aux_blob_len,
                                             snap.ptr, snap.len);
+                fprintf(stderr, "ds4: convcache store write %.2fs\n", (double)(now_ns() - t_write) / 1e9);
                 trim_disk_to_budget(cc, path);
                 free(path);
             }
