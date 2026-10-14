@@ -66896,6 +66896,60 @@ static uint64_t kolibri1_payload_body_bytes(const ds4_session *s, uint32_t token
     return bytes;
 }
 
+#ifdef DS4_HAS_KOLIBRI1_GPU
+/* Rows [first, first + count) of one layer's GPU K/V cache to or from the
+ * payload, which holds each row's K then its V.  Rows that are consecutive in
+ * the cache move in one transfer per tensor: a transfer per row and tensor
+ * stalled a 40k-token prompt for 13 to 27 s at every 10240-token snapshot.
+ * ring is the sliding window's row count, 0 for a full-context layer. */
+static int kolibri1_payload_gpu_rows(FILE *fp, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+                                     uint32_t first, uint32_t count, uint32_t ring,
+                                     uint64_t kv_row, bool write, uint8_t *buf, size_t cap,
+                                     uint64_t *remaining, char *err, size_t errlen) {
+    const uint64_t run_cap = (uint64_t)(cap / 2) / kv_row;
+    uint8_t *kbuf = buf, *vbuf = buf + cap / 2;
+    if (run_cap == 0) {
+        payload_set_err(err, errlen, "Kolibri-1 K/V row is larger than the payload buffer");
+        return 1;
+    }
+    for (uint32_t done = 0; done < count;) {
+        const uint32_t phys = ring ? (first + done) % ring : first + done;
+        uint64_t n = count - done;
+        if (n > run_cap) n = run_cap;
+        if (ring && n > ring - phys) n = ring - phys;
+        const uint64_t offset = (uint64_t)phys * kv_row, bytes = n * kv_row;
+        if (offset > ds4_gpu_tensor_bytes(k) || bytes > ds4_gpu_tensor_bytes(k) - offset ||
+            offset > ds4_gpu_tensor_bytes(v) || bytes > ds4_gpu_tensor_bytes(v) - offset) {
+            payload_set_err(err, errlen, "session tensor is smaller than the payload");
+            return 1;
+        }
+        if (write) {
+            if (ds4_gpu_tensor_read(k, offset, kbuf, bytes) == 0 ||
+                ds4_gpu_tensor_read(v, offset, vbuf, bytes) == 0) {
+                payload_set_err(err, errlen, "failed to read accelerator session tensor");
+                return 1;
+            }
+            for (uint64_t r = 0; r < n; r++) {
+                if (payload_write_bytes(fp, kbuf + r * kv_row, kv_row, err, errlen) != 0 ||
+                    payload_write_bytes(fp, vbuf + r * kv_row, kv_row, err, errlen) != 0) return 1;
+            }
+        } else {
+            for (uint64_t r = 0; r < n; r++) {
+                if (payload_read_bytes(fp, kbuf + r * kv_row, kv_row, remaining, err, errlen) != 0 ||
+                    payload_read_bytes(fp, vbuf + r * kv_row, kv_row, remaining, err, errlen) != 0) return 1;
+            }
+            if (ds4_gpu_tensor_write(k, offset, kbuf, bytes) == 0 ||
+                ds4_gpu_tensor_write(v, offset, vbuf, bytes) == 0) {
+                payload_set_err(err, errlen, "failed to restore accelerator session tensor");
+                return 1;
+            }
+        }
+        done += (uint32_t)n;
+    }
+    return 0;
+}
+#endif
+
 static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     const bool gpu = ds4_session_kolibri_uses_gpu(s);
     const uint32_t tokens = (uint32_t)s->checkpoint.len;
@@ -66955,17 +67009,9 @@ static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t err
 #ifdef DS4_HAS_KOLIBRI1_GPU
         if (gpu) {
             const ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
-            for (uint32_t r = 0; rc == 0 && r < live; r++) {
-                const uint32_t pos = tokens - live + r;
-                const uint32_t phys = full ? pos : pos % slide_rows;
-                const uint64_t offset = (uint64_t)phys * kv_row;
-                rc = payload_write_tensor_span(fp, g->layer_k_cache[il], offset, kv_row,
-                                               buf, DS4_SESSION_IO_CHUNK, err, errlen);
-                if (rc == 0) {
-                    rc = payload_write_tensor_span(fp, g->layer_v_cache[il], offset, kv_row,
-                                                   buf, DS4_SESSION_IO_CHUNK, err, errlen);
-                }
-            }
+            rc = kolibri1_payload_gpu_rows(fp, g->layer_k_cache[il], g->layer_v_cache[il],
+                                           tokens - live, live, full ? 0 : slide_rows, kv_row, true,
+                                           buf, DS4_SESSION_IO_CHUNK, NULL, err, errlen);
             continue;
         }
 #endif
@@ -67076,17 +67122,9 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 #ifdef DS4_HAS_KOLIBRI1_GPU
         if (gpu) {
             ds4_kolibri1_gpu_graph *g = &s->kolibri_gpu;
-            for (uint32_t r = 0; rc == 0 && r < live; r++) {
-                const uint32_t pos = saved_tokens - live + r;
-                const uint32_t phys = full ? pos : pos % g->slide_rows;
-                const uint64_t offset = (uint64_t)phys * kv_row;
-                rc = payload_read_tensor_span(fp, g->layer_k_cache[il], offset, kv_row,
-                                              buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-                if (rc == 0) {
-                    rc = payload_read_tensor_span(fp, g->layer_v_cache[il], offset, kv_row,
-                                                  buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
-                }
-            }
+            rc = kolibri1_payload_gpu_rows(fp, g->layer_k_cache[il], g->layer_v_cache[il],
+                                           saved_tokens - live, live, full ? 0 : g->slide_rows, kv_row,
+                                           false, buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
             continue;
         }
 #endif
