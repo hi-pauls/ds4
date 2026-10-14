@@ -127,8 +127,9 @@ static char *disk_path_for(const ds4_convcache *cc, const char *sha) {
  *   [aux_blob_len(u32)] [aux_blob_len bytes]
  *   [text bytes] [ZSTD-compressed snapshot bytes to EOF]
  * The snap_ptr/snap_len are ALREADY compressed by the caller.
- * Silently swallows I/O errors — disk backing is best-effort. */
-static void write_entry_atomic(const char *path,
+ * Returns whether the file landed; disk backing is best-effort, so most
+ * callers ignore it. */
+static bool write_entry_atomic(const char *path,
                                uint64_t model_key,
                                const char *text, size_t text_len,
                                int token_count,
@@ -139,11 +140,12 @@ static void write_entry_atomic(const char *path,
                                uint32_t aux_blob_len,
                                const uint8_t *snap_ptr, uint64_t snap_len) {
     if (!path || !text || text_len == 0 || !snap_ptr || snap_len == 0 ||
-        uncompressed_len == 0) return;
+        uncompressed_len == 0) return false;
     size_t plen = strlen(path);
     char *tmp = (char *)malloc(plen + 5);
-    if (!tmp) return;
+    if (!tmp) return false;
     snprintf(tmp, plen + 5, "%s.tmp", path);
+    bool landed = false;
     FILE *fp = fopen(tmp, "wb");
     if (fp) {
         uint32_t magic = DS4_CONV_FILE_MAGIC;
@@ -164,14 +166,12 @@ static void write_entry_atomic(const char *path,
                   (ab   == 0 || fwrite(aux_blob, 1, ab, fp) == ab) &&
                   fwrite(text, 1, text_len, fp) == text_len &&
                   fwrite(snap_ptr, 1, (size_t)snap_len, fp) == (size_t)snap_len;
-        fclose(fp);
-        if (ok) {
-            if (rename(tmp, path) != 0) unlink(tmp);
-        } else {
-            unlink(tmp);
-        }
+        ok = fclose(fp) == 0 && ok;
+        landed = ok && rename(tmp, path) == 0;
+        if (!landed) unlink(tmp);
     }
     free(tmp);
+    return landed;
 }
 
 /* Delete the least recently written .conv files until the directory fits the
@@ -484,27 +484,28 @@ int ds4_convcache_store(ds4_convcache *cc,
 
     /* Doesn't fit RAM at all → write to disk if backing exists, then bail. */
     if (snap.len > cc->opt.ram_budget_bytes) {
+        bool landed = false;
         if (cc->opt.disk_budget_bytes > 0 && cc->opt.disk_dir) {
             char *path = disk_path_for(cc, sha);
             if (path) {
-                write_entry_atomic(path, cc->opt.model_key, text, text_len, token_count,
-                                   uncompressed_len,
-                                   residents, residents_len,
-                                   aux_blob, aux_blob_len,
-                                   snap.ptr, snap.len);
+                landed = write_entry_atomic(path, cc->opt.model_key, text, text_len, token_count,
+                                            uncompressed_len,
+                                            residents, residents_len,
+                                            aux_blob, aux_blob_len,
+                                            snap.ptr, snap.len);
                 trim_disk_to_budget(cc, path);
                 free(path);
             }
         }
-        free(residents);
-        ds4_session_snapshot_free(&snap);
-        if (err && errlen) {
+        if (!landed && err && errlen) {
             snprintf(err, errlen,
-                     "compressed snapshot %llu bytes exceeds ram budget %llu bytes",
+                     "compressed snapshot %llu bytes exceeds ram budget %llu bytes, no disk copy",
                      (unsigned long long)snap.len,
                      (unsigned long long)cc->opt.ram_budget_bytes);
         }
-        return -1;
+        free(residents);
+        ds4_session_snapshot_free(&snap);
+        return landed ? DS4_CONVCACHE_DISK_ONLY : -1;
     }
 
     /* Evict until it fits, protecting entries that are prefixes of the

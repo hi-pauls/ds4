@@ -81,6 +81,25 @@ int main(void) {
     expect(conv_disk_load(dir, model_a, conversation), "conversation loads for the model that saved it");
     expect(!conv_disk_load(dir, model_b, conversation), "conversation must not load for another model");
 
+    /* a snapshot larger than the whole RAM budget goes to disk alone and is
+     * reported as stored; without a disk directory it is lost, and says so */
+    const char *long_conversation = "<|user|>a 265k-token session<|assistant|>does not fit RAM";
+    char err[160] = {0};
+    const ds4_convcache_opt tiny = { .ram_budget_bytes = 16, .disk_budget_bytes = 1 << 20,
+                                     .disk_dir = dir, .model_key = model_a };
+    expect(ds4_convcache_init(&cc, &tiny), "convcache init, tiny RAM");
+    expect(ds4_convcache_store(&cc, NULL, (ds4_session *)&cc, long_conversation, strlen(long_conversation),
+                               0, 2, 4096, 7, NULL, 0, NULL, 0, err, sizeof(err)) == DS4_CONVCACHE_DISK_ONLY,
+           "oversized snapshot is stored to disk only");
+    ds4_convcache_free(&cc);
+    expect(conv_disk_load(dir, model_a, long_conversation), "disk-only snapshot loads back");
+    const ds4_convcache_opt no_disk = { .ram_budget_bytes = 16, .model_key = model_a };
+    expect(ds4_convcache_init(&cc, &no_disk), "convcache init, no disk");
+    expect(ds4_convcache_store(&cc, NULL, (ds4_session *)&cc, long_conversation, strlen(long_conversation),
+                               0, 2, 4096, 7, NULL, 0, NULL, 0, err, sizeof(err)) == -1 &&
+           strstr(err, "no disk copy") != NULL, "oversized snapshot without disk fails with its reason");
+    ds4_convcache_free(&cc);
+
     const char *prompt = "You are a helpful assistant.";
     ds4_syscache sa, sb;
     const ds4_syscache_opt oa = { .disk_budget_bytes = 1 << 20, .disk_dir = dir, .model_key = model_a };

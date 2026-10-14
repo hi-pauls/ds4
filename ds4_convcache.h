@@ -108,7 +108,10 @@ int ds4_convcache_find_prefix(ds4_convcache *cc,
  * byte-prefix of `pinned_text_prefix` (i.e., an entry we'd want to load
  * next) is protected from eviction.
  *
- * Returns the entry index on success, or -1 on failure. */
+ * Returns the entry index on success, DS4_CONVCACHE_DISK_ONLY when the
+ * snapshot was larger than the whole RAM budget and went to disk only, or -1
+ * on failure. */
+#define DS4_CONVCACHE_DISK_ONLY (-2)
 int ds4_convcache_store(ds4_convcache *cc,
                         ds4_engine *engine,
                         ds4_session *session,
