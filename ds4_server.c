@@ -10916,6 +10916,14 @@ struct server_slot {
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
 
+    /* the conversation entry on disk this session continues: its file, the
+     * key it holds and the mark its newest record was taken at, so the next
+     * finished turn appends only what it added (conv_cache_store_slot) */
+    char *disk_path;
+    char *disk_key;
+    size_t disk_key_len;
+    ds4_session_mark disk_mark;
+
     job *assigned;
     job *running;
     bool busy;
@@ -11041,6 +11049,20 @@ static void id_list_push_unique(stop_list *ids, const char *id);
  * --kv-cache-mode flag. Default is PREFIX so existing users see no change. */
 typedef enum { DS4_CACHE_PREFIX = 0, DS4_CACHE_CONVERSATION = 1 } ds4_cache_mode;
 
+/* One conversation entry for the writer thread: a fresh base or a record to
+ * append (ds4_convcache_write), its payload still uncompressed. */
+typedef struct conv_write {
+    struct conv_write *next;
+    char *path;
+    bool base;
+    char *text;
+    size_t text_len;
+    int token_count;
+    uint8_t *aux;
+    size_t aux_len;
+    ds4_session_snapshot raw;
+} conv_write;
+
 struct server {
     ds4_engine *engine;
     ds4_tp *tp_leader;
@@ -11054,6 +11076,13 @@ struct server {
     ds4_cache_mode cache_mode;
     kv_disk_cache kv;
     ds4_convcache convcache;
+    /* conversation entries are compressed and written behind the turn that
+     * made them, in order, by one thread (conv_writer_main) */
+    conv_write *conv_writes, *conv_writes_tail;
+    pthread_mutex_t conv_write_mu;
+    pthread_cond_t conv_write_cv;
+    pthread_t conv_writer;
+    bool conv_writer_running, conv_writer_stop;
     ds4_syscache syscache;
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
@@ -13460,6 +13489,125 @@ static void qwen_route_miss_log(server *s, const job *j) {
  * its rendered text, which could never prefix the next request otherwise.
  * pinned names the request about to be restored, which the store's eviction
  * pass must not drop.  Holds inference_mu; takes tool_mu. */
+static void conv_write_free(conv_write *w) {
+    if (w) {
+        free(w->path);
+        free(w->text);
+        free(w->aux);
+        ds4_session_snapshot_free(&w->raw);
+        free(w);
+    }
+}
+
+static void *conv_writer_main(void *arg) {
+    server *s = arg;
+    pthread_mutex_lock(&s->conv_write_mu);
+    for (;;) {
+        while (!s->conv_writes && !s->conv_writer_stop) pthread_cond_wait(&s->conv_write_cv, &s->conv_write_mu);
+        conv_write *w = s->conv_writes;
+        if (!w) break;
+        s->conv_writes = w->next;
+        if (!s->conv_writes) s->conv_writes_tail = NULL;
+        pthread_mutex_unlock(&s->conv_write_mu);
+        char err[200] = {0};
+        const bool ok = ds4_convcache_write(&s->convcache, w->path, w->base, w->text, w->text_len, w->token_count,
+                                            NULL, 0, w->aux, (uint32_t)w->aux_len, &w->raw, err, sizeof(err));
+        server_log(DS4_LOG_KVCACHE, "ds4-server: convcache %s %s tokens=%d%s%s", w->base ? "base" : "record",
+                   ok ? "written" : "failed", w->token_count, ok ? "" : " err=", ok ? "" : err);
+        conv_write_free(w);
+        pthread_mutex_lock(&s->conv_write_mu);
+    }
+    pthread_mutex_unlock(&s->conv_write_mu);
+    return NULL;
+}
+
+static void conv_write_enqueue(server *s, conv_write *w) {
+    pthread_mutex_lock(&s->conv_write_mu);
+    if (s->conv_writes_tail) s->conv_writes_tail->next = w;
+    else s->conv_writes = w;
+    s->conv_writes_tail = w;
+    pthread_cond_signal(&s->conv_write_cv);
+    pthread_mutex_unlock(&s->conv_write_mu);
+}
+
+/* The slot now continues the entry at path, holding key; its next store
+ * appends what the session gains after this point. */
+static void slot_adopt_disk_entry(server_slot *slot, char *path, char *key, size_t key_len) {
+    free(slot->disk_path);
+    free(slot->disk_key);
+    slot->disk_path = path;
+    slot->disk_key = key;
+    slot->disk_key_len = key_len;
+    slot->disk_mark = ds4_session_mark_now(slot->session);
+}
+
+/* Queues the slot's state for the writer: a record holding only what it
+ * gained since the slot's entry was last written, while no row the entry
+ * holds has changed since (the mark), else a fresh base.  Only the copy off
+ * the device happens here.  Takes ownership of key and aux. */
+static bool conv_cache_queue_slot(server *s, server_slot *slot, char *key, size_t key_len, uint8_t *aux,
+                                  size_t aux_len, int pos, const char *reason) {
+    bool queued = false;
+    const bool extends = slot->disk_path && slot->disk_mark.valid;
+    if (extends && pos == slot->disk_mark.rows && key_len == slot->disk_key_len &&
+        memcmp(key, slot->disk_key, key_len) == 0) {
+        server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) already on disk tokens=%d", reason, pos);
+        free(key);
+        free(aux);
+        queued = true;
+    } else {
+        conv_write *w = xmalloc(sizeof(*w));
+        memset(w, 0, sizeof(*w));
+        char err[192] = {0};
+        const double t0 = now_sec();
+        int rc = extends ? ds4_session_save_delta_snapshot(slot->session, &slot->disk_mark, &w->raw, err, sizeof(err))
+                         : 1;
+        if (rc == 0) {
+            w->path = xstrdup(slot->disk_path);
+            w->text = xstrdup(key);
+            w->text_len = key_len;
+        } else {
+            if (extends) server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) writes a new base: %s", reason, err);
+            w->base = true;
+            w->path = ds4_convcache_entry_path(&s->convcache, key, key_len);
+            rc = w->path ? ds4_session_save_snapshot(slot->session, &w->raw, err, sizeof(err)) : 1;
+            w->text = xstrdup(key);
+            w->text_len = key_len;
+        }
+        if (rc == 0) {
+            w->token_count = pos;
+            w->aux = aux;
+            w->aux_len = aux_len;
+            server_log(DS4_LOG_KVCACHE, "ds4-server: convcache store (%s) queued %s tokens=%d bytes=%llu copy=%.2fs",
+                       reason, w->base ? "base" : "record", pos, (unsigned long long)w->raw.len, now_sec() - t0);
+            slot_adopt_disk_entry(slot, xstrdup(w->path), key, key_len);
+            conv_write_enqueue(s, w);
+            queued = true;
+        } else {
+            server_log(DS4_LOG_WARNING, "ds4-server: convcache store (%s) failed tokens=%d err=%s", reason, pos, err);
+            free(key);
+            w->aux = aux;
+            conv_write_free(w);
+        }
+    }
+    return queued;
+}
+
+static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinned, size_t pinned_len,
+                                  const char *reason);
+
+/* Every finished turn reaches disk, so a crash loses at most the turn in
+ * progress.  Runs after the client has its answer and before the slot is
+ * free: a request continuing the conversation waits for it
+ * (slot_finishing_conversation). */
+static void conv_cache_store_turn(server *s, server_slot *slot) {
+    if (s->conv_writer_running && slot->turn_done) {
+        pthread_mutex_lock(&s->inference_mu);
+        (void)conv_cache_store_slot(s, slot, NULL, 0, "turn");
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+}
+
 static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinned, size_t pinned_len,
                                   const char *reason) {
     bool stored = false;
@@ -13488,7 +13636,11 @@ static bool conv_cache_store_slot(server *s, server_slot *slot, const char *pinn
         size_t key_len = 0;
         if (key) key_len = strlen(key);
         else key = render_tokens_text(s->engine, live, &key_len);
-        if (key) {
+        if (key && s->conv_writer_running) {
+            stored = conv_cache_queue_slot(s, slot, key, key_len, tool_blob, tool_blob_len, pos, reason);
+            key = NULL;
+            tool_blob = NULL;
+        } else if (key) {
             char err[160] = {0};
             const int rc = ds4_convcache_store(&s->convcache, s->engine, slot->session, key, key_len,
                                                ds4_engine_model_id(s->engine), ds4_engine_routed_quant_bits(s->engine),
@@ -15417,6 +15569,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                  load_err, sizeof(load_err)))
                 {
                     restored_from = "conv-disk";
+                    if (s->convcache.loaded_path) {
+                        char *key = xmalloc(restored_key_len + 1);
+                        memcpy(key, j->req.prompt_text, restored_key_len);
+                        key[restored_key_len] = '\0';
+                        slot_adopt_disk_entry(slot, xstrdup(s->convcache.loaded_path), key, restored_key_len);
+                    }
                 } else {
                     server_log(DS4_LOG_WARNING,
                                "ds4-server: convcache disk load failed: %s", load_err);
@@ -15453,6 +15611,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                         {
                             restored_from = cands[c].ram_idx >= 0 ? "conv-ram-span" : "conv-disk-span";
                             span_restore = true;
+                            if (cands[c].path)
+                                slot_adopt_disk_entry(slot, xstrdup(cands[c].path), xstrdup(cands[c].text),
+                                                      cands[c].text_len);
                         } else {
                             server_log(DS4_LOG_WARNING, "ds4-server: convcache span load failed: %s", load_err);
                             ds4_session_invalidate(slot->session);
@@ -17125,6 +17286,7 @@ static void *worker_main(void *arg) {
         if (!j) break;
         generate_job(s, &s->slots[0], j);
         job_complete(j);
+        conv_cache_store_turn(s, &s->slots[0]);
         /* Mirror slot_worker_main: the checkpoint may have changed in any way
          * during the job, and the memory-text probe tier plus the staleness
          * tiers read the slot's rendered-text cache and activity stamp. */
@@ -17152,6 +17314,7 @@ static void *slot_worker_main(void *arg) {
 
         generate_job(s, slot, j);
         job_complete(j);
+        conv_cache_store_turn(s, slot);
         /* The checkpoint may have changed in any way during the job (sync,
          * rewind, generation, disk load, reset); refresh the rendered-text
          * cache the memory-text probe relies on before the slot becomes
@@ -17721,6 +17884,8 @@ static void server_close_resources(server *s) {
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
         free(slot->busy_text);
+        free(slot->disk_path);
+        free(slot->disk_key);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);
@@ -18291,6 +18456,15 @@ int main(int argc, char **argv) {
             server_close_resources(&s);
             return 1;
         }
+        if (cco.disk_budget_bytes && cco.disk_dir) {
+            pthread_mutex_init(&s.conv_write_mu, NULL);
+            pthread_cond_init(&s.conv_write_cv, NULL);
+            s.conv_writer_running = pthread_create(&s.conv_writer, NULL, conv_writer_main, &s) == 0;
+            if (!s.conv_writer_running) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: conversation writer thread failed to start; storing on shutdown only");
+            }
+        }
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: conversation cache mode ram=%llu MiB disk=%llu MiB dir=%s",
                    (unsigned long long)cfg.kv_conv_ram_mb,
@@ -18470,6 +18644,15 @@ int main(int argc, char **argv) {
          * (idle-timeout kill, launchd stop, upgrade restart) even though
          * hibernated ones would survive. */
         for (int i = 0; i < s.slot_count; i++) (void)conv_cache_store_slot(&s, &s.slots[i], NULL, 0, "shutdown");
+        if (s.conv_writer_running) {
+            /* everything queued, the shutdown stores included, lands first */
+            pthread_mutex_lock(&s.conv_write_mu);
+            s.conv_writer_stop = true;
+            pthread_cond_signal(&s.conv_write_cv);
+            pthread_mutex_unlock(&s.conv_write_mu);
+            pthread_join(s.conv_writer, NULL);
+            s.conv_writer_running = false;
+        }
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: flushing %d hibernated conversations to disk",
                    ds4_convcache_len(&s.convcache));
