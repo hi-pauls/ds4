@@ -248,6 +248,11 @@ int sigaddset(sigset_t *set, int sig);
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
 int sigprocmask(int how, const sigset_t *set, sigset_t *old);
 int kill(int pid, int sig);
+/* Ctrl-Break, and the console closing, the user logging off or Windows shutting
+ * down, call stop(SIGTERM) instead of ending the process.  For the last three
+ * Windows ends it once its handler returns, so the handler then waits until
+ * *done is set.  Ctrl-C stays the CRT's SIGINT. */
+int ds4_w32_console_stop(void (*stop)(int), volatile const int *done);
 
 /* ---- terminal ---------------------------------------------------------------- */
 
