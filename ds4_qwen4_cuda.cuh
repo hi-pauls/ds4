@@ -722,6 +722,9 @@ __device__ __forceinline__ int moe_pair_id(const int *selected, const int *table
  * value4 forms it; q becomes a float by exponent bias, which is exact and
  * spares the conversion instruction. */
 __device__ __forceinline__ float q2k_dot4(float acc, unsigned q, float scale, float offset, float4 xv) {
+#ifdef QWEN4_ABLATE_DECODE
+    return acc + (scale * __uint_as_float((q & 0x7fffffu) | 0x3f800000u) - offset) * (xv.x + xv.y + xv.z + xv.w);
+#endif
     const float *xs = (const float *)&xv;
     #pragma unroll
     for (unsigned k = 0; k < 4; k++) {
@@ -731,36 +734,37 @@ __device__ __forceinline__ float q2k_dot4(float acc, unsigned q, float scale, fl
     return acc;
 }
 
-/* A warp over one or two Q2_K rows: a lane takes one 32-bit word of a
- * block's qs, which holds 16 values under four scales, so a block header is
- * decoded once per 16 values rather than once per 4.  Sixteen lanes to a
- * block, two blocks to a step. */
+/* A warp over one or two Q2_K rows, one block a step: a lane takes half of
+ * one 32-bit word of the block's qs, eight values under two scales, so every
+ * lane works whatever the block count: at two blocks a step the 768-value
+ * down rows left half the warp idle every second step. */
 template<bool TWO>
 __device__ __forceinline__ void q2k_rows(const char *r0, const char *r1, const float *xt, unsigned K,
         float &a, float &b) {
-    const unsigned lane = threadIdx.x & 31, w = lane & 15, h = w >> 3, m = w & 7;
-    for (unsigned blk = lane >> 4; blk * 256 < K; blk += 2) {
+    const unsigned lane = threadIdx.x & 31, w = lane >> 1, sh = lane & 1, h = w >> 3, m = w & 7;
+    for (unsigned blk = 0; blk * 256 < K; blk++) {
         const char *b0 = r0 + blk * 84, *b1 = TWO ? r1 + blk * 84 : NULL;
         const unsigned dd0 = *(const unsigned *)(b0 + 80), q0 = *(const unsigned *)(b0 + 16 + 4 * w);
-        const unsigned sa0 = *(const unsigned *)(b0 + 8 * h), sb0 = *(const unsigned *)(b0 + 8 * h + 4);
+        const unsigned sw0 = *(const unsigned *)(b0 + 8 * h + 4 * sh);
         const float d0 = dev_f16_to_f32((uint16_t)dd0), dm0 = dev_f16_to_f32((uint16_t)(dd0 >> 16));
-        unsigned dd1 = 0, q1 = 0, sa1 = 0, sb1 = 0;
+        unsigned q1 = 0, sw1 = 0;
         float d1 = 0, dm1 = 0;
         if (TWO) {
-            dd1 = *(const unsigned *)(b1 + 80); q1 = *(const unsigned *)(b1 + 16 + 4 * w);
-            sa1 = *(const unsigned *)(b1 + 8 * h); sb1 = *(const unsigned *)(b1 + 8 * h + 4);
+            const unsigned dd1 = *(const unsigned *)(b1 + 80);
+            q1 = *(const unsigned *)(b1 + 16 + 4 * w);
+            sw1 = *(const unsigned *)(b1 + 8 * h + 4 * sh);
             d1 = dev_f16_to_f32((uint16_t)dd1); dm1 = dev_f16_to_f32((uint16_t)(dd1 >> 16));
         }
         #pragma unroll
-        for (unsigned s = 0; s < 4; s++) {
-            const unsigned j = blk * 256 + h * 128 + 32 * s + 4 * m;
+        for (unsigned e = 0; e < 2; e++) {
+            const unsigned s = 2 * sh + e, j = blk * 256 + h * 128 + 32 * s + 4 * m;
             if (j < K) {
                 const float4 xv = *(const float4 *)(xt + j);
-                const unsigned pick = 0x4440u | (2 * (s & 1) + (m >> 2));
-                const unsigned sc0 = __byte_perm(s < 2 ? sa0 : sb0, 0, pick);
+                const unsigned pick = 0x4440u | (2 * e + (m >> 2));
+                const unsigned sc0 = __byte_perm(sw0, 0, pick);
                 a = q2k_dot4(a, q0 >> (2 * s), d0 * (float)(sc0 & 15), dm0 * (float)(sc0 >> 4), xv);
                 if (TWO) {
-                    const unsigned sc1 = __byte_perm(s < 2 ? sa1 : sb1, 0, pick);
+                    const unsigned sc1 = __byte_perm(sw1, 0, pick);
                     b = q2k_dot4(b, q1 >> (2 * s), d1 * (float)(sc1 & 15), dm1 * (float)(sc1 >> 4), xv);
                 }
             }
@@ -771,6 +775,11 @@ __device__ __forceinline__ void q2k_rows(const char *r0, const char *r1, const f
 /* Eight IQ2_XXS values, one grid entry, against x: the signed bytes value4
  * forms, each scale * byte, the byte a float by exponent bias. */
 __device__ __forceinline__ float iq2_dot8(float acc, uint64_t grid, unsigned signs, float scale, const float *x) {
+#ifdef QWEN4_ABLATE_DECODE
+    const float4 x0 = *(const float4 *)x, x1 = *(const float4 *)(x + 4);
+    const float v = __uint_as_float((((unsigned)grid ^ signs) & 0x7fffffu) | 0x3f800000u);
+    return acc + scale * v * (x0.x + x0.y + x0.z + x0.w + x1.x + x1.y + x1.z + x1.w);
+#endif
     #pragma unroll
     for (unsigned q = 0; q < 2; q++) {
         const unsigned bits = (((signs >> (4 * q)) & 15) * 0x00204081u) & 0x01010101u;
