@@ -77449,6 +77449,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
 #if defined(__APPLE__)
+        /* The planned prefill reserve doubles as the decode-time expert zone. */
+        if (e->ssd_streaming && e->ssd_streaming_prefill_headroom_bytes != 0) {
+            uint64_t zone_slot_bytes = 0;
+            if (ds4_streaming_routed_expert_bytes(&e->weights, &zone_slot_bytes))
+                ds4_gpu_stream_expert_zone_configure(zone_slot_bytes, DS4_N_EXPERT);
+        }
         /* Keep the weights used by every token from competing with streamed
          * experts in the file cache. These bytes are already in the model
          * budget; munmap in model_close releases the locks. */

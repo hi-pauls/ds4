@@ -14277,6 +14277,79 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
     return buffer;
 }
 
+/* Decode-time expert zone: two of the three prefill staging buffers stay
+ * allocated between prefills and lend their slots to the expert cache. The
+ * budget grows by the zone, entries point into it like into a slab (decode
+ * reads experts by address), slab growth stays at the base budget, and a
+ * prefill that needs the buffers back evicts the zone's entries first. The
+ * memory plan already reserves two staging layers, so decode stays within it.
+ * DS4_METAL_DISABLE_STREAMING_EXPERT_ZONE turns it off. */
+#define DS4_STREAM_EXPERT_ZONE_BUFFERS 2u
+static struct {
+    __strong id<MTLBuffer> buf[DS4_STREAM_EXPERT_ZONE_BUFFERS];
+    uint64_t slot_bytes;
+    uint32_t slots_per_buf;
+    uint32_t capacity;
+    uint32_t free_slots[DS4_STREAM_EXPERT_ZONE_BUFFERS * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint32_t n_free;
+    int active;
+} g_stream_expert_zone;
+
+static int ds4_gpu_stream_expert_zone_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ZONE") == NULL;
+    return enabled && g_ssd_streaming_mode;
+}
+
+static int ds4_gpu_stream_expert_zone_slot(id<MTLBuffer> buffer, NSUInteger inner, uint32_t *slot) {
+    int found = 0;
+    const uint64_t slot_bytes = g_stream_expert_zone.slot_bytes;
+    if (g_stream_expert_zone.active && buffer && slot_bytes != 0 && (uint64_t)inner % slot_bytes == 0) {
+        const uint64_t local = (uint64_t)inner / slot_bytes;
+        for (uint32_t b = 0; b < DS4_STREAM_EXPERT_ZONE_BUFFERS && !found; b++) {
+            if (g_stream_expert_zone.buf[b] == buffer && local < g_stream_expert_zone.slots_per_buf) {
+                *slot = b * g_stream_expert_zone.slots_per_buf + (uint32_t)local;
+                found = 1;
+            }
+        }
+    }
+    return found;
+}
+
+static int ds4_gpu_stream_expert_zone_take(
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        __strong id<MTLBuffer> *gate_buf,
+        __strong id<MTLBuffer> *up_buf,
+        __strong id<MTLBuffer> *down_buf,
+        NSUInteger *gate_inner,
+        NSUInteger *up_inner,
+        NSUInteger *down_inner) {
+    int ok = 0;
+    if (g_stream_expert_zone.active && g_stream_expert_zone.n_free != 0 &&
+        2ull * gate_expert_bytes + down_expert_bytes == g_stream_expert_zone.slot_bytes) {
+        const uint32_t slot = g_stream_expert_zone.free_slots[--g_stream_expert_zone.n_free];
+        id<MTLBuffer> b = g_stream_expert_zone.buf[slot / g_stream_expert_zone.slots_per_buf];
+        const uint64_t base = (uint64_t)(slot % g_stream_expert_zone.slots_per_buf) * g_stream_expert_zone.slot_bytes;
+        *gate_buf = b;
+        *up_buf = b;
+        *down_buf = b;
+        *gate_inner = (NSUInteger)base;
+        *up_inner = (NSUInteger)(base + gate_expert_bytes);
+        *down_inner = (NSUInteger)(base + 2ull * gate_expert_bytes);
+        ok = 1;
+    }
+    return ok;
+}
+
+static void ds4_gpu_stream_expert_zone_maybe_activate(void);
+
+/* Slabs grow only up to the budget without the zone. */
+static uint32_t ds4_gpu_stream_expert_slab_budget(uint32_t budget) {
+    const uint32_t zone = g_stream_expert_zone.active ? g_stream_expert_zone.capacity : 0u;
+    return budget > zone ? budget - zone : budget;
+}
+
 static int ds4_gpu_stream_expert_slab_slot_range(
         uint32_t slot,
         uint32_t *slab_index,
@@ -14497,7 +14570,7 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
             DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
             return 0;
         }
-        const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+        const uint32_t budget = ds4_gpu_stream_expert_slab_budget(ds4_gpu_stream_expert_cache_configured_budget());
         if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
             return 0;
         }
@@ -15524,6 +15597,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
                                                e->down_abs_offset,
                                                e->down_expert_bytes);
     ds4_gpu_stream_expert_cache_zero_addr_slot(layer, expert);
+    uint32_t zone_slot = 0;
     if (reuse) {
         reuse->gate_buffer = e->gate_buffer;
         reuse->up_buffer = e->up_buffer;
@@ -15531,6 +15605,8 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
         reuse->gate_inner = e->gate_inner;
         reuse->up_inner = e->up_inner;
         reuse->down_inner = e->down_inner;
+    } else if (ds4_gpu_stream_expert_zone_slot(e->gate_buffer, e->gate_inner, &zone_slot)) {
+        g_stream_expert_zone.free_slots[g_stream_expert_zone.n_free++] = zone_slot;
     } else if (e->slab_backed && recycle_slab_slot) {
         ds4_gpu_stream_expert_slab_push_free_slot(e->slab_slot);
     } else if (!e->slab_backed) {
@@ -16239,6 +16315,7 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
     *gate_inner = 0;
     *up_inner = 0;
     *down_inner = 0;
+    ds4_gpu_stream_expert_zone_maybe_activate();
 
     ds4_gpu_stream_expert_reusable_buffers reuse = { nil, nil, nil, 0, 0, 0 };
     ds4_gpu_stream_expert_cache_entry *e =
@@ -16301,6 +16378,11 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
             gate_expert_bytes * 2ull + down_expert_bytes >
                 (uint64_t)NSUIntegerMax) {
             return 0;
+        }
+        if (ds4_gpu_stream_expert_zone_take(gate_expert_bytes, down_expert_bytes,
+                                            gate_buf, up_buf, down_buf,
+                                            gate_inner, up_inner, down_inner)) {
+            return 1;
         }
         if (g_stream_expert_cache_mlock_budget_cap != 0) {
             return ds4_gpu_stream_expert_cache_take_capped_reusable(
@@ -18401,9 +18483,103 @@ typedef struct {
     double      read_ms;
     uint64_t    read_bytes;
     int         hold;
+    uint64_t    slot_bytes;
+    uint32_t    n_experts;
 } ds4_gpu_prefill_stage;
 
 static ds4_gpu_prefill_stage g_prefill_stage = { .layer = { -1, -1, -1 } };
+
+/* Lend the kept staging buffers to the expert cache until the next prefill. */
+static void ds4_gpu_stream_expert_zone_activate(void) {
+    const ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    const uint64_t buf_bytes = s->slot_bytes * s->n_experts;
+    int ready = ds4_gpu_stream_expert_zone_enabled() && !g_stream_expert_zone.active &&
+                g_stream_expert_cache_budget_override != 0 && buf_bytes != 0;
+    for (uint32_t b = 0; ready && b < DS4_STREAM_EXPERT_ZONE_BUFFERS; b++)
+        ready = s->buf[b] != nil && [s->buf[b] length] >= buf_bytes;
+    if (ready) {
+        static int announced;
+        for (uint32_t b = 0; b < DS4_STREAM_EXPERT_ZONE_BUFFERS; b++) g_stream_expert_zone.buf[b] = s->buf[b];
+        g_stream_expert_zone.slot_bytes = s->slot_bytes;
+        g_stream_expert_zone.slots_per_buf = s->n_experts;
+        g_stream_expert_zone.capacity = DS4_STREAM_EXPERT_ZONE_BUFFERS * s->n_experts;
+        g_stream_expert_zone.n_free = 0;
+        for (uint32_t slot = g_stream_expert_zone.capacity; slot > 0; slot--)
+            g_stream_expert_zone.free_slots[g_stream_expert_zone.n_free++] = slot - 1u;
+        g_stream_expert_cache_budget_override += g_stream_expert_zone.capacity;
+        g_stream_expert_zone.active = 1;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: Metal streaming expert zone: %u slots (%.2f GiB) of prefill staging lent "
+                    "to the expert cache between prefills\n", g_stream_expert_zone.capacity,
+                    ds4_gpu_gib(buf_bytes * DS4_STREAM_EXPERT_ZONE_BUFFERS));
+        }
+    }
+}
+
+/* GLM ends staging before the chunk's last batch is committed, so the release
+ * cannot lend the zone then; the first expert load after the ring went idle
+ * and its batches completed does. */
+static void ds4_gpu_stream_expert_zone_maybe_activate(void) {
+    ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    int idle = ds4_gpu_stream_expert_zone_enabled() && !g_stream_expert_zone.active;
+    for (uint32_t r = 0; idle && r < DS4_PREFILL_STAGE_SLOTS; r++) idle = s->layer[r] < 0 && !s->pending[r];
+    for (uint32_t r = 0; idle && r < DS4_STREAM_EXPERT_ZONE_BUFFERS; r++)
+        idle = !s->last_cb[r] || s->last_cb[r].status == MTLCommandBufferStatusCompleted;
+    /* A session resumed from a KV checkpoint never staged a prefill: allocate
+     * the zone's ring slots here, within the same planned reserve. */
+    const uint64_t buf_bytes = s->slot_bytes * s->n_experts;
+    for (uint32_t r = 0; idle && buf_bytes != 0 && r < DS4_STREAM_EXPERT_ZONE_BUFFERS; r++) {
+        if (!s->buf[r] || [s->buf[r] length] < buf_bytes) {
+            s->buf[r] = [g_device newBufferWithLength:(NSUInteger)buf_bytes options:MTLResourceStorageModeShared];
+            for (uint32_t k = 0; k < 3; k++)
+                s->addr[r][k] = [g_device newBufferWithLength:DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t)
+                                                      options:MTLResourceStorageModeShared];
+            idle = s->buf[r] && s->addr[r][0] && s->addr[r][1] && s->addr[r][2];
+            if (!idle) {
+                fprintf(stderr, "ds4: streaming expert zone could not allocate %.2f GiB\n", ds4_gpu_gib(buf_bytes));
+                s->buf[r] = nil;
+            }
+        }
+    }
+    if (idle) {
+        for (uint32_t r = 0; r < DS4_STREAM_EXPERT_ZONE_BUFFERS; r++) s->last_cb[r] = nil;
+        ds4_gpu_stream_expert_zone_activate();
+    }
+}
+
+void ds4_gpu_stream_expert_zone_configure(uint64_t slot_bytes, uint32_t n_experts) {
+    if (g_prefill_stage.slot_bytes == 0 && n_experts <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        g_prefill_stage.slot_bytes = slot_bytes;
+        g_prefill_stage.n_experts = n_experts;
+    }
+}
+
+/* Take the zone back for prefill staging: its entries go first. */
+static int ds4_gpu_stream_expert_zone_deactivate(void) {
+    int ok = 1;
+    if (g_stream_expert_zone.active) {
+        ok = ds4_gpu_stream_expert_cache_wait_inflight("streaming expert zone return");
+        for (uint32_t layer = 0; ok && layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+            for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+                const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+                uint32_t slot = 0;
+                if (e->valid && ds4_gpu_stream_expert_zone_slot(e->gate_buffer, e->gate_inner, &slot))
+                    ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+            }
+        }
+        if (ok) {
+            g_stream_expert_cache_budget_override -= g_stream_expert_zone.capacity;
+            g_stream_expert_zone.active = 0;
+            g_stream_expert_zone.capacity = 0;
+            g_stream_expert_zone.n_free = 0;
+            for (uint32_t b = 0; b < DS4_STREAM_EXPERT_ZONE_BUFFERS; b++) g_stream_expert_zone.buf[b] = nil;
+        } else {
+            fprintf(stderr, "ds4: streaming expert zone could not be taken back for prefill staging\n");
+        }
+    }
+    return ok;
+}
 
 int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
@@ -18412,6 +18588,7 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
         t->gate_expert_bytes == 0 || t->down_expert_bytes == 0) {
         return 0;
     }
+    if (!ds4_gpu_stream_expert_zone_deactivate()) return 0;
     const uint32_t ring = t->layer % DS4_PREFILL_STAGE_SLOTS;
     const uint32_t prev = (ring + DS4_PREFILL_STAGE_SLOTS - 1u) % DS4_PREFILL_STAGE_SLOTS;
     if (s->pending[prev]) {
@@ -18421,6 +18598,8 @@ int ds4_gpu_prefill_stage_begin(const ds4_gpu_stream_expert_table *t) {
     }
     const uint64_t slot_bytes = 2u * t->gate_expert_bytes + t->down_expert_bytes;
     const uint64_t buf_bytes = slot_bytes * t->n_total_expert;
+    s->slot_bytes = slot_bytes;
+    s->n_experts = t->n_total_expert;
     if (!s->buf[ring] || [s->buf[ring] length] < buf_bytes) {
         s->buf[ring] = [g_device newBufferWithLength:(NSUInteger)buf_bytes
                                              options:MTLResourceStorageModeShared];
@@ -18523,9 +18702,12 @@ int ds4_gpu_prefill_stage_wait(uint32_t layer) {
     return ok;
 }
 
-/* The ring is ~5 GiB; decode must not keep it resident. */
+/* The ring is ~5 GiB. Decode keeps only the slots the expert zone lends to
+ * the cache, which the memory plan's two-layer prefill reserve covers. */
 static void ds4_gpu_prefill_stage_release(void) {
     ds4_gpu_prefill_stage *s = &g_prefill_stage;
+    const int keep_zone = ds4_gpu_stream_expert_zone_enabled();
+    int zone_ready = keep_zone;
     for (uint32_t r = 0; r < DS4_PREFILL_STAGE_SLOTS; r++) {
         /* After a failed encode the last batch may never be committed, and
          * waiting on it would hang; keep its staging buffer alive then. */
@@ -18533,9 +18715,12 @@ static void ds4_gpu_prefill_stage_release(void) {
         {
             if (s->last_cb[r]) [s->last_cb[r] waitUntilCompleted];
             s->last_cb[r] = nil;
-            s->buf[r] = nil;
+            if (!keep_zone || r >= DS4_STREAM_EXPERT_ZONE_BUFFERS) s->buf[r] = nil;
+        } else if (r < DS4_STREAM_EXPERT_ZONE_BUFFERS) {
+            zone_ready = 0;
         }
     }
+    if (zone_ready) ds4_gpu_stream_expert_zone_activate();
 }
 
 /* While held, the ring survives ds4_gpu_prefill_stage_end, so the chunks and
