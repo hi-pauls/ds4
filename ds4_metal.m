@@ -49416,9 +49416,24 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
             const qwen4_moe_args *a = args;
             const bool specialize = qwen4_moe_mv_specialize(a->weight_type);
             const uint32_t values[] = {a->weight_type, a->shared_type, specialize ? a->in_dim : 0u, specialize ? qwen4_moe_mv_rows() : 0u};
-            NSString *key = [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%d",
-                             qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addr ? 1 : 0];
-            pipeline = [g_pipeline_cache objectForKey:key];
+            /* decode looks these up per dispatch: integer keys, no string formatting */
+            static struct { int kernel; uint32_t values[4]; bool addr; id<MTLComputePipelineState> pipeline; } moe_pipes[64];
+            static uint32_t moe_pipe_count;
+            for (uint32_t i = 0; i < moe_pipe_count && !pipeline; i++)
+                if (moe_pipes[i].kernel == kernel && moe_pipes[i].addr == addr &&
+                    memcmp(moe_pipes[i].values, values, sizeof(values)) == 0)
+                    pipeline = moe_pipes[i].pipeline;
+            NSString *key = pipeline ? nil :
+                [NSString stringWithFormat:@"%s_type=%u_shared=%u_dim=%u_rows=%u_addr=%d",
+                 qwen4_kernel_names[kernel], values[0], values[1], values[2], values[3], addr ? 1 : 0];
+            if (!pipeline) pipeline = [g_pipeline_cache objectForKey:key];
+            if (pipeline && key && moe_pipe_count < 64u) {
+                moe_pipes[moe_pipe_count].kernel = kernel;
+                memcpy(moe_pipes[moe_pipe_count].values, values, sizeof(values));
+                moe_pipes[moe_pipe_count].addr = addr;
+                moe_pipes[moe_pipe_count].pipeline = pipeline;
+                moe_pipe_count++;
+            }
             if (!pipeline) {
                 MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
                 for (uint32_t i = 0; specialize && i < 4u; i++)

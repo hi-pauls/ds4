@@ -62207,6 +62207,71 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     return ngram_ids != NULL || upload(g->ple_emb, 0, row, (uint64_t)T * E * sizeof(float)) != 0;
 }
 
+#ifdef __APPLE__
+/* A decode step's n-gram rows are uncached disk reads of ~1.2 ms, but the GPU
+ * needs them only at the PLE layer: a worker reads them while the host encodes,
+ * and they land in ple_emb before the first submission holding that layer.
+ * The worker writes into the caller's frame, so every exit waits for it. */
+enum { QWEN4_ASYNC_NGRAM_TOKENS = 4, QWEN4_ASYNC_NGRAM_EMBD = 2560 };
+typedef struct {
+    const ds4_model *model;
+    uint32_t ids[QWEN4_ASYNC_NGRAM_TOKENS * DS4_MAX_PLE_HEADS];
+    size_t count;
+    float rows[QWEN4_ASYNC_NGRAM_TOKENS * QWEN4_ASYNC_NGRAM_EMBD];
+    bool ok;
+    int error;
+    dispatch_semaphore_t done;
+} qwen4_async_ngrams;
+
+static void qwen4_async_ngrams_run(void *context) {
+    qwen4_async_ngrams *job = context;
+    job->ok = qwen4_ngram_read(job->model, job->ids, job->count, job->rows);
+    job->error = job->ok ? 0 : errno;
+    dispatch_semaphore_signal(job->done);
+}
+
+static void qwen4_async_ngrams_drain(qwen4_async_ngrams *job) {
+    if (job->model) {
+        dispatch_semaphore_wait(job->done, DISPATCH_TIME_FOREVER);
+        dispatch_release(job->done);
+        job->model = NULL;
+    }
+}
+
+static bool qwen4_async_ngrams_finish(qwen4_async_ngrams *job, ds4_qwen4_gpu_graph *g, uint32_t T) {
+    bool ok = job->model != NULL;
+    qwen4_async_ngrams_drain(job);
+    if (ok && !job->ok) {
+        fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(job->error));
+        ok = false;
+    }
+    if (ok) ok = ds4_gpu_tensor_write(g->ple_emb, 0, job->rows, (uint64_t)T * DS4_N_EMBD * sizeof(float)) != 0;
+    return ok;
+}
+#endif
+
+/* Submit the layers encoded so far; a pending n-gram read lands first once the
+ * PLE layer is among them. */
+static bool qwen4_graph_flush_layer(ds4_qwen4_gpu_graph *g, uint32_t T, uint32_t il, void *ngram_job) {
+    bool ok = true;
+#ifdef __APPLE__
+    qwen4_async_ngrams *job = ngram_job;
+    if (job && job->model && il >= DS4_N_PLE_LAYER) ok = qwen4_async_ngrams_finish(job, g, T);
+#else
+    (void)g; (void)T; (void)il; (void)ngram_job;
+#endif
+    return ok && ds4_gpu_flush_commands() != 0;
+}
+
+/* Whether the layers up to il go out now: at flush_layer, at second (the layer
+ * after a deferred n-gram read), and every `every` layers after the later one. */
+static bool qwen4_flush_here(uint32_t il, uint32_t flush_layer, uint32_t second, uint32_t every, uint32_t n_trunk) {
+    const uint32_t done = il + 1u;
+    const uint32_t base = second > flush_layer ? second : flush_layer;
+    return done == flush_layer || (second && done == second) ||
+           (base && every && done > base && done < n_trunk && (done - base) % every == 0);
+}
+
 /* Read the n-gram rows of the chunk the caller named next, continuing the
  * PLE history from the state this chunk leaves behind. A failed read only
  * loses the prefetch. */
@@ -62278,18 +62343,46 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
      * the device has the layers before it, the input writes keep stream order
      * instead of waiting, and the hc combine rides on the output projections. */
     bool fused = false;
+    uint32_t second_flush = 0u, flush_every = 0u;
+    void *ngram_job = NULL;
     if (!qwen4_graph_enter_tier(g, g->n_tiers ? g->layer_tier[0] : 0, 0u, T, false)) return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     fused = qwen4_decode_fuse_on(g, T);
     uint32_t ngram_ids[DS4_MAX_PLE_HEADS];
     bool ngrams_pending = fused;
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T, fused ? ngram_ids : NULL)) return false;
+#elif defined(__APPLE__)
+    /* Decode steps read their n-gram rows behind the encoding: layers before
+     * the PLE layer go out at once, the PLE layer when its rows are in, the rest
+     * every four layers so the GPU never waits for the end of encoding. */
+    qwen4_async_ngrams async_job;
+    async_job.model = NULL;
+    const bool use_async = flush_layer != 0u && T <= QWEN4_ASYNC_NGRAM_TOKENS &&
+                           DS4_N_EMBD <= QWEN4_ASYNC_NGRAM_EMBD && DS4_N_PLE_HEADS <= DS4_MAX_PLE_HEADS &&
+                           DS4_N_PLE_LAYER >= 1u && DS4_N_PLE_LAYER + 1u < n_trunk;
+    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T, use_async ? async_job.ids : NULL)) return false;
+    if (use_async) {
+        async_job.model = m;
+        async_job.count = (size_t)T * DS4_N_PLE_HEADS;
+        async_job.done = dispatch_semaphore_create(0);
+        dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &async_job,
+                         qwen4_async_ngrams_run);
+        ngram_job = &async_job;
+        flush_layer = DS4_N_PLE_LAYER;
+        second_flush = DS4_N_PLE_LAYER + 1u;
+        flush_every = 4u;
+    }
 #else
     if (!qwen4_graph_stage_inputs(g, m, w, tokens, T, NULL)) return false;
 #endif
     const double t1 = timing ? now_sec() : 0.0;
-    if (!glm_graph_begin_commands_if_needed()) return false;
-    bool ok = true;
+    bool ok = glm_graph_begin_commands_if_needed() != 0;
+#ifdef __APPLE__
+    if (ngram_job && !ok) qwen4_async_ngrams_drain(ngram_job);
+    /* matvec pipelines by hashed name instead of a formatted key per dispatch */
+    const int previous_fast_lookup = ok ? ds4_gpu_set_decode_pipeline_fast_lookup(1) : 0;
+#endif
+    if (!ok) return false;
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only); 3 does
      * the same for single decoded tokens. */
@@ -62349,7 +62442,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             if (!ok) fprintf(stderr, "ds4: Qwen3.8 forward failed in layer %u (replayed mixer and recurrence)\n", il);
             if (ok) ok = qwen4_graph_moe(g, m, l, T);
             if (ok) ok = qwen4_graph_apply_steering_ffn(g, il, T);
-            if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
+            if (ok && qwen4_flush_here(il, flush_layer, second_flush, flush_every, n_trunk))
+                ok = qwen4_graph_flush_layer(g, T, il, ngram_job);
             continue;
         }
 #endif
@@ -62402,7 +62496,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         /* Submit this prefix while the host encodes the remaining layers.
          * Flush keeps the same ordered queue and retains pending buffers;
          * end_commands below waits for both batches before inputs are reused. */
-        if (ok && il + 1u == flush_layer) ok = ds4_gpu_flush_commands() != 0;
+        if (ok && qwen4_flush_here(il, flush_layer, second_flush, flush_every, n_trunk))
+            ok = qwen4_graph_flush_layer(g, T, il, ngram_job);
     }
     if (prof_on) {
         fprintf(stderr, "ds4: Qwen3.8 prefill stage ms/chunk (pos=%u T=%u ok=%d): "
@@ -62434,6 +62529,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_gemv(g->logits, m, w->output, g->mixed, 1);
     }
     const double t2 = timing ? now_sec() : 0.0;
+#ifdef __APPLE__
+    if (ngram_job && ((qwen4_async_ngrams *)ngram_job)->model) {
+        if (ok) ok = qwen4_async_ngrams_finish(ngram_job, g, T);
+        else qwen4_async_ngrams_drain(ngram_job);
+    }
+#endif
     /* Submit everything first: the next chunk's table reads take ~175 ms of
      * SSD time per 1024 tokens that otherwise leave the GPU idle. */
     if (ok && T > 1u && g->pf_next_T != 0u && ds4_gpu_flush_commands())
@@ -62465,6 +62566,9 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         g->snap2_valid = ok;
         g->snap_after_second = false;
     }
+#ifdef __APPLE__
+    (void)ds4_gpu_set_decode_pipeline_fast_lookup(previous_fast_lookup);
+#endif
     return ok;
 }
 
