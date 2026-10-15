@@ -17552,6 +17552,16 @@ static bool client_recv_errno_disconnected(int err) {
     return err != EINTR && err != EAGAIN && err != EWOULDBLOCK;
 }
 
+static bool address_is_loopback(const struct sockaddr_in *peer) {
+    return peer->sin_family == AF_INET && (ntohl(peer->sin_addr.s_addr) >> 24) == 127u;
+}
+
+static bool client_is_loopback(int fd) {
+    struct sockaddr_in peer;
+    socklen_t len = sizeof(peer);
+    return getpeername(fd, (struct sockaddr *)&peer, &len) == 0 && address_is_loopback(&peer);
+}
+
 /* The request body has already been consumed and this one-request server sends
  * Connection: close, so EOF is cancellation. Discard unsupported pipelined
  * bytes nonblockingly: otherwise they can hide the FIN behind readable data. */
@@ -17667,6 +17677,20 @@ static void *client_main(void *arg) {
     }
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    /* A stop that writes the live sessions to the disk cache, as SIGTERM does,
+     * for a supervisor that cannot signal: under Windows a service has no
+     * console to send a Ctrl event through, and taskkill /F loses every
+     * conversation's tail past its last stored boundary. */
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/shutdown")) {
+        if (client_is_loopback(fd)) {
+            http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"stopping\"}");
+            stop_signal_handler(SIGTERM);
+        } else {
+            http_error(fd, s->enable_cors, 403, "shutdown is accepted from the loopback address only");
+        }
         http_request_free(&hr);
         goto done;
     }
@@ -25074,6 +25098,17 @@ static void test_kv_cache_file_size_must_fit_budget(void) {
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
 }
 
+static void test_shutdown_accepts_loopback_peers_only(void) {
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    TEST_ASSERT(inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr) == 1 && address_is_loopback(&peer));
+    TEST_ASSERT(inet_pton(AF_INET, "127.8.9.10", &peer.sin_addr) == 1 && address_is_loopback(&peer));
+    TEST_ASSERT(inet_pton(AF_INET, "192.168.1.2", &peer.sin_addr) == 1 && !address_is_loopback(&peer));
+    TEST_ASSERT(inet_pton(AF_INET, "128.0.0.1", &peer.sin_addr) == 1 && !address_is_loopback(&peer));
+    peer.sin_family = AF_INET6;
+    TEST_ASSERT(inet_pton(AF_INET, "127.0.0.1", &peer.sin_addr) == 1 && !address_is_loopback(&peer));
+}
+
 static void test_sha1_bytes_hex_matches_known_vector(void) {
     char sha[41];
     sha1_bytes_hex("abc", 3, sha);
@@ -26544,6 +26579,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
+    test_shutdown_accepts_loopback_peers_only();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
