@@ -64615,6 +64615,9 @@ struct ds4_session {
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
     uint64_t glm_reserved_graph_bytes;
+    /* position the answer may reach while KV tail rows are lent to the
+     * streamed expert cache; 0 when nothing is lent */
+    uint32_t kv_zone_limit;
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_gpu_graph ds41_graph;
@@ -64623,9 +64626,6 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
-    /* position the answer may reach while KV tail rows are lent to the
-     * streamed expert cache; 0 when nothing is lent */
-    uint32_t kv_zone_limit;
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
