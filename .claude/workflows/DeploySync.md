@@ -22,6 +22,16 @@ local changes.
    `.3`) and posts the tag in the comms `dwarfstar` room. Both machines
    switch to the tag and rebuild.
 
+## What a deployed build runs with
+
+Every measuring switch in ds4 (profiles, traces, timing, statistics, verify
+checks) is opt-in through a `DS4_*` environment variable: `*_STATS`,
+`*_TRACE`, `*_TIMING`, `*_PROFILE`, `*_VERIFY`, `*_DEBUG`, `*_ABLATE`. The
+served entries in SpawnAI's `models.yaml` set none of them; check before a
+switch (`grep -nE 'DS4_[A-Z0-9_]*(STATS|TRACE|TIMING|PROFILE|VERIFY|DEBUG|ABLATE)' models.yaml`
+finds nothing). Builds use the Makefiles' release flags (`-O3`, fast math,
+no CUDA `-G` or `-lineinfo`); `-g` only adds symbols.
+
 ## Building on Hel
 
 - Build in a worktree the live server does not run from. SpawnAI's
