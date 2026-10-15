@@ -63017,10 +63017,11 @@ static int generate_qwen4_metal_argmax(
 #define DS4_KOLIBRI1_SCRATCH_COUNT 13
 
 typedef struct ds4_kolibri1_gpu_graph {
-    uint32_t ctx_cap;
+    uint32_t ctx_cap;    /* rows the full-attention K/V caches hold now */
+    uint32_t ctx_max;    /* the session's context; ctx_cap grows to it (DS4_KOLIBRI1_KV_GROW) */
     uint32_t pos;
     uint32_t cap_tokens;
-    uint32_t slide_rows; /* sliding K/V ring rows: min(ctx, window + chunk) */
+    uint32_t slide_rows; /* sliding K/V ring rows: min(ctx_max, window + chunk) */
     bool owns_scratch;   /* false when the scratch is borrowed from the engine arena */
     ds4_gpu_tensor *R, *x, *blk, *attn_o, *moe_out, *logits;
     ds4_gpu_tensor *q, *kv;       /* [T][H*D] and [T][2*Hkv*D] projections */
@@ -63141,6 +63142,7 @@ static void kolibri1_graph_free(ds4_kolibri1_gpu_graph *g) {
 static void kolibri1_graph_transfer_scratch(ds4_kolibri1_gpu_graph *dst, ds4_kolibri1_gpu_graph *src) {
     memset(dst, 0, sizeof(*dst));
     dst->ctx_cap = src->ctx_cap;
+    dst->ctx_max = src->ctx_max;
     dst->cap_tokens = src->cap_tokens;
     dst->slide_rows = src->slide_rows;
 #define DS4_KOLIBRI1_SCRATCH_TAKE(field_) dst->field_ = src->field_;
@@ -63194,6 +63196,24 @@ static bool kolibri1_graph_alloc_scratch(ds4_kolibri1_gpu_graph *g, int tier) {
     return ok;
 }
 
+/* DS4_KOLIBRI1_KV_GROW=1: the full-attention K/V caches start at 8192 rows
+ * and double with the session instead of holding its whole context from the
+ * start, so memory a short conversation leaves unused goes to the streamed
+ * expert cache, which takes what is free on a device.  Doubling keeps the
+ * times a growing conversation takes that memory back to four at 131072. */
+enum { kolibri1_kv_grow_rows = 8192 };
+/* what a device keeps free after a step, as the expert cache's own reserve */
+static const uint64_t kolibri1_kv_grow_margin = 512ull << 20;
+
+static bool kolibri1_kv_grow_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *env = getenv("DS4_KOLIBRI1_KV_GROW");
+        on = env && atoi(env) != 0;
+    }
+    return on != 0;
+}
+
 /* placement is the engine's layer placement (entry il + 1 per layer, the
  * output head last) when the layers are spread over n_gpus CUDA devices, and
  * NULL for one device. */
@@ -63204,7 +63224,8 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
     memset(g, 0, sizeof(*g));
     if (!kolibri1_graph_weights_supported(w)) return false;
     const uint64_t E = DS4_N_EMBD;
-    g->ctx_cap = ctx_cap;
+    g->ctx_max = ctx_cap;
+    g->ctx_cap = kolibri1_kv_grow_on() && ctx_cap > kolibri1_kv_grow_rows ? kolibri1_kv_grow_rows : ctx_cap;
     g->cap_tokens = cap_tokens;
     if (placement) {
         if (shared || n_gpus < 2 || n_gpus > DS4_MAX_GPUS) return false;
@@ -63262,7 +63283,7 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         /* Full layers keep one row per absolute position; sliding layers a
          * ring of window + chunk rows (see slide_rows). */
-        const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? ctx_cap : g->slide_rows;
+        const uint32_t rows = ds4_kolibri1_layer_is_full(il) ? g->ctx_cap : g->slide_rows;
         const int tier = g->n_tiers ? g->layer_tier[il] : -1;
         g->layer_k_cache[il] = kolibri1_graph_alloc_bytes(tier, (uint64_t)rows * kolibri1_kv_pos_bytes(true));
         g->layer_v_cache[il] = kolibri1_graph_alloc_bytes(tier, (uint64_t)rows * kolibri1_kv_pos_bytes(true));
@@ -63279,6 +63300,62 @@ static bool kolibri1_graph_alloc(ds4_kolibri1_gpu_graph *g, const ds4_weights *w
 static void kolibri1_graph_reset(ds4_kolibri1_gpu_graph *g) {
     if (!g) return;
     g->pos = 0;
+}
+
+/* Moves one full-attention layer's K/V to rows rows, keeping the first pos.
+ * A device without room for the new buffers next to the old ones gives up its
+ * streamed expert cache, which sizes itself again from what is free when it
+ * is next used.  Free memory is checked up front because under Windows WDDM
+ * an allocation past the card does not fail: it pages device memory out to
+ * RAM, and decode drops from ~30 to ~5 t/s. */
+static bool kolibri1_graph_grow_layer(ds4_kolibri1_gpu_graph *g, uint32_t il, uint32_t rows) {
+    const int tier = g->n_tiers ? g->layer_tier[il] : -1;
+    const uint64_t row = kolibri1_kv_pos_bytes(true), keep = (uint64_t)g->pos * row;
+    const uint64_t bytes = (uint64_t)rows * row;
+    ds4_gpu_tensor **cache[2] = { &g->layer_k_cache[il], &g->layer_v_cache[il] };
+#if defined(DS4_HAS_QWEN4_MOE_STREAM) && !defined(__APPLE__)
+    if (ds4_gpu_tier_free_vram(tier >= 0 ? tier : 0) < 2u * bytes + kolibri1_kv_grow_margin) {
+        fprintf(stderr, "ds4: Kolibri-1 context takes device memory back from the expert cache\n");
+        if (tier >= 0) (void)ds4_gpu_set_current_device(tier);
+        ds4_gpu_qwen4_moe_stream_release();
+    }
+#endif
+    ds4_gpu_tensor *grown[2] = { kolibri1_graph_alloc_bytes(tier, bytes), kolibri1_graph_alloc_bytes(tier, bytes) };
+    bool ok = grown[0] && grown[1];
+    for (int k = 0; k < 2 && ok; k++) ok = keep == 0 || ds4_gpu_tensor_copy(grown[k], 0, *cache[k], 0, keep);
+    /* the copies read the old buffers: finish them before letting those go */
+    if (tier >= 0) ok = ds4_gpu_set_current_device(tier) == 0 && ok;
+    ok = ds4_gpu_synchronize() != 0 && ok;
+    if (tier >= 0) ok = ds4_gpu_set_current_device(g->active_tier) == 0 && ok;
+    for (int k = 0; k < 2; k++) {
+        ds4_gpu_tensor_free(ok ? *cache[k] : grown[k]);
+        if (ok) *cache[k] = grown[k];
+    }
+    return ok;
+}
+
+/* Makes room for need rows, doubling up to the session's context.  Without
+ * DS4_KOLIBRI1_KV_GROW the caches already hold all of it. */
+static bool kolibri1_graph_reserve(ds4_kolibri1_gpu_graph *g, uint32_t need) {
+    bool ok = need <= g->ctx_cap;
+    if (!ok && need <= g->ctx_max) {
+        uint64_t want = g->ctx_cap;
+        while (want < need) want *= 2u;
+        if (want > g->ctx_max) want = g->ctx_max;
+        const bool caller_batch = ds4_gpu_begin_commands() == 0;
+        ok = true;
+        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++)
+            if (ds4_kolibri1_layer_is_full(il)) ok = kolibri1_graph_grow_layer(g, il, (uint32_t)want);
+        if (caller_batch) (void)ds4_gpu_begin_commands();
+        else (void)ds4_gpu_end_commands();
+        if (ok) {
+            fprintf(stderr, "ds4: Kolibri-1 session context %u -> %u rows\n", g->ctx_cap, (uint32_t)want);
+            g->ctx_cap = (uint32_t)want;
+        } else {
+            fprintf(stderr, "ds4: Kolibri-1 session context could not grow to %u rows\n", need);
+        }
+    }
+    return ok;
 }
 
 /* One dense projection of the same weight for n_tok rows. */
@@ -63542,7 +63619,7 @@ static bool kolibri1_graph_enter_tier(ds4_kolibri1_gpu_graph *g, int tier, uint3
  * pre-norm reads R again — the exact CPU reference order. */
 static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                           const int *tokens, uint32_t T, float *logits_out) {
-    if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
+    if (!g || T == 0 || T > g->cap_tokens || !kolibri1_graph_reserve(g, g->pos + T)) return false;
     for (uint32_t t = 0; t < T; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
             fprintf(stderr, "ds4: Kolibri-1 token id %d is outside the vocabulary\n", tokens[t]);
@@ -67081,7 +67158,7 @@ static uint64_t kolibri1_payload_body_bytes(const ds4_session *s, uint32_t token
     uint32_t slide_rows = DS4_N_SWA;
 #ifdef DS4_HAS_KOLIBRI1_GPU
     if (ds4_session_kolibri_uses_gpu(s)) {
-        ctx_rows = s->kolibri_gpu.ctx_cap;
+        ctx_rows = s->kolibri_gpu.ctx_max;
         slide_rows = s->kolibri_gpu.slide_rows;
     }
 #endif
@@ -67166,7 +67243,7 @@ static int kolibri1_save_payload(ds4_session *s, FILE *fp, char *err, size_t err
             payload_set_err(err, errlen, "failed to synchronize accelerator before Kolibri-1 snapshot");
             return 1;
         }
-        ctx_rows = s->kolibri_gpu.ctx_cap;
+        ctx_rows = s->kolibri_gpu.ctx_max;
         slide_rows = s->kolibri_gpu.slide_rows;
         saved_slide = slide_rows;
 #else
@@ -67264,6 +67341,10 @@ static int kolibri1_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             kolibri1_payload_live_rows(false, saved_tokens, saved_ctx_rows, saved_slide) >
                 g->slide_rows) {
             payload_set_err(err, errlen, "KV checkpoint Kolibri-1 ring layout does not match current runtime");
+            return 1;
+        }
+        if (!kolibri1_graph_reserve(&s->kolibri_gpu, saved_tokens)) {
+            payload_set_err(err, errlen, "no device memory for the Kolibri-1 context of the KV checkpoint");
             return 1;
         }
 #else
@@ -84456,7 +84537,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (errlen) snprintf(err, errlen, "Kolibri-1 graph is not initialized");
             return 1;
         }
-        if (s->kolibri_gpu.pos >= s->kolibri_gpu.ctx_cap) {
+        if (s->kolibri_gpu.pos >= s->kolibri_gpu.ctx_max) {
             if (errlen) snprintf(err, errlen, "context is full");
             return 1;
         }
