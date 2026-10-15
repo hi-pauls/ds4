@@ -63608,6 +63608,12 @@ static bool kolibri1_graph_forward_tokens(ds4_kolibri1_gpu_graph *g, const ds4_m
                                                              DS4_N_EMBD, T, DS4_RMS_EPS) &&
                          ds4_gpu_add_tensor(g->R, g->R, g->x, T * DS4_N_EMBD);
         }
+#ifdef __APPLE__
+        /* One submission per step left the GPU idle while the host encoded all
+         * 50 layers (~19% of a decode step): start after layer 0, then every
+         * four layers. The queue keeps layer order. */
+        if (ok && T <= 4u && il + 1u < DS4_N_LAYER && il % 4u == 0u) ok = ds4_gpu_flush_commands() != 0;
+#endif
     }
     /* Final norm and head on the last row; callers read one logit row. */
     if (ok) ok = kolibri1_graph_enter_tier(g, g->head_tier, T, true);
