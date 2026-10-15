@@ -4087,6 +4087,8 @@ int main(void) {
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 16u, 10u);
     test_moe_types(&arena, 16, 10, 2560, 640, 37, 16u, 10u);
     test_moe_types(&arena, 8, 6, 256, 256, 9, 16u, 10u);
+    test_moe_types(&arena, 16, 8, 2560, 512, 1, 16u, 10u);
+    test_moe_types(&arena, 16, 8, 2560, 512, 2, 16u, 10u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 100, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 10u);
