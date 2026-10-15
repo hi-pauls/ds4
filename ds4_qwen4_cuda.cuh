@@ -886,13 +886,15 @@ template<unsigned TYPE, bool DOWN>
 __global__ void moe_mv_rows(float *out, const float *x, const int *selected, const int *table, int *mapped,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
         unsigned shared_type, unsigned NE, unsigned NT, unsigned NS, unsigned K, unsigned M,
-        uint64_t rb, uint64_t srb, uint64_t estride) {
+        uint64_t rb, uint64_t srb, uint64_t estride, const uint64_t *grid_src, const uint8_t *sign_src) {
     const unsigned row = blockIdx.x * 8 + threadIdx.x / 32, slot = blockIdx.y, t = blockIdx.z;
     __shared__ uint64_t grid_table[TYPE == 16 ? 256 : 1];
     __shared__ uint8_t sign_table[TYPE == 16 ? 128 : 1];
     if (TYPE == 16) {
-        for (unsigned i = threadIdx.x; i < 256; i += blockDim.x) grid_table[i] = cuda_iq2xxs_grid[i];
-        for (unsigned i = threadIdx.x; i < 128; i += blockDim.x) sign_table[i] = cuda_ksigns_iq2xs[i];
+        for (unsigned i = threadIdx.x; i < 256; i += blockDim.x)
+            grid_table[i] = grid_src ? grid_src[i] : cuda_iq2xxs_grid[i];
+        for (unsigned i = threadIdx.x; i < 128; i += blockDim.x)
+            sign_table[i] = sign_src ? sign_src[i] : cuda_ksigns_iq2xs[i];
         __syncthreads();
     }
     if (row >= M) return;
@@ -950,6 +952,30 @@ __global__ void keep_awake(unsigned iterations, unsigned *sink) {
     if (!threadIdx.x) *sink = v;
 }
 
+/* The IQ2_XXS grid and sign tables at their global addresses, per device.
+ * moe_mv_rows copies them to shared memory first: read as __constant__, the
+ * 32 different entries a warp asks for are served one after another, which
+ * cost the IQ2 expert rows ~2 us a call.  NULL leaves the kernel on the constants. */
+struct iq2_tables { const uint64_t *grid; const uint8_t *signs; };
+
+static iq2_tables iq2_tables_global(void) {
+    static iq2_tables cached[DS4_MAX_GPUS];
+    static bool looked[DS4_MAX_GPUS];
+    iq2_tables tables = { NULL, NULL };
+    int device = -1;
+    if (cudaGetDevice(&device) == cudaSuccess && device >= 0 && device < DS4_MAX_GPUS) {
+        if (!looked[device]) {
+            void *grid = NULL, *signs = NULL;
+            if (cudaGetSymbolAddress(&grid, cuda_iq2xxs_grid) == cudaSuccess &&
+                cudaGetSymbolAddress(&signs, cuda_ksigns_iq2xs) == cudaSuccess)
+                cached[device] = { (const uint64_t *)grid, (const uint8_t *)signs };
+            looked[device] = true;
+        }
+        tables = cached[device];
+    }
+    return tables;
+}
+
 static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         const char *w0, const char *w1, const char *s0, const char *s1,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down,
@@ -961,7 +987,8 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const uint64_t es = expert_stride ? expert_stride : (uint64_t)M * rb;
     const dim3 rows((M + 7) / 8, NS + (st != UINT_MAX), T);
-#define QWEN_MOE_ARGS out,x,sel,table,mapped,w0,w1,s0,s1,st,NE,NT,NS,K,M,rb,srb,es
+    const iq2_tables iq2 = type == 16 ? iq2_tables_global() : iq2_tables{ NULL, NULL };
+#define QWEN_MOE_ARGS out,x,sel,table,mapped,w0,w1,s0,s1,st,NE,NT,NS,K,M,rb,srb,es,iq2.grid,iq2.signs
 #define QWEN_MOE(TYPE) case TYPE: \
     if (down) moe_mv_rows<TYPE, true><<<rows,256,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
     else moe_mv_rows<TYPE, false><<<rows,256,0,cuda_decode_stream()>>>(QWEN_MOE_ARGS); \
