@@ -64623,6 +64623,9 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
+    /* position the answer may reach while KV tail rows are lent to the
+     * streamed expert cache; 0 when nothing is lent */
+    uint32_t kv_zone_limit;
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
@@ -65712,6 +65715,85 @@ static bool ds4_session_kolibri_uses_gpu(const ds4_session *s) {
     return ds4_session_is_kolibri1(s) && !ds4_session_is_cpu(s);
 }
 
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+/* KV rows beyond what the current answer can reach are lent to the streamed
+ * expert cache while it decodes (the expert zone in ds4_metal.m). Rows up to
+ * the limit plus a margin stay KV: attention kernels may read a tile past the
+ * last row and mask it, and expert bytes read as f16 can be NaN. */
+enum { DS4_KV_ZONE_MARGIN_POSITIONS = 2048 };
+
+static uint32_t ds4_session_kv_zone_regions(ds4_session *s, uint64_t reach,
+                                            ds4_gpu_tensor **tensors, uint64_t *start_bytes,
+                                            uint32_t cap) {
+    uint32_t n = 0;
+    if (ds4_session_is_glm(s) && s->glm_graph_ready) {
+        ds4_glm_gpu_graph *g = &s->glm_graph;
+        for (uint32_t il = 0; g->compact_cache_cap != 0 && reach < g->compact_cache_cap && il < DS4_N_LAYER; il++) {
+            ds4_gpu_tensor *caches[2] = { g->layer_kv_lora_cache[il], g->layer_k_rope_cache[il] };
+            for (uint32_t k = 0; k < 2 && n < cap; k++) {
+                if (caches[k]) {
+                    tensors[n] = caches[k];
+                    start_bytes[n] = reach * (ds4_gpu_tensor_bytes(caches[k]) / g->compact_cache_cap);
+                    n++;
+                }
+            }
+        }
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        ds4_gpu_graph *g = &s->graph;
+        for (uint32_t il = 0; il < DS4_N_LAYER && n + 2u <= cap; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            const uint64_t rows = ratio != 0 ? reach / ratio + 2u : 0u;
+            if (ratio != 0 && rows < g->layer_comp_cap[il]) {
+                if (g->layer_attn_comp_cache[il]) {
+                    tensors[n] = g->layer_attn_comp_cache[il];
+                    start_bytes[n++] = rows * metal_graph_attn_comp_cache_row_bytes();
+                }
+                if (ratio == 4 && g->layer_index_comp_cache[il]) {
+                    tensors[n] = g->layer_index_comp_cache[il];
+                    start_bytes[n++] = rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                }
+            }
+        }
+    }
+    return n;
+}
+#endif
+
+void ds4_session_reclaim_kv_tail(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (s && s->kv_zone_limit != 0) {
+        (void)ds4_gpu_stream_expert_kv_zone_clear();
+        s->kv_zone_limit = 0;
+    }
+#else
+    (void)s;
+#endif
+}
+
+void ds4_session_lend_kv_tail(ds4_session *s, int max_new_tokens) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    ds4_session_reclaim_kv_tail(s);
+    if (s && s->engine && s->engine->ssd_streaming && !ds4_session_is_cpu(s) && max_new_tokens > 0) {
+        const uint64_t limit = (uint64_t)s->checkpoint.len + (uint64_t)max_new_tokens;
+        ds4_gpu_tensor *tensors[2u * DS4_MAX_LAYER];
+        uint64_t start_bytes[2u * DS4_MAX_LAYER];
+        const uint32_t n = limit < UINT32_MAX - DS4_KV_ZONE_MARGIN_POSITIONS ?
+            ds4_session_kv_zone_regions(s, limit + DS4_KV_ZONE_MARGIN_POSITIONS, tensors, start_bytes,
+                                        2u * DS4_MAX_LAYER) : 0u;
+        if (n != 0 && ds4_gpu_stream_expert_kv_zone_lend(tensors, start_bytes, n)) s->kv_zone_limit = (uint32_t)limit;
+    }
+#else
+    (void)s;
+    (void)max_new_tokens;
+#endif
+}
+
+/* A step that would pass the reserved answer window takes the KV rows back. */
+static void ds4_session_kv_zone_guard(ds4_session *s, int n_new) {
+    if (s && s->kv_zone_limit != 0 && (uint64_t)s->checkpoint.len + (uint64_t)(n_new > 0 ? n_new : 1) > s->kv_zone_limit)
+        ds4_session_reclaim_kv_tail(s);
+}
+
 #ifndef DS4_NO_GPU
 static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     if (!s) return;
@@ -66158,6 +66240,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
                                    const int *tokens, uint32_t n_tokens,
                                    uint32_t layer_start, uint32_t layer_end,
                                    char *err, size_t errlen) {
+    ds4_session_reclaim_kv_tail(s);
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
@@ -68295,6 +68378,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    ds4_session_reclaim_kv_tail(s);
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -68971,6 +69055,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    ds4_session_reclaim_kv_tail(s);
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -69741,6 +69826,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
+    ds4_session_kv_zone_guard(s, 1);
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) ||
         ds4_session_is_kolibri1(s) || ds4_session_is_qwen4(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
@@ -79838,6 +79924,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    ds4_session_reclaim_kv_tail(s);
     if (s->glm_reserved_graph_bytes && s->engine) {
         s->engine->glm_session_graph_bytes -= s->glm_reserved_graph_bytes;
         s->engine->glm_session_count--;
@@ -81676,6 +81763,7 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    ds4_session_reclaim_kv_tail(s);
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
 #endif
@@ -81870,6 +81958,7 @@ static int session_cpu_prefill_tokens(
 }
 
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    ds4_session_reclaim_kv_tail(s);
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
         return 1;
@@ -84545,6 +84634,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    ds4_session_kv_zone_guard(s, 1);
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {
@@ -91371,6 +91461,7 @@ static int ds4_session_eval_speculative_argmax_impl(
         int *accepted, int accepted_cap,
         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    ds4_session_kv_zone_guard(s, accepted_cap + 1);
     if (!s->checkpoint_valid) {
         payload_set_err(err, errlen, "speculative decode requires a synchronized checkpoint");
         return -1;
@@ -92240,6 +92331,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+    ds4_session_kv_zone_guard(s, accepted_cap + 1);
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,
@@ -92381,6 +92473,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+    ds4_session_reclaim_kv_tail(s);
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);

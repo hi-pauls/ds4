@@ -318,6 +318,8 @@ static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_stream_expert_zone_configure(uint64_t slot_bytes, uint32_t n_experts);
+int ds4_gpu_stream_expert_kv_zone_lend(ds4_gpu_tensor *const *tensors, const uint64_t *start_bytes, uint32_t n);
+int ds4_gpu_stream_expert_kv_zone_clear(void);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 int ds4_gpu_qwen4_conv_stream_rows_tensor(
         ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,

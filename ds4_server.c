@@ -16171,6 +16171,9 @@ decode_again:
     const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
     int stop_token = -1;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    /* One session owns the KV caches, so their rows beyond this answer's reach
+     * can serve as expert cache until the job ends. */
+    if (s->slot_count == 1) ds4_session_lend_kv_tail(slot->session, max_tokens);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
@@ -17074,6 +17077,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
+    ds4_session_reclaim_kv_tail(slot->session);
     ds4_session_set_cancel(slot->session, NULL, NULL);
 
     pthread_mutex_lock(&s->model_mu);

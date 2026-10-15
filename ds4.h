@@ -625,6 +625,11 @@ int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
  * Logits are valid only at the block start; otherwise replay before sampling. */
 int ds4_session_restore_speculative_prefix(ds4_session *s, int pos);
 void ds4_session_invalidate(ds4_session *s);
+/* Lend the KV rows beyond position + max_new_tokens to the streamed expert
+ * cache while this answer decodes (Metal SSD streaming); reclaim takes them
+ * back, as does every operation that may write past that window. */
+void ds4_session_lend_kv_tail(ds4_session *s, int max_new_tokens);
+void ds4_session_reclaim_kv_tail(ds4_session *s);
 /* Try a recent speculative rewind, including valid next-token logits. False
  * means the caller must use ordinary rewind/sync before continuing; a failed
  * restore may have invalidated the checkpoint. */
