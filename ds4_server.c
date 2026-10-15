@@ -57,14 +57,23 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #define DS4_SERVER_MAYBE_UNUSED
 #endif
 
+/* Set once the shutdown has written the sessions and freed everything; the
+ * Windows console handler holds the process open until then. */
+static volatile int g_stop_done = 0;
+
+/* A SIGTERM repeated while the sessions are being written is a supervisor
+ * asking again, not a kill: it changes nothing.  Only a second Ctrl-C ends
+ * the process at once. */
 static void stop_signal_handler(int sig) {
-    (void)sig;
-    if (g_stop_requested) _exit(130);
-    g_stop_requested = 1;
-    if (g_listen_fd >= 0) {
-        int fd = (int)g_listen_fd;
-        g_listen_fd = -1;
-        close(fd);
+    if (g_stop_requested) {
+        if (sig == SIGINT) _exit(130);
+    } else {
+        g_stop_requested = 1;
+        if (g_listen_fd >= 0) {
+            int fd = (int)g_listen_fd;
+            g_listen_fd = -1;
+            close(fd);
+        }
     }
 }
 
@@ -17683,7 +17692,8 @@ static void *client_main(void *arg) {
     /* A stop that writes the live sessions to the disk cache, as SIGTERM does,
      * for a supervisor that cannot signal: under Windows a service has no
      * console to send a Ctrl event through, and taskkill /F loses every
-     * conversation's tail past its last stored boundary. */
+     * conversation's tail past its last stored boundary.  Asked again it only
+     * answers. */
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/shutdown")) {
         if (client_is_loopback(fd)) {
             http_response(fd, s->enable_cors, 200, "application/json", "{\"status\":\"stopping\"}");
@@ -18292,6 +18302,10 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+#ifdef _WIN32
+    if (ds4_w32_console_stop(stop_signal_handler, &g_stop_done) != 0)
+        fprintf(stderr, "ds4-server: no console stop handler; Ctrl-Break or closing the console ends it at once\n");
+#endif
 
     server_config cfg = parse_options(argc, argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
@@ -18707,6 +18721,7 @@ int main(int argc, char **argv) {
         ds4_syscache_free(&s.syscache);
     }
     server_close_resources(&s);
+    g_stop_done = 1;
     return 0;
 }
 #else
@@ -25098,6 +25113,16 @@ static void test_kv_cache_file_size_must_fit_budget(void) {
     TEST_ASSERT(!kv_cache_file_size_fits(&kc, UINT64_MAX, 1, 0, NULL, NULL));
 }
 
+static void test_repeated_sigterm_is_not_a_kill(void) {
+    g_stop_requested = 0;
+    g_listen_fd = -1;
+    stop_signal_handler(SIGTERM);
+    TEST_ASSERT(g_stop_requested == 1);
+    stop_signal_handler(SIGTERM);
+    TEST_ASSERT(g_stop_requested == 1);
+    g_stop_requested = 0;
+}
+
 static void test_shutdown_accepts_loopback_peers_only(void) {
     struct sockaddr_in peer = {0};
     peer.sin_family = AF_INET;
@@ -26580,6 +26605,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_shutdown_accepts_loopback_peers_only();
+    test_repeated_sigterm_is_not_a_kill();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();

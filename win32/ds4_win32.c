@@ -787,6 +787,25 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
     return result;
 }
 
+static void (*console_stop)(int);
+static volatile const int *console_stop_done;
+
+static BOOL WINAPI console_stop_handler(DWORD event) {
+    const BOOL handled = event != CTRL_C_EVENT && console_stop != NULL;
+    if (handled) {
+        console_stop(SIGTERM);
+        if (event != CTRL_BREAK_EVENT)
+            while (!*console_stop_done) Sleep(50);
+    }
+    return handled;
+}
+
+int ds4_w32_console_stop(void (*stop)(int), volatile const int *done) {
+    console_stop = stop;
+    console_stop_done = done;
+    return SetConsoleCtrlHandler(console_stop_handler, TRUE) ? 0 : -1;
+}
+
 int kill(int pid, int sig) {
     int result = -1;
     if (pid == _getpid()) {
