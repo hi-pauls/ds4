@@ -35,6 +35,29 @@ To achieve this, we implemented the following changes:
 *   **Windows and CUDA:** We provided a Windows build using MinGW and MSVC, featuring streamed experts with a page-locked RAM tier and unbuffered reads. We also implemented two-card decode support for Kolibri-1 and Qwen3.8.
 *   **Server:** We added an appendable conversation cache storing every finished turn as a delta record, allowing sessions to be reused across dropped reasoning and pruned tool output. The server includes a reasoning budget with graceful close capabilities via `--think-budget-ratio` and optional reasoning cut via `--reasoning-cut`, along with `GET /health` and `POST /shutdown` endpoints from loopback that store live sessions similarly to SIGTERM.
 
+### Results
+
+We measured the first table on our Apple M1 Max with 64 GB of unified memory and its internal SSD. DeepSeek V4 Flash and GLM 5.3 Flash do not fit in memory and run with SSD expert streaming, while Qwen3.8 figures come from production server logs of agent sessions; the others from benchmark runs.
+
+| Model | Served context | Prefill t/s | Decode t/s |
+|---|---|---|---|
+| Qwen3.8 Flash Next Q2 | 524,288 (pool 557,056) | 247 median, new spans of 2,048+ tokens | 30.6 median (p10 22.1, p90 32.4), agent turns of 200+ tokens; 24.5-25.8 in chat at 8k context |
+| DeepSeek V4 Flash | 262,144 | 139 at 8.5k, 146 at 25.6k | 11.9, plus 4.4% from the KV-tail expert zone |
+| GLM 5.3 Flash Q2 | 262,144 | 94 at 8k | 7.35, plus 2.8% from the KV-tail expert zone |
+| Kolibri-1 Q2 | 262,144 | | 52.5, short context |
+| Kolibri-1 Q4 | 131,072 | | 45.0, short context |
+
+The second table was measured on a Windows 11 PC with an RTX 4070 laptop GPU (8 GB) and an RTX 5060 Ti (16 GB) attached as an eGPU over USB4, 32 GB of RAM, and model files on an internal NVMe drive. Decode is the server's average, and reading the model from a USB4 SSD instead cut Qwen3.8 prompt speed from 125-132 to 50 t/s and decode from 9.2 to 7 t/s.
+
+| Model | Served context | Prefill t/s | Decode t/s |
+|---|---|---|---|
+| Qwen3.8 Flash Next Q2 | 131,072 (pool 163,840, 4 sessions) | 170-190 at 30k, 119 at 45k, 126 at 85k | 20.5-20.7 at 3k, 9.9-11.3 at 30k, 10.6-11.7 at 85k |
+| Kolibri-1 Q2 | 131,072 (2 sessions) | 265 at 66k | 38.4-43.3 at 3k (43.3-46.5 when served at 16k context), 37.5 at 66k |
+
+Over 51 Qwen3.8 agent requests on the M1 Max, 82.6% of 1,061,612 prompt tokens were served from the live session instead of being prefilled again.
+
+Finished conversations are stored on disk so that a returning conversation does not prefill again. On the M1 Max a full Qwen3.8 entry takes about 18.6 KB per token (617 MB on average at 33,000 tokens). Each finished turn is appended as a delta record of 124 MB on average, about a fifth of rewriting the entry, and an entry is compacted into a fresh base once its records outgrow it. Each model has a disk budget: on the M1 Max, Qwen3.8 keeps 2 GiB of conversations in RAM, 24 GiB on disk (22 GB in 26 entries at the time of writing) and 4 GiB of system-prompt caches, GLM and Kolibri 8 GiB each; on the Windows PC, 16 GB per model. On the Windows PC prompts are stored in 2048-token steps with snapshots at 10240-token boundaries; losing the snapshot of a 17,000-token conversation made its next turn take 85 s instead of 16 s.
+
 Upstream changes are merged regularly and the fork tracks upstream main.
 
 ## Supported hardware
