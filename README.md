@@ -23,6 +23,20 @@ We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
+## About this fork
+
+We forked the DwarfStar inference engine to enable high-performance execution of DeepSeek V4 Flash, GLM 5.3, Qwen3.8 Flash Next, and Kolibri-1 on hardware configurations that the upstream project does not target. Our primary objective is to run these models efficiently on an Apple M1 Max with 64 GB of unified memory, where large models require SSD expert streaming, and on a Windows PC equipped with two consumer NVIDIA cards, one connected over an external link, and to support long-running coding-agent sessions via the HTTP server on both.
+
+To achieve this, we implemented the following changes:
+
+*   **Metal and SSD Streaming:** We introduced staged prefill that reads only uncached experts pipelined over a three-slot staging ring, alongside a streamed expert cache utilizing per-token decay eviction and a hotlist. Our implementation includes router-predicted prefetch of next-layer experts and reuses prefill staging buffers and unused KV rows as expert cache during decode. We keep the GPU clock up during streamed decode and optimized GLM 5.3 Flash prefill and decode speeds through asynchronous expert loads, tiled low-rank projections, and KDA recurrence. Additionally, we tuned Q8_0 matvec tiles for the M1 Max and enabled the kernel fusions that upstream enables only on M3.
+*   **Qwen3.8 Flash Next:** We added IQ2_XXS and Q2_K decode kernels for M1 Max, enabling n-gram rows to be read while the GPU executes. The shared context pool grows on demand, and we support an opt-in q8_0 K/V cache along with expert-pruned and re-quantized GGUFs.
+*   **Kolibri-1:** We enabled SSD expert streaming on Metal, added CUDA kernels, split layers across several CUDA devices, implemented a K/V cache that grows on demand, and added tooling to fuse mlx-lm LoRA adapters into a GGUF.
+*   **Windows and CUDA:** We provided a Windows build using MinGW and MSVC, featuring streamed experts with a page-locked RAM tier and unbuffered reads. We also implemented two-card decode support for Kolibri-1 and Qwen3.8.
+*   **Server:** We added an appendable conversation cache storing every finished turn as a delta record, allowing sessions to be reused across dropped reasoning and pruned tool output. The server includes a reasoning budget with graceful close capabilities via `--think-budget-ratio` and optional reasoning cut via `--reasoning-cut`, along with `GET /health` and `POST /shutdown` endpoints from loopback that store live sessions similarly to SIGTERM.
+
+Upstream changes are merged regularly and the fork tracks upstream main.
+
 ## Supported hardware
 
 * **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
